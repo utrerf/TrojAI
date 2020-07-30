@@ -1,0 +1,15 @@
+Bootstrap: docker
+From: pytorch/pytorch:latest
+
+%files
+    ./trojan_detector.py /
+    ./ utils.py /
+    ./ attacks.py /
+    ./ titration.py /	
+
+%post
+    /opt/conda/bin/conda install scikit-image
+    /opt/conda/bin/conda install pandas
+
+%runscript
+    exec python3 /fake_trojan_detector.py "$@"
