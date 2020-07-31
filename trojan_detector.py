@@ -126,9 +126,7 @@ def trojan_detector(model_filepath, result_filepath, scratch_dirpath, examples_d
     #================================================
     # Titration Analysis
     #================================================    
-
-
-    titration_probability, result_dis_abs_df = titration(model, N, n_batch)
+    titration_probability = titration(model, N, n_batch)
 
     
 

@@ -144,6 +144,9 @@ def titration(model, N, n_batch):
         
         print(tscores)    
 
+        titration_prob = 0.5
+
+        return titration_prob
 
 
 
