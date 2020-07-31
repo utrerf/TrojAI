@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from torch.autograd import Variable, grad
 import torch.nn.utils.prune as prune
 
-from utils import test_acc
+from utils import test_acc, get_softmax
 
 warnings.filterwarnings("ignore")
 
@@ -76,7 +76,73 @@ def tscore(softmax_activation, preds, targets, gamma=0.95):
 
 
 
+def titration(model, N, n_batch):
 
+        N = 400
+        n_batch = 1
+        # copy data back
+        np.random.seed(0)
+        img = np.random.standard_normal((N, 3, 224, 224)) * 0.05
+        for i in range(img.shape[0]):
+            img[i] = img[i] - np.min(img[i])
+            img[i] = img[i] / np.max(img[i])    
+        
+        data_art = torch.from_numpy(img).float().cuda()
+        
+        
+        true_out, targets_art = get_softmax(model, N=N, n_batch=n_batch, dim=224, channels=3, data=data_art)
+        
+        
+    
+        tscores = []
+        sigs = [0.0, 0.5, 1.0, 1.5, 2.0, 4.0, 6.0, 10, 20, 50, 100, 200]
+        sigs = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.5]
+    
+        for sigma in sigs:
+            soft_titration, preds_titration = get_softmax_titration(model, sigma, N=N, n_batch=n_batch, dim=224, channels=3, data=data_art)
+            tscores.append(tscore(soft_titration, preds_titration, targets_art, gamma=0.95))
+        
+        print(tscores)
+        
+        
+        #    ================================================
+        #     Do some Damage
+        #    ================================================
+        
+    
+        k = 0   
+        for child in model.children():
+          for layer in child.modules():
+            if(isinstance(layer,torch.nn.modules.conv.Conv2d) or isinstance(layer,torch.nn.modules.Linear)):
+                    
+                if k < 15:
+                    gamma = torch.abs(layer.weight.data).max()
+                    kappa = gamma * 0.5
+                    
+                    # Trimming                  
+                    layer.weight.data[layer.weight.data>kappa] = kappa
+                    layer.weight.data[layer.weight.data<-kappa] = -kappa
+                        
+                    # Damage
+                    #np.random.seed(123)
+                    #sparse = np.random.binomial(1, 0.95, layer.weight.data.shape)
+                    #layer.weight.data = layer.weight.data * torch.from_numpy(sparse).float().cuda()
+                        
+                    # Pruning
+                    layer.weight.data[torch.abs(layer.weight.data)<gamma*0.1] = 0.0
+                    k += 1
+                        
+        
+        
+        tscores = []
+        sigs = [0.0, 0.5, 1.0, 1.5, 2.0, 4.0, 6.0, 10, 20, 50, 100, 200]
+        sigs = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.5]
+    
+        for sigma in sigs:
+            soft_titration, preds_titration = get_softmax_titration(model, sigma, N=N, n_batch=n_batch, dim=224, channels=3, data=data_art)
+            tscores.append(tscore(soft_titration, preds_titration, targets_art, gamma=0.95))
+        
+        print(tscores)    
 
 
 
