@@ -1,4 +1,5 @@
 numpy
+pandas
 scikit-image
 torch
 torchvision
