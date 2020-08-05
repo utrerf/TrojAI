@@ -76,7 +76,10 @@ def trojan_detector(model_filepath, result_filepath, scratch_dirpath, examples_d
     #================================================
     # Read Model 
     #================================================
-    model = torch.load(model_filepath)
+    #model = torch.load(model_filepath)
+    model = torch.load(model_filepath, map_location=torch.device('cuda'))
+
+    
     true_out, true_labels = get_softmax(model, N=N, n_batch=n_batch, dim=224, channels=3, data=data)
     
     targets = true_labels
