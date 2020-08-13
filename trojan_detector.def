@@ -3,13 +3,17 @@ From: pytorch/pytorch:latest
 
 %files
     ./trojan_detector.py /
-    ./ utils.py /
-    ./ attacks.py /
-    ./ titration.py /	
+    ./utils.py /
+    ./attacks.py /
+    ./attack_tools.py /
+    ./titration.py /
+    ./spectral.py /
+    ./damage.py /
+
 
 %post
     /opt/conda/bin/conda install scikit-image
     /opt/conda/bin/conda install pandas
 
 %runscript
-    exec python3 /fake_trojan_detector.py "$@"
+    exec python3 /trojan_detector.py "$@"

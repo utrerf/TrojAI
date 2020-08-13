@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from torch.autograd import Variable, grad
 import torch.nn.utils.prune as prune
 
+
 warnings.filterwarnings("ignore")
 
 
@@ -38,11 +39,20 @@ def input_batch(examples_dirpath, example_img_format='png'):
     for fn in fns:
         # read the image (using skimage)
         img = skimage.io.imread(fn)
+        
+        
+        # perform center crop to what the CNN is expecting 224x224
+        h, w, c = img.shape
+        dx = int((w - 224) / 2)
+        dy = int((w - 224) / 2)
+        img = img[dy:dy+224, dx:dx+224, :]        
+        
+        
         # convert to BGR (training codebase uses cv2 to load images which uses bgr format)
-        r = img[:, :, 0]
-        g = img[:, :, 1]
-        b = img[:, :, 2]
-        img = np.stack((b, g, r), axis=2)
+#        r = img[:, :, 0]
+#        g = img[:, :, 1]
+#        b = img[:, :, 2]
+#        img = np.stack((b, g, r), axis=2)
 
         # Or use cv2 (opencv) to read the image
         # img = cv2.imread(fn, cv2.IMREAD_UNCHANGED)
@@ -79,6 +89,11 @@ def input_batch(examples_dirpath, example_img_format='png'):
     
     
     return batch_data, targets
+
+
+
+
+
 
 
 def test_acc(adv_data, Y_test, model, num_data, N):
