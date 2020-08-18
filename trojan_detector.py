@@ -14,8 +14,14 @@ import pandas as pd
 from utils import *
 from attacks import *
 from titration import titration, titration_real
-from damage import damage, damage2
+from damage import damage
 from spectral import spectral
+
+import pickle
+from sklearn.ensemble import GradientBoostingClassifier
+import time
+
+from model import predict
 
 warnings.filterwarnings("ignore")
 
@@ -27,229 +33,267 @@ def trojan_detector(model_filepath, result_filepath, scratch_dirpath, examples_d
     try:
        results = pd.read_csv(scratch_dirpath + 'results.csv', header=0, index_col=False)
     except:
-       columns = ['model', 'score', 'p1', 'p2', 'p3', 'p4', 'p5', 'p6']
+       columns = ['model',  'depth', 'nclass', 'score']
        results = pd.DataFrame(columns=columns)    
 
 
     print('**********')
     print(examples_dirpath)
+    start = time.time()
+#    try:
+    if False == False:
 
-    try:   
-#    if True == True:
-        #================================================
-        # parameters
-        #================================================
-        N = 50
-        n_batch = 4
-    
-        #N = 2
-        #n_batch = 2
-    
-        #================================================
-        # Read Data
-        #================================================
-        data, targets = input_batch(examples_dirpath, example_img_format='png')
+            #================================================
+            # parameters
+            #================================================
+            N = 10
+            n_batch = 4
         
-        np.random.seed(0)
-        idx = np.random.choice(range(data.shape[0]), data.shape[0])
-        data = data[idx]
-        
-        if data.shape[0] >= N*n_batch:
-            data = data[0:N*n_batch]
-        elif data.shape[0] // n_batch > 0:
-            N = data.shape[0] // n_batch 
-            data = data[0:N*n_batch]        
-        else:
-           print('There are not enough data points. Create artificial data...') 
+            #================================================
+            # Read Data
+            #================================================
+            data, targets = input_batch(examples_dirpath, example_img_format='png')
             
-    
-        ndata_points = data.shape[0]
-        
-        if ndata_points > 0:
-            print('Number of data points loaded: ', ndata_points) 
-        else:
-           print('No data available. Create artificial data...') 
-           
-           
-        
-        #================================================
-        # Read Model 
-        #================================================
-        #model = torch.load(model_filepath)
-        model = torch.load(model_filepath, map_location=torch.device('cuda'))
-    
-        
-        true_out, true_labels = get_softmax(model, N=N, n_batch=n_batch, dim=224, channels=3, data=data)
-        
-        targets = true_labels
+            np.random.seed(0)
+            idx = np.random.choice(range(data.shape[0]), data.shape[0])
+            data = data[idx]
+            targets = targets[idx]
+            
+            
+            n_batch = data.shape[0] // N
+            
+            if data.shape[0] >= N*n_batch:
+                data = data[0:N*n_batch]
+                targets = targets[0:N*n_batch]
 
-        print('Load Model: Okay.')     
-        
-
-        count=0
-        for child in model.children():
-            for layer in child.modules():
-                if(isinstance(layer,torch.nn.modules.conv.Conv2d) or isinstance(layer,torch.nn.modules.Linear)): 
-                    count+=1
-        print('Depth: ', count)        
-        
-        
-        
-    #
-    #
-    #    #================================================
-    #    # Compute some statistics
-    #    #================================================
-    ##    print('Compute some statistics.')     
-    ##    
-    ##    n_conf = np.sum([np.max(true_out[i], axis=1) > 0.0 for i in range(n_batch)])
-    ##    print('Number of data points with confidence greater 0.0: ', n_conf)
-    ##    
-    ##    n_conf = np.sum([np.max(true_out[i], axis=1) > 0.9 for i in range(n_batch)])
-    ##    print('Number of data points with confidence greater 0.9: ', n_conf)
-    ##
-    #    n_conf = np.sum([np.max(true_out[i], axis=1) > 0.95 for i in range(n_batch)])
-    #    print('Number of data points with confidence greater 0.95: ', n_conf)
-    ##    
-    #    n_conf = np.sum([np.max(true_out[i], axis=1) > 0.99 for i in range(n_batch)])
-    #    print('Number of data points with confidence greater 0.99: ', n_conf)    
-    ##
-    ##
-    ##    print(true_out.shape)
-    #
-    #
-    #
-        print('Run tests.') 
-
-        trojan_probability = 0.5
-        titration_probability = 0.5
-        titration_real_probability = 0.5
-        attack_probability = 0.5         
-        damage_probability = 0.5
-        damage2_probability = 0.5
-        
-        spectral_probability = 0.5        
-        spectral_probability2 = 0.5        
-        
-        #================================================
-        # Titration Analysis
-        #================================================   
-
-        
-        titration_probability = titration(model, N, n_batch)
-        titration_real_probability = titration_real(model, data, targets, N, n_batch)
-        #titration_real2_probability = titration_real2(model, data, targets, N, n_batch)
+            elif data.shape[0] // n_batch > 0:
+                N = data.shape[0] // n_batch
+                data = data[0:N*n_batch]  
+                targets = targets[0:N*n_batch]  
+                
+            else:
+               print('There are not enough data points. Create artificial data...') 
                 
         
+            ndata_points = data.shape[0]
+            
+            if ndata_points > 0:
+                print('Number of data points loaded: ', ndata_points) 
+            else:
+               print('No data available. Create artificial data...') 
+            
+            nclasses = np.max(targets.cpu().numpy().flatten())
+            print('N', N)
+            print('Batch', n_batch)
+            print('N class', nclasses)
+            print(data.shape)
+            print(targets.shape)
+               
+            
+            #================================================
+            # Read Model 
+            #================================================
+            #model = torch.load(model_filepath)
+            model = torch.load(model_filepath, map_location=torch.device('cuda'))
         
-        #================================================
-        # Attack 1
-        #================================================
-        data_orig = torch.empty(data.shape).float()
-        # copy data back
-        for i in range(n_batch):
-            data_orig[i*N:(i+1)*N] = data[i*N:(i+1)*N]    
-       
-        
-        #attack_probability, attack_acc = attack(model, data, targets, N, n_batch, eps=0, iters=0, df_iter=0, p=1)
-    
-        for i in range(n_batch):
-            data[i*N:(i+1)*N] = data_orig[i*N:(i+1)*N]           
-        
-        #================================================
-        # Damage
-        #================================================    
-        #model = torch.load(model_filepath, map_location=torch.device('cuda'))
+            
+            #true_out, targets = get_softmax(model, N=N, n_batch=n_batch, dim=224, channels=3, data=data)
+                
+            print('Load Model: Okay.')     
 
-        #damage_probability = damage(model, data, targets, N, n_batch)
-        
-        model = torch.load(model_filepath, map_location=torch.device('cuda'))
-        
-        damage2_probability = damage2(model, data, targets, N, n_batch)
+            cross = torch.nn.CrossEntropyLoss(reduction = 'sum')
+            score_cross = 0
+            for i in range(n_batch):
+                with torch.no_grad():
+                    data_batch = data[i*N:(i+1)*N].float().cuda()
+                    output = model(data_batch)        
+                    score_cross += cross(output.float().cuda(), targets[i*N:(i+1)*N].long().cuda()).item()       
+            score_cross /= (N*n_batch)  
 
-        model = torch.load(model_filepath, map_location=torch.device('cuda'))
-        
-        #spectral_probability = spectral(model, data, targets, N, n_batch, k=2)
-        #spectral_probability2 = spectral(model, data, targets, N, n_batch, k=-2)
-        
-        
-        #================================================
-        # Stack
-        #================================================        
-    
-        print('----')
-        print('Titration prob: ', titration_probability)
-        print('Titration Real prob: ', titration_real_probability)
-        print('Attack prob: ', attack_probability)
-        print('Damage prob: ', damage_probability)
-        print('Damage2 prob: ', damage2_probability)
-        
-        print('Spectral prob: ', spectral_probability)
-        print('Spectral prob: ', spectral_probability2)
-        
-        print('----')    
-        
-    
-        
-        probs = np.asarray(list([attack_probability,titration_probability,titration_real_probability,damage2_probability,spectral_probability]))
-        probs = np.asarray(list([titration_probability,titration_real_probability,damage2_probability]))
-        
 
-        if len(probs[probs>=0.5]) >= 3:
-            idx = np.where(probs >= 0.5)[0]
-            trojan_probability = np.minimum(np.mean(probs[idx]),0.65)
-        elif len(probs[probs<=0.5]) >= 3:
-            idx = np.where(probs <= 0.5)[0]
-            trojan_probability = np.maximum(np.mean(probs[idx]),0.35) 
-        else:
+            
+    
+            depth=0
+            for child in model.children():
+                for layer in child.modules():
+                    if(isinstance(layer,torch.nn.modules.conv.Conv2d) or isinstance(layer,torch.nn.modules.Linear)): 
+                        depth+=1
+            print('Depth: ', depth)        
+            
+            
+            
+        #
+        #
+        #    #================================================
+        #    # Compute some statistics
+        #    #================================================
+        ##    print('Compute some statistics.')     
+        ##    
+        ##    n_conf = np.sum([np.max(true_out[i], axis=1) > 0.0 for i in range(n_batch)])
+        ##    print('Number of data points with confidence greater 0.0: ', n_conf)
+        ##    
+        ##    n_conf = np.sum([np.max(true_out[i], axis=1) > 0.9 for i in range(n_batch)])
+        ##    print('Number of data points with confidence greater 0.9: ', n_conf)
+        ##
+        #    n_conf = np.sum([np.max(true_out[i], axis=1) > 0.95 for i in range(n_batch)])
+        #    print('Number of data points with confidence greater 0.95: ', n_conf)
+        ##    
+        #    n_conf = np.sum([np.max(true_out[i], axis=1) > 0.99 for i in range(n_batch)])
+        #    print('Number of data points with confidence greater 0.99: ', n_conf)    
+        ##
+        ##
+        ##    print(true_out.shape)
+        #
+        #
+        #
+            print('Run tests.') 
             trojan_probability = 0.5
             
-        if len(probs[probs>=0.51]) >= 3:
-            idx = np.where(probs >= 0.5)[0]
-            trojan_probability = 0.99
-        elif len(probs[probs<=0.49]) >= 3:
-            idx = np.where(probs <= 0.5)[0]
-            trojan_probability = 0.01             
-        
             
-        print(trojan_probability)
+            #================================================
+            # Titration Analysis
+            #================================================  
+            titration_score, titration2_score, titration3_score, titration4_score = 0,0,0,0
+            titration5_score, titration6_score = 0,0
+
+            titration_score = titration(model, data, targets, N, n_batch, nlevel=0.2)            
+            titration2_score = titration(model, data, targets, N, n_batch, nlevel=0.3)
+            titration3_score = titration(model, data, targets, N, n_batch, nlevel=0.6)
+            
+            
+            titration4_score  = titration_real(model, data, targets, N, n_batch, d=1)                    
+            titration5_score  = titration_real(model, data, targets, N, n_batch, d=2)                    
+            titration6_score  = titration_real(model, data, targets, N, n_batch, d=3)                    
+            
+            
+         
+            
+            #================================================
+            # Damage
+            #================================================ 
+            damage_score, damage2_score, damage3_score, damage4_score = 0,0,0,0
+            
+            damage_score = damage(model, data, targets, N, n_batch, trimm=0.30, prune=0.01)
+            model = torch.load(model_filepath, map_location=torch.device('cuda'))
+            damage2_score = damage(model, data, targets, N, n_batch, trimm=0.45, prune=0.08)            
+            model = torch.load(model_filepath, map_location=torch.device('cuda'))
+            damage3_score = damage(model, data, targets, N, n_batch, trimm=0.35, prune=0.05)
+            model = torch.load(model_filepath, map_location=torch.device('cuda'))
+            damage4_score = damage(model, data, targets, N, n_batch, trimm=0.65, prune=0.11)
+    
+    
+            #================================================
+            # Spectral
+            #================================================
+            spectral_score = 0
+            
+            model = torch.load(model_filepath, map_location=torch.device('cuda')) 
+            spectral_score = spectral(model, data, targets, N, n_batch, k=-1)
+            
+            
+            #================================================
+            # Attack 1
+            #================================================
+            attack_score1, attack_score2, attack_noise1, attack_noise2 = 0, 0, 0, 0
+            
+            model = torch.load(model_filepath, map_location=torch.device('cuda'))         
+            attack_score1, attack_score2, attack_noise1, attack_noise2 = attack(model, data, targets, N, n_batch, eps=0, iters=0, df_iter=0, p=1)
+            
+            #================================================
+            # Stack
+            #================================================        
+            train = pd.DataFrame({    'a1' : attack_score1,
+                                      'a2' : attack_noise1,
+                                      'a3' : attack_score2,
+                                      'a4' : attack_noise2,     
+
+                                      'd1' : damage_score,
+                                      'd2' : damage2_score,
+                                      'd3' : damage3_score,
+                                      'd4' : damage4_score,
+                                      
+                                      's1' : spectral_score,                    
+                    
+                                      't1' : titration_score,                          
+                                      't2' : titration2_score,
+                                      't3' : titration3_score, 
+                                      't4' : titration4_score, 
+                                      't5' : titration5_score, 
+                                      't6' : titration6_score, 
+
+                                      }, index=[0])        
         
-        
-#        if attack_acc < 0.05:
-#            trojan_probability = 0.95
-#        elif attack_acc > 0.9 and trojan_probability > 0.5:
+
+            # load the model from disk
+            trojan_probability = 0.5
+            
+            #loaded_model = pickle.load(open('./troj_classify_boost.sav', 'rb'))
+            #loaded_model2 = pickle.load(open('./troj_classify_forest.sav', 'rb'))
+
+            #df.to_csv(scratch_dirpath + 'results_temps.csv', index=False)
+            #train = pd.read_csv('scratch/results_temps.csv')
+
+            # prepare data
+            inputs = train.to_numpy()
+ 
+            preds1, preds2 = predict(inputs)
+            
+            if preds1 > 0.55 and preds2 > 0.55:
+                trojan_probability = (preds1+preds2) /2
+            elif preds1 < 0.45 and preds2 < 0.45:
+                trojan_probability = (preds1+preds2) /2       
+            else:
+                trojan_probability = 0.5
+           
+              
+            trojan_probability = np.minimum(trojan_probability, 0.95)
+            trojan_probability = np.maximum(trojan_probability, 0.05)      
+       
+#    except RuntimeError:
 #            trojan_probability = 0.5
-            
-    
-        trojan_probability = np.minimum(trojan_probability, 0.8)
-        trojan_probability = np.maximum(trojan_probability, 0.2)      
-    
-    except RuntimeError:
-       trojan_probability = 0.5
     
     #================================================
     # Report
     #================================================    
-    
-    
-    print('Trojan Probability: {}'.format(trojan_probability))
-    results = results.append({'model' : model_filepath, 
-                              'score' : trojan_probability,
-                              'p1' : attack_probability,
-                              'p2' : titration_probability,                          
-                              'p3' : titration_real_probability,                          
-                              'p4' : damage2_probability,
-                              'p5' : damage_probability,
-                              'p6' : spectral_probability,
-                              } , ignore_index=True)
-    results.to_csv(scratch_dirpath + 'results.csv')
-
-    
-
     with open(result_filepath, 'w') as fh:
         fh.write("{}".format(trojan_probability))
 
+    print('--------------------------')
+    print('Trojan Probability: {}'.format(trojan_probability))
+    end = time.time()
+    totaltime = end - start
+    print('Time:', totaltime)   
+    print('--------------------------')    
+    
 
+    results = results.append({'model' : model_filepath,
+                                      'depth' : depth, 
+                                      'score' : trojan_probability,
+                                      'nclass' : nclasses,
+                                      'totaltime' : totaltime,
+                         
+                                      't1' : titration_score,                          
+                                      't2' : titration2_score,
+                                      't3' : titration3_score, 
+                                      't4' : titration4_score, 
+                                      't5' : titration5_score, 
+                                      't6' : titration6_score, 
+                                      
+                                      'd1' : damage_score,
+                                      'd2' : damage2_score,
+                                      'd3' : damage3_score,
+                                      'd4' : damage4_score,
+                                      
+                                      's1' : spectral_score,
+
+                                      'a1' : attack_score1,
+                                      'a2' : attack_noise1,
+                                      'a3' : attack_score2,
+                                      'a4' : attack_noise2,                                                                                     
+                                
+                                      } , ignore_index=True)        
+    results.to_csv(scratch_dirpath + 'results.csv', index=False)
+    
 
 
 if __name__ == "__main__":

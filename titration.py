@@ -7,20 +7,16 @@ Created on Wed Jul 29 13:30:55 2020
 """
 
 import numpy as np
-import skimage.io
-import random
 import torch
 import warnings 
-import pandas as pd
-
 
 import torch.nn.functional as F
-from torch.autograd import Variable, grad
-import torch.nn.utils.prune as prune
 
-from utils import test_acc, get_softmax
+from torchvision import transforms
 
-from attack_tools import *
+from utils import test_acc, get_softmax, test_cross
+
+from sklearn.metrics import f1_score
 
 
 warnings.filterwarnings("ignore")
@@ -56,7 +52,7 @@ def get_softmax_titration(model, sigma, N, n_batch, dim, channels, data):
     pred_collect = np.asarray(pred_collect)
     softmax_activations_collect = np.asarray(softmax_activations_collect)
     
-    return softmax_activations_collect, pred_collect 
+    return softmax_activations_collect, pred_collect, output 
 
 
 
@@ -82,96 +78,104 @@ def tscore(softmax_activation, preds, targets, gamma=0.9):
 
 
 
-def titration(model, N, n_batch):
+def titration(model, data, targets, N, n_batch, nlevel=0.7):
 
-        N = 500
-        n_batch = 1
-        num_data = N*n_batch
+#        cross = torch.nn.CrossEntropyLoss(reduction = 'sum')
+#        score1 = 0
+#        for i in range(n_batch):
+#            with torch.no_grad():
+#                data_batch = data[i*N:(i+1)*N].float().cuda()
+#                output = model(data_batch)        
+#                score1 += cross(output.float().cuda(), targets[i*N:(i+1)*N].long().cuda()).item()       
+#        score1 /= (N*n_batch)        
+
+        preds = torch.Tensor(N*n_batch,1)
+        for i in range(n_batch):
+                with torch.no_grad():
+                    data_batch = data[i*N:(i+1)*N].float().cuda()
+                    output = model(data_batch)       
+                    preds[i*N:(i+1)*N] = output.data.max(1, keepdim=True)[1] # get the index of the max log-probability
+                           
+        score1 = f1_score(targets.cpu().numpy().flatten(), preds.cpu().numpy().flatten(), average='macro')      
+                
         
-        # copy data back
-        np.random.seed(10000)
-        img = np.random.standard_normal((num_data, 3, 256, 256)) * 0.05
-        #img2 = np.random.uniform(0,1,(num_data, 3, 256, 256))
-        img = img #* img2
+#        score2 = 0
+#        for i in range(n_batch):
+#            np.random.seed(i)
+#            noise = np.random.standard_normal((N,3,224,224)) * nlevel           
+#            with torch.no_grad():
+#                tit_noise = torch.from_numpy((noise)).float().cuda() 
+#                data_batch = data[i*N:(i+1)*N].float().cuda()  + tit_noise.float().cuda() 
+#                output = model(data_batch)        
+#                score2 += cross(output.float().cuda(), targets[i*N:(i+1)*N].long().cuda()).item()       
+#        score2 /= (N*n_batch)  
+            
         
-        for i in range(img.shape[0]):
-            img[i] = img[i] - np.min(img[i])
-            img[i] = img[i] / np.max(img[i])    
-        
-        
-        data_art = torch.from_numpy(img).float().cuda()
-        true_out, targets_art = get_softmax(model, N=N, n_batch=n_batch, dim=256, channels=3, data=data_art)
-        c = np.max(targets_art.flatten())
+        preds = torch.Tensor(N*n_batch,1)
+        for i in range(n_batch):
+            np.random.seed(i)
+            noise = np.random.standard_normal((N,3,224,224)) * nlevel           
+            with torch.no_grad():
+                tit_noise = torch.from_numpy((noise)).float().cuda() 
+                data_batch = data[i*N:(i+1)*N].float().cuda()  + tit_noise.float().cuda() 
+                output = model(data_batch)        
+                preds[i*N:(i+1)*N] = output.data.max(1, keepdim=True)[1] # get the index of the max log-probability
 
-
-        tscores = []
-        sigs = [0.0, 1.0, 2.0, 4.0, 6.0, 8.0, 10]
-        sigs = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2]
-        sigs = [0.2]
-    
-        for sigma in sigs:
-            soft_titration, preds_titration = get_softmax_titration(model, sigma, N=N, n_batch=n_batch, dim=256, channels=3, data=data_art)
-            ttemp, counttemp = tscore(soft_titration, preds_titration, targets_art, gamma=0.8)
-            tscores.append(ttemp)
-        
-        print('titration: ', counttemp)
+        score2 = f1_score(targets.cpu().numpy().flatten(), preds.cpu().numpy().flatten(), average='macro')           
         
         
-        titration_prob = 1 - 1/(1+ np.exp( 0.1 * (counttemp - 425)))
+        
+        
 
-        if counttemp <= 100:
-            titration_prob = 1 - 1/(1+ np.exp( 0.2 * (counttemp - 100)))
-        elif counttemp >= 450:
-            titration_prob = 1 - 1/(1+ np.exp( 0.2 * (counttemp - 450)))
-        else:
-            titration_prob = 0.5
+        
+        score = np.abs(score1-score2)
+        print('titration score: ', score)
+        
 
-        return titration_prob
-
+        return score
 
 
 
 
-
-
-def titration_real(model, data, targets, N, n_batch,):
+def titration_real(model, data, targets, N, n_batch, d=1):
 
         num_data = N*n_batch
                 
         X_ori = torch.Tensor(num_data, 3, 224, 224)
-        Y_test = torch.LongTensor(num_data)
+        for i in range(n_batch):
+            X_ori[i*N:(i+1)*N] = data[i*N:(i+1)*N].float().cuda()
+        
+        
+        preds = torch.Tensor(N*n_batch,1)
+        for i in range(n_batch):
+                with torch.no_grad():
+                    data_batch = X_ori[i*N:(i+1)*N].float().cuda()
+                    output = model(data_batch)       
+                    preds[i*N:(i+1)*N] = output.data.max(1, keepdim=True)[1] # get the index of the max log-probability
+                           
+        score1 = f1_score(targets.cpu().numpy().flatten(), preds.cpu().numpy().flatten(), average='macro')      
                 
 
         
-        #print('Run IFGSM')
-        for i in range(n_batch):
-            X_ori[i*N:(i+1)*N] = data[i*N:(i+1)*N].float().cuda()
-            Y_test[i*N:(i+1)*N] = torch.from_numpy(targets[i].flatten()).cuda()                                      
-        
-        _, Y_test = get_softmax(model, N=N, n_batch=n_batch, dim=224, channels=3, data=X_ori)
-        
-        
-        for i in range(X_ori.shape[0]):
-            for j in range(3):
-                temp = X_ori[i,j, :, :].cpu().numpy()
-                X_ori[i,j,:,:] = torch.from_numpy(temp.T).float().cuda()
-
-
-        #soft_titration, preds_titration = get_softmax(model, N=N, n_batch=n_batch, dim=224, channels=3, data=X_ori)
-        soft_titration, preds_titration = get_softmax_titration(model, 0.2, N=N, n_batch=n_batch, dim=224, channels=3, data=X_ori)
-
-        ttemp, counttemp = tscore(soft_titration, preds_titration, Y_test, gamma=0.8)
-         
-        
-        score = counttemp/num_data
-        print('titration real: ', score)
-        print(num_data)
-        
-        if score <= 0.3:
-            titration_prob = 1 - 1/(1+ np.exp( 13 * (score - 0.3)))
-        elif score >= 0.5:
-            titration_prob = 1 - 1/(1+ np.exp( 13 * (score - 0.5)))
+        if d < 3:
+            X_ori = X_ori.flip(d)
         else:
-            titration_prob = 0.5
+            X_ori = X_ori.flip(1)
+            X_ori = X_ori.flip(2)
 
-        return titration_prob
+
+        preds = torch.Tensor(N*n_batch,1)
+        for i in range(n_batch):
+            with torch.no_grad():
+                data_batch = X_ori[i*N:(i+1)*N].float().cuda()
+                output = model(data_batch)        
+                preds[i*N:(i+1)*N] = output.data.max(1, keepdim=True)[1] # get the index of the max log-probability
+
+        score2 = f1_score(targets.cpu().numpy().flatten(), preds.cpu().numpy().flatten(), average='macro')   
+            
+    
+        
+        score = np.abs(score1-score2)
+        print('titration score: ', score)
+        
+        return score

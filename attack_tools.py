@@ -60,10 +60,6 @@ def fgsm_iter(model, data, target, eps, iterations=10):
     for i in range(iterations):
     	X_adv = fgsm(model, X_adv, target, eps)
         
-        
-            
-        
-        
     return X_adv
 
 

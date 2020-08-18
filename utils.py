@@ -28,7 +28,7 @@ def input_batch(examples_dirpath, example_img_format='png'):
     
     # Inference the example images in data
     fns = [os.path.join(examples_dirpath, fn) for fn in os.listdir(examples_dirpath) if fn.endswith(example_img_format)]
-    random.shuffle(fns)
+    #random.shuffle(fns)
 
     imgs = []
     targets = []
@@ -73,8 +73,8 @@ def input_batch(examples_dirpath, example_img_format='png'):
         #img_idf = fn[27::]
         #img_idf = int(img_idf[6])
         #print(img_idf)
-        
-        #targets.append(img_idf)
+        out = fn.split('_')
+        targets.append(int(out[2]))
         #targets.append(np.asarray(csv.loc[csv['file'] == img_idf]['true_label']))
         
     imgs = np.asarray(imgs)
@@ -84,12 +84,11 @@ def input_batch(examples_dirpath, example_img_format='png'):
     # move tensor to the gpu
     batch_data = batch_data.cuda()
     
-    #targets = np.asarray(targets)
-    #targets = torch.from_numpy(targets).cuda()
+    targets = np.asarray(targets)
+    targets = torch.from_numpy(targets.flatten()).cuda()
     
     
     return batch_data, targets
-
 
 
 
@@ -114,6 +113,21 @@ def test_acc(adv_data, Y_test, model, num_data, N):
 
     return correct*1./num_data, total_ent*1./num_data
 
+
+def test_cross(inputs, targets, model, N, n_batch):
+    
+    model.eval()
+    cross = torch.nn.CrossEntropyLoss()             
+    score = 0
+    
+    with torch.no_grad():
+        for i in np.arange(n_batch):
+            inputsTemp, targetTemp = inputs[N*i:N*(i+1), :].cuda(), targets[N*i:N*(i+1)].cuda()
+            output = model(inputsTemp)
+
+            score += cross(output.float().cuda(), targetTemp).item()
+
+    return score
 
 
 def get_softmax(model, N, n_batch, dim, channels, data):

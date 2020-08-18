@@ -9,11 +9,13 @@ From: pytorch/pytorch:latest
     ./titration.py /
     ./spectral.py /
     ./damage.py /
+    ./model.py /
 
 
 %post
     /opt/conda/bin/conda install scikit-image
     /opt/conda/bin/conda install pandas
+    /opt/conda/bin/conda install scikit-learn
 
 %runscript
     exec python3 /trojan_detector.py "$@"
