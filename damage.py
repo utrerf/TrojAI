@@ -15,7 +15,6 @@ import pandas as pd
 
 import torch.nn.functional as F
 from torch.autograd import Variable, grad
-import torch.nn.utils.prune as prune
 
 from utils import test_acc, get_softmax, test_cross
 

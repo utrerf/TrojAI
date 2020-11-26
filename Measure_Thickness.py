@@ -178,69 +178,16 @@ def Measure_Thickness(model, images, labels, nclasses, eps=10.0, iters=20, step_
 
 
 
-def direction(model, images, labels, nclasses, eps=3, iters=10, step_size=1.0, estbatch = 10):
-    # Here, eps, iters, step_size are parameters of the adv attack
-    # num_points, alpha and beta are the parameters to measure thickness
-    PGD_attack = PGD_l2(model = model, eps = eps, iters = iters, alpha = step_size)
-    
-    s_all = []
-    stable_ranks = []
-
-    for target_class in range(nclasses):
-        adv_directions = []
-        
-        n = 20
-        n_batch = images.shape[0] // n - 1
-        #adv_images = torch.Tensor(n*n_batch, 3, 224, 224).float().cuda()
-        
-        for i in range(n_batch):
-            wrong_labels = target_class * torch.ones(size = (images[i*n:(i+1)*n].shape[0],)).long()
-            adv_images = PGD_attack.__call__(images[i*n:(i+1)*n], wrong_labels)
-            adv_dir = adv_images - images[i*n:(i+1)*n]
-            adv_directions.append(adv_dir)
-            
-            
-        adv_directions = torch.cat(adv_directions)
-        adv_directions = adv_directions.view(adv_directions.shape[0],-1)
-        #adv_directions = torch.mm(adv_directions.transpose(0,1), adv_directions)
-        adv_directions = adv_directions.cpu().numpy()
-        #print(adv_directions.shape)
-        #adv_directions = adv_directions.dot(adv_directions)       
-        
-        
-        ## compute the eig spectrum
-        U, s, Vh = svds(adv_directions, k=1)
-    
-        fnorm = np.linalg.norm(adv_directions)
-        srank = fnorm**2 / s[0]**2
-    
-        s_all.append(s[0])
-        stable_ranks.append(srank)
 
     
-    
-    score1 = np.max(s_all)**2 - np.min(s_all)**2
-    score2 = np.var(np.asarray(s_all)**2)
-    score3 = np.mean(np.asarray(s_all)**2)
-    
-    score4 = np.max(stable_ranks) - np.min(stable_ranks)
-    score5 = np.var(stable_ranks)
-    score6 = np.mean(stable_ranks)
-    
-    return score1, score2, score3, score4, score5, score6   
-    
-    
-    
-    
-def direction(model, images, labels, nclasses, eps=3, iters=15, step_size=1.0, estbatch = 10):
+def direction(model, images, labels, nclasses, eps=0.3, iters=6):
     # Here, eps, iters, step_size are parameters of the adv attack
     # num_points, alpha and beta are the parameters to measure thickness
-    PGD_attack = PGD_l2(model = model, eps = eps, iters = iters, alpha = step_size)
+    PGD_attack = PGD_l2(model = model, eps = eps, iters = iters)
     
     accs = []
 
     for target_class in range(nclasses):
-        adv_directions = []
         
         n = 20
         n_batch = images.shape[0] // n - 1
@@ -261,12 +208,13 @@ def direction(model, images, labels, nclasses, eps=3, iters=15, step_size=1.0, e
         preds = np.vstack(preds)  
         targets = np.vstack(targets)
 
-        score = f1_score(targets.flatten(), preds.flatten(), average='macro')        
+        score = f1_score(targets.flatten(), preds.flatten(), average='micro')        
         accs.append(score)
 
 
     score1 = (np.max(accs) - np.min(accs)) / np.max(accs)
     score2 = np.mean(accs)
-    score3 = np.min(accs) / np.median(accs)
+    #score3 = np.median(accs)
+    score3 = np.max(accs) / np.min(accs)
     
     return score1, score2, score3

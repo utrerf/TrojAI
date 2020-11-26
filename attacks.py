@@ -11,6 +11,7 @@ import torch
 import warnings 
 import pandas as pd
 
+import torch.nn as nn
 
 import torch.nn.functional as F
 
@@ -35,8 +36,8 @@ warnings.filterwarnings("ignore")
 
 def attack(model, data, targets, N, n_batch, eps, iters, df_iter, p=1):
     
-        #torch.manual_seed(123456)
-        #torch.cuda.manual_seed(123456)
+        torch.manual_seed(123456)
+        torch.cuda.manual_seed(123456)
     
         c = np.max(targets.cpu().numpy().flatten())
         num_data = N*n_batch
@@ -47,69 +48,215 @@ def attack(model, data, targets, N, n_batch, eps, iters, df_iter, p=1):
             X_ori[i*N:(i+1)*N] = data[i*N:(i+1)*N].float()           
     
 
-        eps = 0.0005
-        iters = 10
-        df_iter = 3
+        eps = 0.02
+        iters = 9
+        df_iter = 1
         
         for i in range(n_batch):
-            X_fgsm[i*N:(i+1)*N] = fgsm_iter(model, data[i*N:(i+1)*N].float(), targets[i*N:(i+1)*N].flatten().long().cuda(), eps, iterations=iters)
+            X_fgsm[i*N:(i+1)*N], _ = fgsm_adaptive_iter(model, data[i*N:(i+1)*N].float(), targets[i*N:(i+1)*N].flatten().long().cuda(), eps, iterations=iters)
                                        
+    
+        #for i in range(n_batch):
+        #    X_fgsm[i*N:(i+1)*N], _ = deep_fool_iter(model, X_fgsm[i*N:(i+1)*N].float(), targets[i*N:(i+1)*N].flatten().long().cuda(), c=c, p=1, iterations=df_iter)
+
+
+        preds = torch.Tensor(num_data,1)
+        for i in range(n_batch):
+                with torch.no_grad():
+                    data_batch = X_fgsm[i*N:(i+1)*N].float().cuda()
+                    output = model(data_batch)       
+                    preds[i*N:(i+1)*N] = output.data.max(1, keepdim=True)[1] # get the index of the max log-probability
+                           
+        score = f1_score(targets.cpu().numpy().flatten(), preds.cpu().numpy().flatten(), average='micro')  
+    
+        absnoise1, _,  _ = distance(X_fgsm, X_ori, norm=2)
+        #absnoise2, _,  _ = distance(X_fgsm, X_ori, norm=1)
+    
+        print('Attack score 1', score)
+        #print('Attack noise 2', absnoise2.item())
+
+        return score, absnoise1.item()
+    
+    
+    
+    
+
+class Attacks(object):
+    """
+    An abstract class representing attacks.
+    Arguments:
+        name (string): name of the attack.
+        model (nn.Module): a model to attack.
+    .. note:: device("cpu" or "cuda") will be automatically determined by a given model.
+    """
+    def __init__(self, name, model):
+        self.attack = name
+        self.model = model.eval()
+        self.model_name = str(model).split("(")[0]
+        self.device = torch.device("cuda" if next(model.parameters()).is_cuda else "cpu")
+    # Whole structure of the model will be NOT displayed for pretty print.
+    def __str__(self):
+        info = self.__dict__.copy()
+        del info['model']
+        del info['attack']
+        return self.attack + "(" + ', '.join('{}={}'.format(key, val) for key, val in info.items()) + ")"
+    # Save image data as torch tensor from data_loader
+    # If you want to reduce the space of dataset, set 'to_unit8' as True
+    # If you don't want to know about accuaracy of the model, set accuracy as False
+    def save(self, file_name, data_loader, to_uint8=True, accuracy=True):
+        image_list = []
+        label_list = []
+        correct = 0
+        total = 0
+        total_batch = len(data_loader)
+        for step, (images, labels) in enumerate(data_loader):
+            labels_change = torch.randint(1, 10, (labels.shape[0],))
+            wrong_labels = torch.remainder(labels_change + labels, 10)
+            adv_images = self.__call__(images, wrong_labels)
+            # adv_images = self.__call__(images, labels)
+            if accuracy:
+                outputs = self.model(adv_images)
+                # print(outputs)
+                _, predicted = torch.max(outputs.data, 1)
+                # print(predicted)
+                total += labels.size(0)
+                correct += (predicted == labels.to(self.device)).sum()
+            if to_uint8:
+                image_list.append((adv_images * 255).type(torch.uint8).cpu())
+            else:
+                image_list.append(adv_images.cpu())
+            # label_list.append(labels)
+            label_list.append(predicted)
+            print('- Save Progress : %2.2f %%        ' % ((step + 1) / total_batch * 100), end='\r')
+            if accuracy:
+                acc = 100 * float(correct) / total
+                print('\n- Accuracy of the model : %f %%' % (acc), end='')
+        x = torch.cat(image_list, 0)
+        y = torch.cat(label_list, 0)
+        # torch.save((x, y), file_name)
+        # print('\n- Save Complete!')
+        print("The new version does not save the data files!")
+        adv_data = torch.utils.data.TensorDataset(x, y)
+        return adv_data
+    # Load image data as torch dataset
+    # When scale=True it automatically tansforms images to [0, 1]
+    def load(self, file_name, scale=True):
+        adv_images, adv_labels = torch.load(file_name)
+        if scale:
+            adv_data = torch.utils.data.TensorDataset(adv_images.float() / adv_images.max(), adv_labels)
+        else:
+            adv_data = torch.utils.data.TensorDataset(adv_images.float(), adv_labels)
+        return adv_data
+
+
+class PGD_l2(Attacks):
+    """
+    CW attack in the paper 'Towards Deep Learning Models Resistant to Adversarial Attacks'
+    [https://arxiv.org/abs/1706.06083]
+    Arguments:
+        model (nn.Module): a model to attack.
+        eps (float): epsilon in the paper. (DEFALUT : 0.3)
+        alpha (float): alpha in the paper. (DEFALUT : 2/255)
+        iters (int): max iterations. (DEFALUT : 40)
+    """
+    def __init__(self, model, eps=0.3, alpha=2 / 255, iters=40):
+        super(PGD_l2, self).__init__("PGD_l2", model)
+        self.eps = eps
+        self.alpha = alpha
+        self.iters = iters
+        self.eps_for_division = 1e-10
+    def __call__(self, images, labels):
+        images = images.to(self.device)
+        labels = labels.to(self.device)
+        loss = nn.CrossEntropyLoss()
+        ori_images = images.data
+        for i in range(self.iters):
+            images.requires_grad = True
+            outputs = self.model(images)
+            self.model.zero_grad()
+            cost = loss(outputs, labels).to(self.device)
+            cost.backward()
+            gradient_norms = torch.norm(images.grad.view(len(images), -1), p=2, dim=1) + self.eps_for_division
+            adv_images = images - self.alpha * images.grad / gradient_norms.view(-1, 1, 1, 1)
+            perturbations = adv_images - ori_images
+            perturb_norms = torch.norm(perturbations.view(len(images), -1), p=2, dim=1)
+            factor = self.eps / perturb_norms
+            factor = torch.min(factor, torch.ones_like(perturb_norms))
+            eta = perturbations * factor.view(-1, 1, 1, 1)
+            # Make sure that the projection does work
+            # if torch.sum(factor) < torch.sum( torch.ones_like(factor))*0.99:
+            #    print(torch.sum(factor)/torch.sum( torch.ones_like(factor)))
+            #    print("This is the iteration" + str(i))
+            images = torch.clamp(ori_images + eta, min=torch.min(images.data), max=torch.max(images.data)).detach_()
+        adv_images = images
+        return adv_images    
+    
+    
+    
+def attack2(model, data, targets, N, n_batch, eps, iters, df_iter, p=1):
+    
+        torch.manual_seed(123456)
+        torch.cuda.manual_seed(123456)
+    
+        c = np.max(targets.cpu().numpy().flatten())
+        num_data = N*n_batch
+        X_ori = torch.Tensor(num_data, 3, 224, 224)
+        X_fgsm = torch.Tensor(num_data, 3, 224, 224)
+        
+        for i in range(n_batch):
+            X_ori[i*N:(i+1)*N] = data[i*N:(i+1)*N].float()           
+    
+        scores = []
+
+        eps = 0.007
+        iters = 7
+
+        PGD_attack = PGD_l2(model = model, eps = eps, iters = iters)
+
+
+        for target_class in range(c):
+
+                        
+            wrong_labels = target_class * torch.ones(size = (data.shape[0],)).long().cuda()
+            data_temp = X_ori[targets.flatten().long().cuda() == wrong_labels.flatten().long().cuda()]
             
-#        cross = torch.nn.CrossEntropyLoss(reduction = 'sum')
-#        score1 = 0
-#        for i in range(n_batch):
-#                with torch.no_grad():
-#                    data_batch = X_fgsm[i*N:(i+1)*N].float().cuda()
-#                    output = model(data_batch)                            
-#                    score1 += cross(output.float().cuda(), targets[i*N:(i+1)*N].long().cuda()).item()       
-#        score1 /= (N*n_batch)  
 
 
-        preds = torch.Tensor(num_data,1)
-        for i in range(n_batch):
-                with torch.no_grad():
-                    data_batch = X_fgsm[i*N:(i+1)*N].float().cuda()
-                    output = model(data_batch)       
-                    preds[i*N:(i+1)*N] = output.data.max(1, keepdim=True)[1] # get the index of the max log-probability
-                           
-        score1 = f1_score(targets.cpu().numpy().flatten(), preds.cpu().numpy().flatten(), average='macro')       
+            wrong_labels = target_class * torch.ones(size = (data_temp.shape[0],)).long()
+            X_fgsm = torch.Tensor(data_temp.shape[0], 3, 224, 224)
+
+            
+            #X_fgsm, _ = fgsm_adaptive_iter(model, data_temp.float().cuda(), wrong_labels.flatten().long().cuda(), eps, iterations=iters)
+            #X_fgsm, _ = deep_fool_iter(model, data_temp.float().cuda(), wrong_labels.flatten().long().cuda(), c=c, p=2, iterations=1)
+            X_fgsm = PGD_attack.__call__(data_temp.float().cuda(), wrong_labels.flatten().long().cuda())
         
-                    
+                
+            with torch.no_grad():
+                data_batch = X_fgsm.float().cuda()
+                output = model(data_batch)       
+                preds = output.data.max(1, keepdim=True)[1] # get the index of the max log-probability
+                     
+                        
+            wrong_labels  = (wrong_labels.cpu().numpy().flatten()).astype(int) 
+            preds = (preds.cpu().numpy().flatten()).astype(int)
+
+            score = f1_score(wrong_labels, preds, average='micro')  
+            print('Accuracy: ', (target_class, score))
+            
+            scores.append(score)
+
+    
+        score1 = np.mean(scores)
+        score2 = np.max(scores) - np.min(scores)
+        score3 = np.min(scores)
         
-        
-        
-     
-        _, absnoise1,  _ = distance(X_fgsm, X_ori, norm=2)
         print('Attack score 1', score1)
-        print('Attack noise 1', absnoise1.item())
-    
-    
-        for i in range(n_batch):
-            X_fgsm[i*N:(i+1)*N], _ = deep_fool_iter(model, X_fgsm[i*N:(i+1)*N].float(), targets[i*N:(i+1)*N].flatten().long().cuda(), c=c, p=2, iterations=df_iter)
-    
-    
-#        cross = torch.nn.CrossEntropyLoss(reduction = 'sum')
-#        score2 = 0
-#        for i in range(n_batch):
-#                with torch.no_grad():
-#                    data_batch = X_fgsm[i*N:(i+1)*N].float().cuda()
-#                    output = model(data_batch)        
-#                    score2 += cross(output.float().cuda(), targets[i*N:(i+1)*N].long().cuda()).item()       
-#        score2 /= (N*n_batch)  
-
-
-        preds = torch.Tensor(num_data,1)
-        for i in range(n_batch):
-                with torch.no_grad():
-                    data_batch = X_fgsm[i*N:(i+1)*N].float().cuda()
-                    output = model(data_batch)       
-                    preds[i*N:(i+1)*N] = output.data.max(1, keepdim=True)[1] # get the index of the max log-probability
-                           
-        score2 = f1_score(targets.cpu().numpy().flatten(), preds.cpu().numpy().flatten(), average='macro')  
-    
-        _, absnoise2,  _ = distance(X_fgsm, X_ori, norm=2)
-    
         print('Attack score 2', score2)
-        print('Attack noise 2', absnoise2.item())
+        print('Attack score 3', score3)
 
-        return score1, score2, absnoise1.item(), absnoise2.item()
+        return score1, score2, score3    
+    
+    
+    
+    
+    

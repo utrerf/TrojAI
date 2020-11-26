@@ -39,33 +39,20 @@ def input_batch(examples_dirpath, example_img_format='png'):
     for fn in fns:
         # read the image (using skimage)
         img = skimage.io.imread(fn)
-        
-        
+        img = img.astype(dtype=np.float32)
+
         # perform center crop to what the CNN is expecting 224x224
         h, w, c = img.shape
         dx = int((w - 224) / 2)
         dy = int((w - 224) / 2)
-        img = img[dy:dy+224, dx:dx+224, :]        
-        
-        
-        # convert to BGR (training codebase uses cv2 to load images which uses bgr format)
-#        r = img[:, :, 0]
-#        g = img[:, :, 1]
-#        b = img[:, :, 2]
-#        img = np.stack((b, g, r), axis=2)
+        img = img[dy:dy + 224, dx:dx + 224, :]
 
-        # Or use cv2 (opencv) to read the image
-        # img = cv2.imread(fn, cv2.IMREAD_UNCHANGED)
-        # img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
-
-        # perform tensor formatting and normalization explicitly
         # convert to CHW dimension ordering
         img = np.transpose(img, (2, 0, 1))
         # convert to NCHW dimension ordering
         img = np.expand_dims(img, 0)
-        # normalize the image
-        img = img - np.min(img)
-        img = img / np.max(img)
+        # normalize the image matching pytorch.transforms.ToTensor()
+        img = img / 255.0
         # convert image to a gpu tensor
         
         imgs.append(img)
@@ -74,7 +61,9 @@ def input_batch(examples_dirpath, example_img_format='png'):
         #img_idf = int(img_idf[6])
         #print(img_idf)
         out = fn.split('_')
-        targets.append(int(out[2]))
+        targets.append(int(out[3]))
+        #targets.append(int(out[2]))
+
         #targets.append(np.asarray(csv.loc[csv['file'] == img_idf]['true_label']))
         
     imgs = np.asarray(imgs)

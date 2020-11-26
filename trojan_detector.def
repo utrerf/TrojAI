@@ -7,15 +7,18 @@ From: pytorch/pytorch:latest
     ./attacks.py /
     ./attack_tools.py /
     ./titration.py /
+    ./Measure_Thickness.py /
     ./spectral.py /
     ./damage.py /
-    ./model.py /
-
+    ./Fourier.py
+    ./troj_classify_boost.sav /
 
 %post
     /opt/conda/bin/conda install scikit-image
     /opt/conda/bin/conda install pandas
     /opt/conda/bin/conda install scikit-learn
+    /opt/conda/bin/conda install pip
+    /opt/conda/bin/python3 -m pip install lightgbm==3.0.0rc1
 
 %runscript
     exec python3 /trojan_detector.py "$@"

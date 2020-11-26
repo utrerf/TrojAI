@@ -40,7 +40,7 @@ def spectral(model, data, targets, N, n_batch, k=2):
                             fnorm = np.linalg.norm(layer.weight.data.cpu().numpy())
                             srank = fnorm**2 / s[0]**2
                             print('Stable rank: ', srank.item())
-                            srank = int(np.ceil(srank.item()+k))
+                            srank = int(np.floor(srank.item()+k))
                             srank = np.minimum(srank, np.min(layer.weight.data.shape))
                             
                             if srank > (np.min(layer.weight.data.shape)):
