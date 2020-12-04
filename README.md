@@ -11,7 +11,7 @@ To install the required pacakages:
 
 ## Example Run
 
-To run the example on backdoored AI (Ben provides):
+To run the example on backdoored AI:
 ```
   $ python trojan_detector.py --model_filepath=./id-00000000/model.pt --result_filepath=./output.txt --scratch_dirpath=./scratch/ --examples_dirpath=./id-00000000/clean_example_data/
 ```
