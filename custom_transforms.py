@@ -9,7 +9,8 @@ class AddGaussianNoise(object):
         self.noise_level = noise_level
 
     def __call__(self, tensor):
-        return tensor + (torch.randn(tensor.size()) * self.std + self.mean) * self.noise_level
+        new_tensor = tensor + (torch.randn(tensor.size()) * self.std + self.mean) * self.noise_level
+        return torch.clamp(new_tensor, min=0, max=1) 
     
     def __repr__(self):
         return self.__class__.__name__ + f'(mean={self.mean}, std={self.std}, noise_level={self.noise_level})'
@@ -21,5 +22,5 @@ TITRATION_TRANSFORM = lambda noise_level: transforms.Compose([
 
 ERASE_TRANSFORM = lambda erase_probability: transforms.Compose([
     transforms.ToTensor(),
-    transforms.RandomErasing(p=erase_probability),
+    transforms.RandomErasing(p=erase_probability, scale=(0.1, 0.4)),
 ])
