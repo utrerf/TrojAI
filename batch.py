@@ -10,9 +10,11 @@ polling_delay_seconds = 1
 def id_gen(i):
     return str(100000000 + i)[1:]
 
+base_dir = '/home_ubuntu/round2/models/'
+
 commands_to_run = [ 'python trojan_detector.py ' +
-                   f'--model_filepath /home/ubuntu/round2/models/id-{id_gen(i)}/model.pt '+
-                   f'--examples_dirpath /home/ubuntu/round2/models/id-{id_gen(i)}/example_data ' 
+                   f'--model_filepath {base_dir}/id-{id_gen(i)}/model.pt '+
+                   f'--examples_dirpath {base_dir}/id-{id_gen(i)}/example_data ' 
                    for i in range(1000)]
 commands_to_run.reverse()
 

@@ -1,4 +1,5 @@
 import torch
+from torch.utils.data import DataLoader
 import argparse
 import tools
 import numpy as np
@@ -8,6 +9,7 @@ from torchvision import transforms
 from robustness import attacker
 import re
 import sys
+# TODO: Update this path and clone PyHessian
 sys.path.append('/home/ubuntu/utrerf/PyHessian')
 from pyhessian import hessian
 
@@ -37,16 +39,16 @@ def trojan_detector(model_filepath, result_filepath, scratch_dirpath, examples_d
     adv_dataset = tools.MadryDataset(None, num_classes=model_info['num_classes'])
     adv_model = attacker.AttackerModel(tools.CustomAdvModel(model), adv_dataset)
     for eps in [.005, 0.015, 0.075, .15]:
-        scores[f'adv_score_linf_eps_{eps}'] = tools.get_adv_score(adv_model, dataset, constraint='inf', eps=eps, iteratons=7)
+        scores[f'adv_score_linf_eps_{eps}'] = tools.get_adv_score(adv_model, dataset, constraint='inf', eps=eps, iterations=7)
     for eps in [.5, 2., 8., 16.]:
-        scores[f'adv_score_l2_eps_{eps}'] = tools.get_adv_score(adv_model, dataset, constraint='2', eps=eps, itrerations=7)
+        scores[f'adv_score_l2_eps_{eps}'] = tools.get_adv_score(adv_model, dataset, constraint='2', eps=eps, iterations=7)
     
     # hessian
     criterion = torch.nn.CrossEntropyLoss()
 
     model = torch.nn.DataParallel(model)
     transform = transforms.ToTensor()
-    loader = DataLoader(dataset, batch_size=64,
+    loader = DataLoader(dataset, batch_size=32,
                         shuffle=True, num_workers=0, pin_memory=True)
     H = hessian(model, criterion, data=None, dataloader=loader, cuda=True)
     scores[f'top_eigenvalues'], _ = H.eigenvalues(top_n=1,maxIter=20)
