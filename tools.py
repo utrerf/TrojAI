@@ -163,7 +163,6 @@ def adv_scores(adv_model, dataset, scores, score, constraint='inf', eps=0.04, it
 
 def adv_scores_helper(adv_model, loader, attack_kwargs, compute_top_eigenvalue, scores, score):
     n = len(loader.dataset) 
-    adv_dataset = None
     preds, targets   = np.zeros(len(loader.dataset)), np.zeros(len(loader.dataset))
     dataset_size = [n] + list(loader.dataset[0][0].shape)
     adv_images = torch.empty(dataset_size, device='cpu', requires_grad=False)
@@ -187,13 +186,15 @@ def adv_scores_helper(adv_model, loader, attack_kwargs, compute_top_eigenvalue, 
             
             current_idx += m
         del inp, target, output, im_adv 
-
+   
+    adv_dataset = None
     if compute_top_eigenvalue:
-        avd_dataset = torch.utils.data.TensorDataset(adv_images)
-        
+        adv_dataset = torch.utils.data.TensorDataset(adv_images, torch.from_numpy(targets))
+
     it_scores = get_scores(targets, preds, n)
     for key, val in it_scores.items():
         scores[f'{key}_{score}'] = val
+    
     return scores, adv_dataset
 
 
@@ -225,6 +226,7 @@ def compute_grad_l2_norm(model, dataset, scores, score, batch_size=40,num_worker
             v = [p.grad.data.flatten().cpu() for p in model.parameters()]
         else:
             v = [v1 + p.grad.data.flatten().cpu() for v1,p in zip(v,model.parameters())]
-    scores[f'grad_l2_norm_{score}'] = torch.cat(v).norm(2)
+    scores[f'grad_l2_norm_{score}'] = torch.cat(v).norm(2).item()
     return scores
+
 
