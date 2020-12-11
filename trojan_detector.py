@@ -9,66 +9,83 @@ from torchvision import transforms
 from robustness import attacker
 import re
 import sys
-# TODO: Update this path and clone PyHessian
-sys.path.append('/home/ubuntu/utrerf/PyHessian')
+sys.path.append('PyHessian')
 from pyhessian import hessian
 
 
-def trojan_detector(model_filepath, result_filepath, scratch_dirpath, examples_dirpath, example_img_format='png'):
-    # load dataset and model
-    tools.set_seeds(123)
-    dataset = tools.TrojAIDataset(examples_dirpath)
+def trojan_detector(model_filepath, result_filepath, scratch_dirpath, 
+                    examples_dirpath, example_img_format='png'):
     
+    torch.set_num_threads(1)
+    tools.set_seeds(123)
+    
+    # load dataset and model
+    dataset = tools.TrojAIDataset(examples_dirpath)
     model = torch.load(model_filepath) 
-    model_info = tools.get_model_info(model)
+    model = tools.CustomAdvModel(model)
     model.cuda().eval()
     
-    scores = {}
+    scores = {} 
     
+    # get num_parameters and classes
+    model_info = tools.get_model_info(model)
+    for key, val in model_info.items():
+        scores[key] = val
+
     # titration
     for noise_level in [.1, .4, .8, 1.6]:
         transform = custom_transforms.TITRATION_TRANSFORM(noise_level)
-        scores[f't_score_noise_level_{noise_level}'] = tools.get_transform_score(model, dataset, transform, num_iterations=10)
-    
+        score = f'noise_level_{noise_level}'
+        scores = tools.transform_scores(model, dataset, transform, scores, score, num_iterations=10)
+
     # erase
     for erase_probability in [1]:
         transform = custom_transforms.ERASE_TRANSFORM(erase_probability) 
-        scores[f't_score_erase_probability_{erase_probability}'] = tools.get_transform_score(model, dataset, 
-                                                                                             transform, num_iterations=20)
-    # adversarial
+        score = f'erase_probability_{erase_probability}' 
+        scores = tools.transform_scores(model, dataset, transform, scores, score, num_iterations=40)
+   
+    # madry adversarial
     adv_dataset = tools.MadryDataset(None, num_classes=model_info['num_classes'])
-    adv_model = attacker.AttackerModel(tools.CustomAdvModel(model), adv_dataset)
-    for eps in [.005, 0.015, 0.075, .15]:
-        scores[f'adv_score_linf_eps_{eps}'] = tools.get_adv_score(adv_model, dataset, constraint='inf', eps=eps, iterations=7)
-    for eps in [.5, 2., 8., 16.]:
-        scores[f'adv_score_l2_eps_{eps}'] = tools.get_adv_score(adv_model, dataset, constraint='2', eps=eps, iterations=7)
+    adv_model = attacker.AttackerModel(model, adv_dataset)
+    hessian_datasets = {'natural':dataset}
+    hessian_list = [.075, 8.]
+    constraints_to_eps = {
+        'inf' : [.005, .015, .075, .15],
+        '2'   : [.5, 2., 8., 16.]
+    }
+    for constraint, eps_list in constraints_to_eps.items():
+        for eps in eps_list:
+            score = f'{constraint}_eps_{eps}'
+            flag = eps in hessian_list
+            scores, hessian_datasets[score] = tools.adv_scores(adv_model, dataset, scores, score, constraint=constraint, eps=eps, 
+                                                                 batch_size=60, iterations=7, compute_top_eigenvalue=flag)
     
     # hessian
-    criterion = torch.nn.CrossEntropyLoss()
+    del adv_dataset, adv_model
+    torch.cuda.empty_cache()
+    for score, hessian_dataset in hessian_datasets.items():
+        if hessian_dataset is not None:
+            del model
+            torch.cuda.empty_cache()
+            model = torch.load(model_filepath) 
+            model.cuda().eval()
+            scores = tools.compute_top_eigenvalue(model, hessian_dataset, scores, score, batch_size=40, max_iter=20)
+            scores = tools.compute_grad_l2_norm(model, hessian_dataset, scores, score, batch_size=40)
 
-    model = torch.nn.DataParallel(model)
-    transform = transforms.ToTensor()
-    loader = DataLoader(dataset, batch_size=32,
-                        shuffle=True, num_workers=0, pin_memory=True)
-    H = hessian(model, criterion, data=None, dataloader=loader, cuda=True)
-    scores[f'top_eigenvalues'], _ = H.eigenvalues(top_n=1,maxIter=20)
-    scores['trace'] = H.trace()
-    scores['density'] = H.density()
-
+    # TODO: chop adversarial
 
     # save results
     model_id = re.findall(r'id-(\d+)/', model_filepath)[0]
-    pd.DataFrame(scores, [0]).to_csv(f'results/{model_id}.csv')
-
-
+    pd.DataFrame(scores, [0]).to_csv(f'results/id-{model_id}.csv')
+    
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Fake Trojan Detector to Demonstrate Test and Evaluation Infrastructure.')
-    parser.add_argument('--model_filepath', type=str, help='File path to the pytorch model file to be evaluated.', default='/home/ubuntu/round2/models/id-00000000/model.pt')
+    parser.add_argument('--model_filepath', type=str, help='File path to the pytorch model file to be evaluated.', default='/scratch/utrerf/round2/models/id-00000000/model.pt')
     parser.add_argument('--result_filepath', type=str, help='File path to the file where output result should be written. After execution this file should contain a single line with a single floating point trojan probability.', default='./output')
-    parser.add_argument('--scratch_dirpath', type=str, help='File path to the folder where scratch disk space exists. This folder will be empty at execution start and will be deleted at completion of execution.', default='./scratch')
-    parser.add_argument('--examples_dirpath', type=str, help='File path to the folder of examples which might be useful for determining whether a model is poisoned.', default='/home/ubuntu/round2/models/id-00000000/example_data')
+    parser.add_argument('--scratch_dirpath', type=str, help='File path to the folder where scratch disk space exists. This folder will be empty at execution start and will be deleted at completion of execution.', default='temp')
+    parser.add_argument('--examples_dirpath', type=str, help='File path to the folder of examples which might be useful for determining whether a model is poisoned.', default='/scratch/utrerf/round2/models/id-00000000/example_data')
 
     args = parser.parse_args()
     trojan_detector(args.model_filepath, args.result_filepath, args.scratch_dirpath, args.examples_dirpath)

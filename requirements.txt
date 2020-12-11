@@ -4,3 +4,5 @@ scikit-image
 torch
 torchvision
 robustness
+chop
+-e git+git://github.com/amirgholami/PyHessian.git#egg=PyHessian
