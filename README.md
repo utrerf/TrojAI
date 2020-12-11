@@ -6,6 +6,7 @@ Routines to detect backdoored AIs
 To install the required pacakages:
 
 ```
+  $ git clone https://github.com/amirgholami/PyHessian.git
   $ pip install -r requirements.txt
 ```
 
