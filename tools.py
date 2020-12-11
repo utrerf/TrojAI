@@ -140,15 +140,20 @@ class CustomAdvModel(torch.nn.Module):
 def adv_scores(adv_model, dataset, scores, score, constraint='inf', eps=0.04, iterations=3, 
                   transform=None, batch_size=60, num_workers=0,
                   compute_top_eigenvalue=False):
-    attack_kwargs = {
-            'constraint': constraint, # L-inf PGD
-            'eps': eps, # Epsilon constraint (L-inf norm)
-            'step_size': 2.*(eps/iterations), # Learning rate for PGD
-            'iterations': iterations, # Number of PGD steps
-            'targeted': False, # Targeted attack
-            'custom_loss': None, # Use default cross-entropy loss
-            'random_start': True
-            }
+    if constraint in ['2', 'inf']:
+        attack_kwargs = {
+                'constraint': constraint, # L-inf PGD
+                'eps': eps, # Epsilon constraint (L-inf norm)
+                'step_size': 2.*(eps/iterations), # Learning rate for PGD
+                'iterations': iterations, # Number of PGD steps
+                'targeted': False, # Targeted attack
+                'custom_loss': None, # Use default cross-entropy loss
+                'random_start': True
+                }
+    else:
+        # TODO: Add chop_func attack_kwargs
+        attack_kwargs = {
+                }
     dataset.transform = transform
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, 
                            num_workers=num_workers, pin_memory=False)
@@ -164,8 +169,13 @@ def adv_scores_helper(adv_model, loader, attack_kwargs, compute_top_eigenvalue, 
     adv_images = torch.empty(dataset_size, device='cpu', requires_grad=False)
     current_idx = 0
     for inp, target in loader:
-        output, im_adv = adv_model(inp.cuda(), target.cuda(), make_adv=True, **attack_kwargs)
-        
+        if attack_kwargs['constraint'] in ['2', 'inf']:
+            output, im_adv = adv_model(inp.cuda(), target.cuda(), make_adv=True, **attack_kwargs)
+        else: 
+            # TODO: feel free to change inputs to the function, but please keep outputs fixed
+            #       adv_model.model takes the model out of the madry wrapper class
+            output, im_adv = chop_func(adv_model.model, inp.cuda(), target.cuda(), **attack_kwargs)
+            
         with torch.no_grad():
             m = len(target)
             argmax =  torch.argmax(output, dim=1).cpu().numpy().flatten()
@@ -185,7 +195,12 @@ def adv_scores_helper(adv_model, loader, attack_kwargs, compute_top_eigenvalue, 
     for key, val in it_scores.items():
         scores[f'{key}_{score}'] = val
     return scores, adv_dataset
-   
+
+
+def chop_func(model, inp, target, **attack_kwargs):
+    # TODO: fill out
+    return output, im_adv
+
 
 def compute_top_eigenvalue(model, dataset, scores, score, batch_size=60, num_workers=0, 
                                        criterion=torch.nn.CrossEntropyLoss(), max_iter=10):

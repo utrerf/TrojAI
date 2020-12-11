@@ -43,8 +43,10 @@ def trojan_detector(model_filepath, result_filepath, scratch_dirpath,
         transform = custom_transforms.ERASE_TRANSFORM(erase_probability) 
         score = f'erase_probability_{erase_probability}' 
         scores = tools.transform_scores(model, dataset, transform, scores, score, num_iterations=40)
-   
-    # madry adversarial
+    
+    # TODO: decide where to call adv_scores for chop constraints
+
+    # adversarial
     adv_dataset = tools.MadryDataset(None, num_classes=model_info['num_classes'])
     adv_model = attacker.AttackerModel(model, adv_dataset)
     hessian_datasets = {'natural':dataset}
@@ -71,8 +73,6 @@ def trojan_detector(model_filepath, result_filepath, scratch_dirpath,
             model.cuda().eval()
             scores = tools.compute_top_eigenvalue(model, hessian_dataset, scores, score, batch_size=40, max_iter=20)
             scores = tools.compute_grad_l2_norm(model, hessian_dataset, scores, score, batch_size=40)
-
-    # TODO: chop adversarial
 
     # save results
     model_id = re.findall(r'id-(\d+)/', model_filepath)[0]
