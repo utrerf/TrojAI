@@ -189,7 +189,7 @@ def adv_scores_helper(adv_model, loader, attack_kwargs, compute_top_eigenvalue, 
    
     adv_dataset = None
     if compute_top_eigenvalue:
-        adv_dataset = torch.utils.data.TensorDataset(adv_images, torch.from_numpy(targets))
+        adv_dataset = torch.utils.data.TensorDataset(adv_images, torch.from_numpy(targets).type(torch.long))
 
     it_scores = get_scores(targets, preds, n)
     for key, val in it_scores.items():
