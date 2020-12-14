@@ -4,14 +4,10 @@ From: pytorch/pytorch:latest
 %files
     ./trojan_detector.py /
     ./utils.py /
-    ./attacks.py /
-    ./attack_tools.py /
-    ./titration.py /
-    ./Measure_Thickness.py /
-    ./spectral.py /
-    ./damage.py /
-    ./Fourier.py
-    ./troj_classify_boost.sav /
+    ./classifier.py /
+    ./model.joblib /
+    ./features.csv /
+
 
 %post
     /opt/conda/bin/conda install scikit-image

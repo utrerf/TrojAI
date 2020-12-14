@@ -12,11 +12,11 @@ os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 def id_gen(i):
     return str(100000000 + i)[1:]
 
-base_dir = '/scratch/utrerf/round2/models'
+base_dir = '/scratch/erichson/TrojAI'
 
 commands_to_run = [ 'python trojan_detector.py ' +
                    f'--model_filepath {base_dir}/id-{id_gen(i)}/model.pt '+
-                   f'--examples_dirpath {base_dir}/id-{id_gen(i)}/example_data ' 
+                   f'--examples_dirpath {base_dir}/id-{id_gen(i)}/clean_example_data ' 
                    for i in range(1000)]
 commands_to_run.reverse()
 
