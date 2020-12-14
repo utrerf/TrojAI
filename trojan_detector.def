@@ -3,7 +3,8 @@ From: pytorch/pytorch:latest
 
 %files
     ./trojan_detector.py /
-    ./utils.py /
+    ./tools.py /
+    ./custom_transforms.py /
     ./classifier.py /
     ./model.joblib /
     ./features.csv /
@@ -12,9 +13,12 @@ From: pytorch/pytorch:latest
 %post
     /opt/conda/bin/conda install scikit-image
     /opt/conda/bin/conda install pandas
+    /opt/conda/bin/conda install numpy
+    /opt/conda/bin/conda install joblib
     /opt/conda/bin/conda install scikit-learn
     /opt/conda/bin/conda install pip
     /opt/conda/bin/python3 -m pip install lightgbm==3.0.0rc1
+
 
 %runscript
     exec python3 /trojan_detector.py "$@"

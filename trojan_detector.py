@@ -8,9 +8,9 @@ import custom_transforms
 from torchvision import transforms
 from robustness import attacker
 import re
-import sys
-sys.path.append('PyHessian')
-from pyhessian import hessian
+# import sys
+# sys.path.append('PyHessian')
+# from pyhessian import hessian
 import classifier
 
 
