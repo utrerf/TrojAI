@@ -56,13 +56,14 @@ def trojan_detector(model_filepath, result_filepath, scratch_dirpath,
     constraints_to_eps = {
         'inf' : [.15],
         '2'   : [.5, 2., 4., 8., 10., 16.],
-        'groupLasso': [.1, .5, 1.5, 2., 4., 10.]
+        'groupLasso': [.1, .5, 1.5, 2., 4., 10.],
+        'tracenorm': [.1, .5, 1., 5.]
     }
     for constraint, eps_list in constraints_to_eps.items():
         for eps in eps_list:
             score = f'{constraint}_eps_{eps}'
             flag = eps in hessian_list
-            if constraint == 'groupLasso':
+            if constraint in ['groupLasso', 'tracenorm']:
                 adversary_alg = chop.optim.minimize_frank_wolfe
             else:
                 adversary_alg = None
