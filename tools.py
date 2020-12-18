@@ -9,9 +9,10 @@ from sklearn.metrics import f1_score
 from torchvision import transforms
 from PIL import Image
 from robustness.datasets import DataSet 
+import chop
 import sys
-sys.path.append('PyHessian')
-from pyhessian import hessian
+# sys.path.append('PyHessian')
+# from pyhessian import hessian
 
 
 def set_seeds(seed):
@@ -139,6 +140,7 @@ class CustomAdvModel(torch.nn.Module):
 
 def adv_scores(adv_model, dataset, scores, score, constraint='inf', eps=0.04, iterations=3, 
                   transform=None, batch_size=60, num_workers=0,
+                  adversary_alg=None,
                   compute_top_eigenvalue=False):
     if constraint in ['2', 'inf']:
         attack_kwargs = {
@@ -153,7 +155,13 @@ def adv_scores(adv_model, dataset, scores, score, constraint='inf', eps=0.04, it
     else:
         # TODO: Add chop_func attack_kwargs
         attack_kwargs = {
+            'constraint': constraint,
+            'eps': eps,
+            'criterion': torch.nn.CrossEntropyLoss(reduction='none'),
+            'adversary': chop.Adversary(adversary_alg),
+            'iterations': iterations,
                 }
+
     dataset.transform = transform
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, 
                            num_workers=num_workers, pin_memory=False)
@@ -199,7 +207,42 @@ def adv_scores_helper(adv_model, loader, attack_kwargs, compute_top_eigenvalue, 
 
 
 def chop_func(model, inp, target, **attack_kwargs):
-    # TODO: fill out
+    
+    if attack_kwargs['constraint'] == '1':
+        constraint = chop.constraints.L1ball(attack_kwargs['eps'])
+    elif attack_kwargs['constraint'] in ['groupLasso', 'groupL1']:
+        groups = chop.image.group_patches(x_patch_size=8, y_patch_size=8,
+                                          x_image_size=inp.size(-2),
+                                          y_image_size=inp.size(-1)
+                                          )
+        constraint = chop.constraints.GroupL1Ball(attack_kwargs['eps'], groups)
+    # aliases for the sum of eigenvalue ball
+    elif attack_kwargs['constraint'] in ['nuclearnorm', 'tracenorm']:
+        constraint = chop.constraints.NuclearNormBall(attack_kwargs['eps'])
+
+    adversary = attack_kwargs['adversary']
+
+    # define projection on image space (0, 1) box constraint
+    def image_constraint_prox(delta, step_size=None):
+        adv_img = torch.clamp(inp + delta, 0, 1)
+        delta = adv_img - inp 
+        return delta
+
+    if adversary.method in [chop.optim.minimize_frank_wolfe,
+                            chop.optim.minimize_pgd_madry]:
+        attack_kwargs['lmo'] = constraint.lmo
+        
+    elif adversary.method == chop.optim.minimize_three_split:
+        attack_kwargs['prox1'] = constraint.prox
+        attack_kwargs['prox2'] = image_constraint_prox
+
+    _, delta = adversary.perturb(inp, target, model,
+                                 max_iter=attack_kwargs['iterations'], **attack_kwargs)
+
+    delta = image_constraint_prox(delta)
+    im_adv = inp + delta
+    output = model(im_adv)
+    
     return output, im_adv
 
 

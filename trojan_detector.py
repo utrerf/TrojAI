@@ -7,6 +7,7 @@ import pandas as pd
 import custom_transforms
 from torchvision import transforms
 from robustness import attacker
+import chop
 import re
 # import sys
 # sys.path.append('PyHessian')
@@ -54,14 +55,21 @@ def trojan_detector(model_filepath, result_filepath, scratch_dirpath,
     hessian_list = [.15, .5, 2., 8., 16.]
     constraints_to_eps = {
         'inf' : [.15],
-        '2'   : [.5, 2., 4., 8., 10., 16.]
+        '2'   : [.5, 2., 4., 8., 10., 16.],
+        'groupLasso': [.1, .5, 1.5, 2., 4., 10.],
+        'tracenorm': [.1, .5, 1., 5.]
     }
     for constraint, eps_list in constraints_to_eps.items():
         for eps in eps_list:
             score = f'{constraint}_eps_{eps}'
             flag = eps in hessian_list
+            if constraint in ['groupLasso', 'tracenorm']:
+                adversary_alg = chop.optim.minimize_frank_wolfe
+            else:
+                adversary_alg = None
             scores, hessian_datasets[score] = tools.adv_scores(adv_model, dataset, scores, score, constraint=constraint, eps=float(eps), 
-                                                                 batch_size=60, iterations=7, compute_top_eigenvalue=flag)
+                                                                 batch_size=32, iterations=7, compute_top_eigenvalue=flag,
+                                                                 adversary_alg=adversary_alg)
     
     # hessian
     del adv_dataset, adv_model
