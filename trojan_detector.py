@@ -13,10 +13,10 @@ import re
 # sys.path.append('PyHessian')
 # from pyhessian import hessian
 import classifier
-
+import joblib
 
 def trojan_detector(model_filepath, result_filepath, scratch_dirpath, 
-                    examples_dirpath, example_img_format='png'):
+                    examples_dirpath, example_img_format='png', is_train=False):
     
     torch.set_num_threads(1)
     tools.set_seeds(123)
@@ -85,15 +85,21 @@ def trojan_detector(model_filepath, result_filepath, scratch_dirpath,
 
     results_df = pd.DataFrame(scores, [0])
     
-    # save results
-    #model_id = re.findall(r'id-(\d+)/', model_filepath)[0]
-    #results_df.to_csv(f'results/id-{model_id}.csv')
-    
-    # make prediction
-    trojan_probability = classifier.make_prediction(results_df)
+    if is_train:
+        # save results
+        model_id = re.findall(r'id-(\d+)/', model_filepath)[0]
+        results_df.to_csv(f'results/id-{model_id}.csv')
+    else:
+        # make prediction
+        clf_filename = '/model.joblib'
+        features_filename = '/features.csv'
 
-    with open(result_filepath, 'w') as fh:
-        fh.write("{}".format(trojan_probability))
+        clf = joblib.load(clf_filename)
+        features = list(pd.read_csv(features_filename).columns)
+        
+        trojan_probability = classifier.make_prediction(results_df)
+        with open(result_filepath, 'w') as fh:
+            fh.write("{}".format(trojan_probability))
 
 
 if __name__ == "__main__":
@@ -101,7 +107,8 @@ if __name__ == "__main__":
     parser.add_argument('--model_filepath', type=str, help='File path to the pytorch model file to be evaluated.', default='/scratch/utrerf/round2/models/id-00000000/model.pt')
     parser.add_argument('--result_filepath', type=str, help='File path to the file where output result should be written. After execution this file should contain a single line with a single floating point trojan probability.', default='./output')
     parser.add_argument('--scratch_dirpath', type=str, help='File path to the folder where scratch disk space exists. This folder will be empty at execution start and will be deleted at completion of execution.', default='temp')
-    parser.add_argument('--examples_dirpath', type=str, help='File path to the folder of examples which might be useful for determining whether a model is poisoned.', default='/scratch/utrerf/round2/models/id-00000000/example_data')
+    parser.add_argument('--examples_dirpath', type=str, help='File path to the folder of examples which might be useful for determining whether a model is poisoned.', default='/scratch/utrerf/round2/models/id-00000000/example_data') 
+    parser.add_argument('--is_train', type=bool, help='If True, then it saves results to csv and doesnt do inference.', default=False)
 
     args = parser.parse_args()
-    trojan_detector(args.model_filepath, args.result_filepath, args.scratch_dirpath, args.examples_dirpath)
+    trojan_detector(args.model_filepath, args.result_filepath, args.scratch_dirpath, args.examples_dirpath, args.is_train)
