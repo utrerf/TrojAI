@@ -52,7 +52,7 @@ class TrojAIDataset(Dataset):
         return len(self.x)
 
 
-def get_model_info(model): 
+def get_model_info(model, dataset): 
     model_info = {}
     total_parameters = 0
     for parameter in model.parameters():
@@ -62,6 +62,8 @@ def get_model_info(model):
         total_parameters += num_parameters
     model_info['total_parameters'] = total_parameters
     model_info['num_classes'] = len(parameter)
+    # model_info['num_classes'] = len(np.unique(dataset.y.numpy()))
+    
     return model_info
 
 
@@ -194,11 +196,10 @@ def adv_scores_helper(adv_model, loader, attack_kwargs, compute_top_eigenvalue, 
             
             current_idx += m
         del inp, target, output, im_adv 
-   
+     
     adv_dataset = None
     if compute_top_eigenvalue:
         adv_dataset = torch.utils.data.TensorDataset(adv_images, torch.from_numpy(targets).type(torch.long))
-
     it_scores = get_scores(targets, preds, n)
     for key, val in it_scores.items():
         scores[f'{key}_{score}'] = val

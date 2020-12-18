@@ -7,7 +7,7 @@ import pandas as pd
 import custom_transforms
 from torchvision import transforms
 from robustness import attacker
-import chop
+import chop.optim
 import re
 # import sys
 # sys.path.append('PyHessian')
@@ -30,7 +30,7 @@ def trojan_detector(model_filepath, result_filepath, scratch_dirpath,
     scores = {} 
     
     # get num_parameters and classes
-    model_info = tools.get_model_info(model)
+    model_info = tools.get_model_info(model, dataset)
     for key, val in model_info.items():
         scores[key] = val
 
@@ -103,11 +103,12 @@ def trojan_detector(model_filepath, result_filepath, scratch_dirpath,
 
 
 if __name__ == "__main__":
+    
     parser = argparse.ArgumentParser(description='Fake Trojan Detector to Demonstrate Test and Evaluation Infrastructure.')
-    parser.add_argument('--model_filepath', type=str, help='File path to the pytorch model file to be evaluated.', default='/scratch/utrerf/round2/models/id-00000000/model.pt')
+    parser.add_argument('--model_filepath', type=str, help='File path to the pytorch model file to be evaluated.', default='/scratch/utrerf/round2/models/id-00000001/model.pt')
     parser.add_argument('--result_filepath', type=str, help='File path to the file where output result should be written. After execution this file should contain a single line with a single floating point trojan probability.', default='./output')
     parser.add_argument('--scratch_dirpath', type=str, help='File path to the folder where scratch disk space exists. This folder will be empty at execution start and will be deleted at completion of execution.', default='temp')
-    parser.add_argument('--examples_dirpath', type=str, help='File path to the folder of examples which might be useful for determining whether a model is poisoned.', default='/scratch/utrerf/round2/models/id-00000000/example_data') 
+    parser.add_argument('--examples_dirpath', type=str, help='File path to the folder of examples which might be useful for determining whether a model is poisoned.', default='/scratch/utrerf/round2/models/id-00000001/example_data') 
     parser.add_argument('--is_train', type=bool, help='If True, then it saves results to csv and doesnt do inference.', default=False)
 
     args = parser.parse_args()
