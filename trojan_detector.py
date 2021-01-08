@@ -52,7 +52,7 @@ def trojan_detector(model_filepath, result_filepath, scratch_dirpath,
        'inf' : [.07, .15, .5, .2],
        '2'   : [.5, 2., 4., 8., 10., 16., 20],
        'tracenorm': [.1, .5, 1., 5.],
-       'groupLasso': np.linspace(-5, -1, num=10)
+       'groupLasso': 10 ** np.linspace(-5, -1, num=10)
     }
     for constraint, eps_list in constraints_to_eps.items():
         for eps in eps_list:
