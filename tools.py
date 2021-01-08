@@ -218,7 +218,7 @@ def chop_func(model, inp, target, **attack_kwargs):
                                           x_image_size=inp.size(-2),
                                           y_image_size=inp.size(-1)
                                           )
-        constraint = chop.constraints.GroupL1Ball(attack_kwargs['eps'], groups)
+        constraint = chop.constraints.GroupL1Ball(attack_kwargs['eps'] * len(groups), groups)
     # aliases for the sum of eigenvalue ball
     elif attack_kwargs['constraint'] in ['nuclearnorm', 'tracenorm']:
         constraint = chop.constraints.NuclearNormBall(attack_kwargs['eps'])
