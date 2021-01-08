@@ -11,8 +11,10 @@ from PIL import Image
 from robustness.datasets import DataSet 
 import chop
 import sys
-# sys.path.append('PyHessian')
-# from pyhessian import hessian
+from scipy.stats import entropy
+
+sys.path.append('PyHessian')
+from pyhessian import hessian
 
 
 def set_seeds(seed):
@@ -77,7 +79,7 @@ def transform_scores(model, dataset, transform, scores, score,
 
 def transform_scores_helper(model, loader, num_iterations, scores, score):
     # compute the mean f1 score over num_iterations
-    f1_sum, avg_abs_dev_sum, sum_std_pred_bins = 0, 0, 0
+    it_scores_sum = {}
     for iteration in range(num_iterations):
         n = len(loader.dataset)
         preds, targets = np.zeros(n), np.zeros(n)
@@ -92,13 +94,13 @@ def transform_scores_helper(model, loader, num_iterations, scores, score):
                 targets[current_idx : current_idx+m] += target.numpy().flatten()
                 current_idx += m
         it_scores = get_scores(targets, preds, n)
-        f1_sum += it_scores['f1']
-        avg_abs_dev_sum += it_scores['aad']
-        sum_std_pred_bins += it_scores['aad_std']
-
-    f1, aad, aad_std = f1_sum/num_iterations, avg_abs_dev_sum/num_iterations, sum_std_pred_bins/num_iterations
-    scores[f'f1_{score}'], scores[f'aad_{score}'], scores[f'aad_std_{score}'] = f1, aad, aad_std 
-    return scores
+        if iteration == 0:
+            it_scores_sum = it_scores
+        else: 
+            for k in it_scores.keys():
+                it_scores_sum[k] += it_scores[k]
+    
+    return {k:v/num_iterations for k, v in it_scores_sum.items()}
 
 
 def get_scores(targets, preds, n):
@@ -110,6 +112,8 @@ def get_scores(targets, preds, n):
     target_bins = np.bincount(targets.astype(int), minlength=num_classes)/n
     scores['aad']= np.mean(np.abs(pred_bins - target_bins))
     scores['aad_std'] = np.std(pred_bins)
+    scores['entropy'] = entropy(pred_bins)
+    scores['kl'] = entropy(pred_bins, target_bins)
 
     return scores
 
@@ -141,9 +145,7 @@ class CustomAdvModel(torch.nn.Module):
 
 
 def adv_scores(adv_model, dataset, scores, score, constraint='inf', eps=0.04, iterations=3, 
-                  transform=None, batch_size=60, num_workers=0,
-                  adversary_alg=None,
-                  compute_top_eigenvalue=False):
+                  transform=None, batch_size=20, num_workers=0, adversary_alg=None):
     if constraint in ['2', 'inf']:
         attack_kwargs = {
                 'constraint': constraint, # L-inf PGD
@@ -259,6 +261,21 @@ def compute_top_eigenvalue(model, dataset, scores, score, batch_size=60, num_wor
     return scores
 
 
+def compute_density(model, dataset, scores, score, batch_size=60, num_workers=0, 
+                                       criterion=torch.nn.CrossEntropyLoss(), max_iter=10):
+    loader = DataLoader(dataset, batch_size=batch_size, 
+                        shuffle=True, num_workers=num_workers, pin_memory=False)
+    H = hessian(model, criterion, data=None, dataloader=loader, cuda=True)
+    density_eigen, density_weight = H.density(iter=max_iter) 
+    print(f'density_eigen:  {density_eigen}')
+    print(f'density_weight: {density_weight}')
+    del H
+    torch.cuda.empty_cache()
+    scores[f'density_eigen_{score}'] = density_eigen
+    scores[f'density_weight_{score}'] = density_weight
+    return scores
+
+
 def compute_grad_l2_norm(model, dataset, scores, score, batch_size=40,num_workers=0,
                                               criterion=torch.nn.CrossEntropyLoss()):
     loader = DataLoader(dataset, batch_size=batch_size, 
@@ -273,4 +290,13 @@ def compute_grad_l2_norm(model, dataset, scores, score, batch_size=40,num_worker
     scores[f'grad_l2_norm_{score}'] = torch.cat(v).norm(2).item()
     return scores
 
-
+def charles_function(model, dataset, scores):
+    # this is optional
+    # loader = DataLoader(dataset, batch_size=batch_size, 
+    #                    shuffle=True, num_workers=num_workers, pin_memory=False)
+    charles_scores = {}
+    # scores is the dictionary where we keep all the features, so just add your scores to it
+    for k, v in charles_scores.items():
+        scores[k] = v
+        
+    return scores 
