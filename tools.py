@@ -14,8 +14,9 @@ import sys
 from scipy.stats import entropy
 
 sys.path.append('PyHessian')
+sys.path.append("../zeroq_classification")
 from pyhessian import hessian
-
+from troj_utils import distill_troj_model_gaussian
 
 def set_seeds(seed):
     np.random.seed(seed)
@@ -46,8 +47,6 @@ class TrojAIDataset(Dataset):
         x, y = self.x[index], self.y[index]
         if self.transform: 
             x = self.transform(x)
-        #else:
-        #    x = self.default_transform(x)
         return x, y
 
     def __len__(self):
@@ -64,7 +63,6 @@ def get_model_info(model, dataset):
         total_parameters += num_parameters
     model_info['total_parameters'] = total_parameters
     model_info['num_classes'] = len(parameter)
-    # model_info['num_classes'] = len(np.unique(dataset.y.numpy()))
     
     return model_info
 
@@ -86,10 +84,9 @@ def transform_scores_helper(model, loader, num_iterations, scores, score):
         current_idx = 0
         for inp, target in loader:
             with torch.no_grad():
-                inp = inp.cuda()
-                output = model(inp)
-                m = len(target)
+                output = model(inp.cuda())
                 argmax =  torch.argmax(output, dim=1).type(torch.uint8).cpu().numpy().flatten()
+                m = len(target)
                 preds[current_idx : current_idx+m] += argmax
                 targets[current_idx : current_idx+m] += target.numpy().flatten()
                 current_idx += m
@@ -157,7 +154,6 @@ def adv_scores(adv_model, dataset, scores, score, constraint='inf', eps=0.04, it
                 'random_start': True
                 }
     else:
-        # TODO: Add chop_func attack_kwargs
         attack_kwargs = {
             'constraint': constraint,
             'eps': eps,
@@ -169,22 +165,20 @@ def adv_scores(adv_model, dataset, scores, score, constraint='inf', eps=0.04, it
     dataset.transform = transform
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, 
                            num_workers=num_workers, pin_memory=False)
-    return adv_scores_helper(adv_model, loader, attack_kwargs, 
-                               compute_top_eigenvalue, scores, score)
+    return adv_scores_helper(adv_model, loader, attack_kwargs, scores, score)
 
 
-def adv_scores_helper(adv_model, loader, attack_kwargs, compute_top_eigenvalue, scores, score):
+def adv_scores_helper(adv_model, loader, attack_kwargs, scores, score):
     n = len(loader.dataset) 
     preds, targets   = np.zeros(len(loader.dataset)), np.zeros(len(loader.dataset))
     dataset_size = [n] + list(loader.dataset[0][0].shape)
-    adv_images = torch.empty(dataset_size, device='cpu', requires_grad=False)
+    triggers = torch.empty(dataset_size, device='cpu', requires_grad=False)
+    
     current_idx = 0
     for inp, target in loader:
         if attack_kwargs['constraint'] in ['2', 'inf']:
             output, im_adv = adv_model(inp.cuda(), target.cuda(), make_adv=True, **attack_kwargs)
         else: 
-            # TODO: feel free to change inputs to the function, but please keep outputs fixed
-            #       adv_model.model takes the model out of the madry wrapper class
             output, im_adv = chop_func(adv_model.model, inp.cuda(), target.cuda(), **attack_kwargs)
             
         with torch.no_grad():
@@ -192,21 +186,18 @@ def adv_scores_helper(adv_model, loader, attack_kwargs, compute_top_eigenvalue, 
             argmax =  torch.argmax(output, dim=1).cpu().numpy().flatten()
             preds[current_idx : current_idx+m] += argmax
             targets[current_idx : current_idx+m] += target.numpy().flatten()
- 
-            if compute_top_eigenvalue:
-                adv_images[current_idx : current_idx+m] = im_adv.detach().clone().cpu()
+            trigger = im_adv - inp.cuda() 
+            triggers[current_idx : current_idx+m] = trigger.detach().clone().cpu()
             
             current_idx += m
         del inp, target, output, im_adv 
      
-    adv_dataset = None
-    if compute_top_eigenvalue:
-        adv_dataset = torch.utils.data.TensorDataset(adv_images, torch.from_numpy(targets).type(torch.long))
+    triggers_dataset = torch.utils.data.TensorDataset(triggers, torch.from_numpy(preds).type(torch.long))
     it_scores = get_scores(targets, preds, n)
     for key, val in it_scores.items():
         scores[f'{key}_{score}'] = val
     
-    return scores, adv_dataset
+    return scores, triggers_dataset
 
 
 def chop_func(model, inp, target, **attack_kwargs):
@@ -290,11 +281,78 @@ def compute_grad_l2_norm(model, dataset, scores, score, batch_size=40,num_worker
     scores[f'grad_l2_norm_{score}'] = torch.cat(v).norm(2).item()
     return scores
 
+
+class Triggered_Dataset(Dataset):
+    def __init__(self, clean_dataset, trigger, trigger_class, transform=None):
+        self.clean_dataset = clean_dataset
+        self.trigger = trigger
+        self.y = trigger_class
+        self.transform = transform
+
+    def __getitem__(self, index):
+        x, _ = self.clean_dataset[index]
+        x = torch.clamp(x + self.trigger, 0 , 1)
+        if self.transform: 
+            x = self.transform(x)
+        return x, self.y
+
+    def __len__(self):
+        return len(self.clean_dataset)
+
+
+def artificial_trigger_success(model, dataset, adv_datasets, scores,
+                               batch_size=20, num_workers=0):
+    for score, adv_dataset in adv_datasets.items():
+        max_trigger_success = 0
+        for trigger, trigger_class in adv_dataset:
+            trig_ds = Triggered_Dataset(dataset, trigger, trigger_class)
+            trig_loader = DataLoader(trig_ds, batch_size=batch_size, 
+                                     shuffle=True, num_workers=num_workers, pin_memory=False)
+            acc_sum = 0
+            for inp, target in trig_loader:
+                with torch.no_grad():
+                    output = model(inp.cuda())
+                    argmax =  torch.argmax(output, dim=1).type(torch.uint8).cpu().numpy().flatten()
+                    acc_sum += np.sum(argmax == target.numpy().flatten())
+            acc = acc_sum/len(trig_loader.dataset)
+            if acc > max_trigger_success:
+                max_trigger_success = acc
+        
+        scores[score+'_artficial_trigger_acc'] = max_trigger_success
+    return scores
+
+
 def charles_function(model, dataset, scores):
     # this is optional
     # loader = DataLoader(dataset, batch_size=batch_size, 
     #                    shuffle=True, num_workers=num_workers, pin_memory=False)
+    n_iters = 250
+    batch_size = 16
+    lr = 0.5
+    num_batches = 5
+    refined_gaussian,_,_,_,_,gaussian_orig,_ = distill_troj_model_gaussian(model, n_iters, batch_size,num_batches)
+    def l1_img_metric(a,b):
+        if not isinstance(a,np.ndarray):
+            a = a.detach().cpu().numpy()
+        if not isinstance(b,np.ndarray):
+            b = b.detach().cpu().numpy()
+        return np.sum(np.power(a-b,2),axis=(1,2,3))
+    def l2_img_metric(a,b):
+        if not isinstance(a,np.ndarray):
+            a = a.detach().cpu().numpy()
+        if not isinstance(b,np.ndarray):
+            b = b.detach().cpu().numpy()
+        return np.sum(np.abs(a-b),axis=(1,2,3))
+    def flatten_sublist(lst):
+        return [item for sublist in lst for item in sublist]
+    this_l1 = flatten_sublist([l1_img_metric(a,b).tolist() for a,b in zip(refined_gaussian,gaussian_orig)])
+    this_l2 = flatten_sublist([l2_img_metric(a,b).tolist() for a,b in zip(refined_gaussian,gaussian_orig)])
+
     charles_scores = {}
+    charles_scores['l1_gaussian_avg'] = np.average(this_l1)
+    charles_scores['l2_gaussian_avg'] = np.average(this_l2)
+    charles_scores['l1_gaussian_std'] = np.std(this_l1)
+    charles_scores['l2_gaussian_std'] = np.std(this_l2)
     # scores is the dictionary where we keep all the features, so just add your scores to it
     for k, v in charles_scores.items():
         scores[k] = v

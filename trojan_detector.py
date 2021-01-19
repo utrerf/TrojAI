@@ -32,27 +32,27 @@ def trojan_detector(model_filepath, result_filepath, scratch_dirpath,
         scores[key] = val
 
     # titration
-    for noise_level in [0.4, 0.8, 1.6, 2]:
-        transform = custom_transforms.TITRATION_TRANSFORM(noise_level)
-        score = f'noise_level_{noise_level}'
-        scores = tools.transform_scores(model, dataset, transform, scores, score, num_iterations=10)
+    #for noise_level in [0.4, 0.8, 1.6, 2]:
+    #    transform = custom_transforms.TITRATION_TRANSFORM(noise_level)
+    #    score = f'noise_level_{noise_level}'
+    #    scores = tools.transform_scores(model, dataset, transform, scores, score, num_iterations=10)
 
-    # erase
-    for erase_probability in [1]:
-        transform = custom_transforms.ERASE_TRANSFORM(erase_probability) 
-        score = f'erase_probability_{erase_probability}' 
-        scores = tools.transform_scores(model, dataset, transform, scores, score, num_iterations=40)
+    ## erase
+    #for erase_probability in [1]:
+    #    transform = custom_transforms.ERASE_TRANSFORM(erase_probability) 
+    #    score = f'erase_probability_{erase_probability}' 
+    #    scores = tools.transform_scores(model, dataset, transform, scores, score, num_iterations=40)
 
     # adversarial
     adv_dataset = tools.MadryDataset(None, num_classes=model_info['num_classes'])
     adv_model = attacker.AttackerModel(model, adv_dataset)
-    hessian_datasets = {'natural':dataset}
-    hessian_list = []
+    adv_datasets = {}
     constraints_to_eps = {
-       'inf' : [.07, .15, .5, .2],
-       '2'   : [.5, 2., 4., 8., 10., 16., 20],
-       'tracenorm': 10 ** np.linspace(-3, 3, num=10),
-       'groupLasso': 10 ** np.linspace(-5, -1, num=10)
+       'inf' : [.05, .4, 3.2, 9.],
+       '2'   : [.5, 4., 32., 90.],
+       #'2'   : [.5, 2., 4., 8., 10., 16., 20],
+       #'tracenorm': 10 ** np.linspace(-3, 3, num=10),
+       #'groupLasso': 10 ** np.linspace(-5, -1, num=10)
     }
     for constraint, eps_list in constraints_to_eps.items():
         for eps in eps_list:
@@ -61,14 +61,16 @@ def trojan_detector(model_filepath, result_filepath, scratch_dirpath,
                 adversary_alg = chop.optim.minimize_frank_wolfe
             else:
                 adversary_alg = None
-            scores, hessian_datasets[score] = tools.adv_scores(adv_model, dataset, scores, score, constraint=constraint, 
-                                                               eps=float(eps), batch_size=20, iterations=20, 
-                                                               adversary_alg=adversary_alg)
+            scores, adv_datasets[score] = tools.adv_scores(adv_model, dataset, scores, score, 
+                                                           constraint=constraint, eps=float(eps), 
+                                                           batch_size=20, iterations=50, 
+                                                           adversary_alg=adversary_alg)
     
-    # charles
-    scores = tools.charles_function(model, dataset, scores)
+    scores = tools.artificial_trigger_success(model, dataset, adv_datasets, scores)
 
- 
+    # charles
+    # scores = tools.charles_function(model, dataset, scores)
+
     results_df = pd.DataFrame(scores, [0])
     if is_train:
         # save results
@@ -88,12 +90,12 @@ def trojan_detector(model_filepath, result_filepath, scratch_dirpath,
 
 
 if __name__ == "__main__":
-    
+     
     parser = argparse.ArgumentParser(description='Fake Trojan Detector to Demonstrate Test and Evaluation Infrastructure.')
-    parser.add_argument('--model_filepath', type=str, help='File path to the pytorch model file to be evaluated.', default='/scratch/utrerf/round4/models/id-00000000/model.pt')
+    parser.add_argument('--model_filepath', type=str, help='File path to the pytorch model file to be evaluated.', default='/scratch/utrerf/round4/models/id-00000001/model.pt')
     parser.add_argument('--result_filepath', type=str, help='File path to the file where output result should be written. After execution this file should contain a single line with a single floating point trojan probability.', default='./output')
     parser.add_argument('--scratch_dirpath', type=str, help='File path to the folder where scratch disk space exists. This folder will be empty at execution start and will be deleted at completion of execution.', default='temp')
-    parser.add_argument('--examples_dirpath', type=str, help='File path to the folder of examples which might be useful for determining whether a model is poisoned.', default='/scratch/utrerf/round4/models/id-00000000/clean_example_data') 
+    parser.add_argument('--examples_dirpath', type=str, help='File path to the folder of examples which might be useful for determining whether a model is poisoned.', default='/scratch/utrerf/round4/models/id-00000001/clean_example_data') 
     parser.add_argument('--is_train', type=bool, help='If True, then it saves results to csv and doesnt do inference.', default=False)
 
     args = parser.parse_args()
