@@ -48,11 +48,11 @@ def trojan_detector(model_filepath, result_filepath, scratch_dirpath,
     adv_model = attacker.AttackerModel(model, adv_dataset)
     adv_datasets = {}
     constraints_to_eps = {
-       'inf' : [.05, .4, 3.2, 9.],
-       '2'   : [.5, 4., 32., 90.],
+       # 'inf' : [.05, .4, 3.2, 9.],
+       '2'   : [2., 4., 10., 20.],
        #'2'   : [.5, 2., 4., 8., 10., 16., 20],
-       #'tracenorm': 10 ** np.linspace(-3, 3, num=10),
-       #'groupLasso': 10 ** np.linspace(-5, -1, num=10)
+       'tracenorm': 10 ** np.linspace(-3, 3, num=10),
+       'groupLasso': 10 ** np.linspace(-5, -1, num=10)
     }
     for constraint, eps_list in constraints_to_eps.items():
         for eps in eps_list:
@@ -66,7 +66,7 @@ def trojan_detector(model_filepath, result_filepath, scratch_dirpath,
                                                            batch_size=20, iterations=50, 
                                                            adversary_alg=adversary_alg)
     
-    scores = tools.artificial_trigger_success(model, dataset, adv_datasets, scores)
+    # scores = tools.artificial_trigger_success(adv_model, dataset, scores)
 
     # charles
     # scores = tools.charles_function(model, dataset, scores)

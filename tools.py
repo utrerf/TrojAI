@@ -13,10 +13,10 @@ import chop
 import sys
 from scipy.stats import entropy
 
-sys.path.append('PyHessian')
-sys.path.append("../zeroq_classification")
-from pyhessian import hessian
-from troj_utils import distill_troj_model_gaussian
+# sys.path.append('PyHessian')
+# sys.path.append("../zeroq_classification")
+# from pyhessian import hessian
+# from troj_utils import distill_troj_model_gaussian
 
 def set_seeds(seed):
     np.random.seed(seed)
@@ -300,8 +300,8 @@ class Triggered_Dataset(Dataset):
         return len(self.clean_dataset)
 
 
-def artificial_trigger_success(model, dataset, adv_datasets, scores,
-                               batch_size=20, num_workers=0):
+def basic_artificial_trigger_success(model, dataset, adv_datasets, scores,
+                                     batch_size=20, num_workers=0):
     for score, adv_dataset in adv_datasets.items():
         max_trigger_success = 0
         for trigger, trigger_class in adv_dataset:
@@ -322,39 +322,79 @@ def artificial_trigger_success(model, dataset, adv_datasets, scores,
     return scores
 
 
-def charles_function(model, dataset, scores):
-    # this is optional
-    # loader = DataLoader(dataset, batch_size=batch_size, 
-    #                    shuffle=True, num_workers=num_workers, pin_memory=False)
-    n_iters = 250
-    batch_size = 16
-    lr = 0.5
-    num_batches = 5
-    refined_gaussian,_,_,_,_,gaussian_orig,_ = distill_troj_model_gaussian(model, n_iters, batch_size,num_batches)
-    def l1_img_metric(a,b):
-        if not isinstance(a,np.ndarray):
-            a = a.detach().cpu().numpy()
-        if not isinstance(b,np.ndarray):
-            b = b.detach().cpu().numpy()
-        return np.sum(np.power(a-b,2),axis=(1,2,3))
-    def l2_img_metric(a,b):
-        if not isinstance(a,np.ndarray):
-            a = a.detach().cpu().numpy()
-        if not isinstance(b,np.ndarray):
-            b = b.detach().cpu().numpy()
-        return np.sum(np.abs(a-b),axis=(1,2,3))
-    def flatten_sublist(lst):
-        return [item for sublist in lst for item in sublist]
-    this_l1 = flatten_sublist([l1_img_metric(a,b).tolist() for a,b in zip(refined_gaussian,gaussian_orig)])
-    this_l2 = flatten_sublist([l2_img_metric(a,b).tolist() for a,b in zip(refined_gaussian,gaussian_orig)])
+def set_madry_fgsm_attack(constraint, eps, iterations, target):
+    attack_kwargs = {
+        'constraint': constraint,         # ell_p norm constraint
+        'eps': eps,                       # Epsilon constraint
+        'step_size': 2.*(eps/iterations), # Learning rate
+        'iterations': 1,                  # Number of PGD steps
+        'targeted': target,               # Targeted attack
+        'custom_loss': None,              # Use default cross-entropy loss
+        'random_start': False
+        }
+    return attack_kwargs
 
-    charles_scores = {}
-    charles_scores['l1_gaussian_avg'] = np.average(this_l1)
-    charles_scores['l2_gaussian_avg'] = np.average(this_l2)
-    charles_scores['l1_gaussian_std'] = np.std(this_l1)
-    charles_scores['l2_gaussian_std'] = np.std(this_l2)
-    # scores is the dictionary where we keep all the features, so just add your scores to it
-    for k, v in charles_scores.items():
-        scores[k] = v
-        
-    return scores 
+# 
+# def advanced_artificial_trigger_success(adv_model, clean_dataset, scores,
+#                                         batch_size=20, num_workers=0, constraint='2',
+#                                         eps=3, iterations=20):
+#     targets = list(clean_dataset.y.numpy().unique())
+#     for target in targets:
+#         attack_kwargs = set_madry_fgsm_attack(constraint, eps, iterations, target)
+#         trigger = torch.empty(list(clean_dataset[0][0].shape), device='cpu', requires_grad=False)
+#         for i in range(iterations):    
+#             # generate the trigger_additions (i.e. candidates) from a trig_ds
+#             trig_ds = Triggered_Dataset(clean_dataset, trigger, target)
+#             trig_loader = DataLoader(trig_ds, batch_size=batch_size, 
+#                                      shuffle=True, num_workers=num_workers, pin_memory=False)
+#             dataset_size = len(trig_loader.dataset) + list(loader.dataset[0][0].shape)
+#             trig_candidates = torch.empty(dataset_size, device='cpu', requires_grad=False)
+#             current_idx = 0
+#             for inp, tgt in trig_loader:
+#                 output, im_adv = adv_model(inp.cuda(), tgt.cuda(), make_adv=True, **attack_kwargs)
+#                 with torch.no_grad()
+#                     m = len(target)
+#                     trig_cand = im_adv.detach().clone().cpu() - inp.cuda() 
+#                     trig_candidates[current_idx : current_idx+m] = trig_cand.detach().clone().cpu()
+#                     current_idx += m
+#             # average over all the triggers, project onto l2 ball of interest
+#             with torch.no_grad():
+#                 trig = torch.mean(trig_candidates)/
+# 
+# 
+# def charles_function(model, dataset, scores):
+#     # this is optional
+#     # loader = DataLoader(dataset, batch_size=batch_size, 
+#     #                    shuffle=True, num_workers=num_workers, pin_memory=False)
+#     n_iters = 250
+#     batch_size = 16
+#     lr = 0.5
+#     num_batches = 5
+#     refined_gaussian,_,_,_,_,gaussian_orig,_ = distill_troj_model_gaussian(model, n_iters, batch_size,num_batches)
+#     def l1_img_metric(a,b):
+#         if not isinstance(a,np.ndarray):
+#             a = a.detach().cpu().numpy()
+#         if not isinstance(b,np.ndarray):
+#             b = b.detach().cpu().numpy()
+#         return np.sum(np.power(a-b,2),axis=(1,2,3))
+#     def l2_img_metric(a,b):
+#         if not isinstance(a,np.ndarray):
+#             a = a.detach().cpu().numpy()
+#         if not isinstance(b,np.ndarray):
+#             b = b.detach().cpu().numpy()
+#         return np.sum(np.abs(a-b),axis=(1,2,3))
+#     def flatten_sublist(lst):
+#         return [item for sublist in lst for item in sublist]
+#     this_l1 = flatten_sublist([l1_img_metric(a,b).tolist() for a,b in zip(refined_gaussian,gaussian_orig)])
+#     this_l2 = flatten_sublist([l2_img_metric(a,b).tolist() for a,b in zip(refined_gaussian,gaussian_orig)])
+# 
+#     charles_scores = {}
+#     charles_scores['l1_gaussian_avg'] = np.average(this_l1)
+#     charles_scores['l2_gaussian_avg'] = np.average(this_l2)
+#     charles_scores['l1_gaussian_std'] = np.std(this_l1)
+#     charles_scores['l2_gaussian_std'] = np.std(this_l2)
+#     # scores is the dictionary where we keep all the features, so just add your scores to it
+#     for k, v in charles_scores.items():
+#         scores[k] = v
+#         
+#     return scores 
