@@ -11,13 +11,19 @@ From: pytorch/pytorch:latest
 
 
 %post
+    apt-get update && apt-get install -y git 
     /opt/conda/bin/conda install scikit-image
     /opt/conda/bin/conda install pandas
     /opt/conda/bin/conda install numpy
     /opt/conda/bin/conda install joblib
     /opt/conda/bin/conda install scikit-learn
     /opt/conda/bin/conda install pip
+    /opt/conda/bin/python3 -m pip install git+https://github.com/openopt/chop#egg=chop
     /opt/conda/bin/python3 -m pip install lightgbm==3.0.0rc1
+    /opt/conda/bin/python3 -m pip install robustness
+    /opt/conda/bin/python3 -m pip install easydict
+    /opt/conda/bin/python3 -m pip install dill
+    /opt/conda/bin/python3 -m pip install tables
 
 
 %runscript
