@@ -4,7 +4,7 @@ import subprocess
 import shlex
 
 # gpu_list = list(range(4,8))
-gpu_list = [1,4,5,6,7]
+gpu_list = [7]
 gpus_per_command = 1
 polling_delay_seconds = 1
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
@@ -18,7 +18,7 @@ commands_to_run = [ 'python trojan_detector.py ' +
                    f'--model_filepath {base_dir}/id-{id_gen(i)}/model.pt '+
                    f'--examples_dirpath {base_dir}/id-{id_gen(i)}/clean_example_data ' +
                    f'--is_train True '
-                   for i in range(1000)]
+                   for i in range(0, 1050)]
 commands_to_run.reverse()
 
 def poll_process(process):

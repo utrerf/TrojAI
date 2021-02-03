@@ -63,7 +63,7 @@ def trojan_detector(model_filepath, result_filepath, scratch_dirpath,
                 adversary_alg = None
             scores, adv_datasets[score] = tools.adv_scores(adv_model, dataset, scores, score, 
                                                            constraint=constraint, eps=float(eps), 
-                                                           batch_size=20, iterations=50, 
+                                                           batch_size=20, iterations=20, 
                                                            adversary_alg=adversary_alg)
     
     # scores = tools.artificial_trigger_success(adv_model, dataset, scores)

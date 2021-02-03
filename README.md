@@ -1,6 +1,8 @@
 # TrojAI
 Routines to detect backdoored AIs
 
+There are two use-cases: NLP and Computer Vision (CV)
+
 ## Prerequisites
 
 To install the required pacakages:
