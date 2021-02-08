@@ -46,10 +46,10 @@ def trojan_detector(args):
     with torch.no_grad():
         input_ids = input_ids.to(device)
         attention_mask = attention_mask.to(device)
-    embedding_vector = embedding(input_ids, attention_mask=attention_mask)[0]
-    embedding_vector = embedding_vector.to('cpu').squeeze()[0]
+    embedding_vector = embedding(input_ids, attention_mask=attention_mask)
+    embedding_vector = embedding(input_ids, attention_mask=attention_mask).last_hidden_state
+    embedding_vector = embedding_vector.to('cpu').squeeze()[0].reshape(1,1,-1)
     
-    print(f'embedding vector: {dir(embedding_vector)}')
     # at this point you can pass the embedding_vector tensor through the model you load from my dataset
     model = torch.load(args.model_filepath, map_location=torch.device(device))
     embedding_vector = embedding_vector.to(device)
