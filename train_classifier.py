@@ -33,7 +33,7 @@ if args.save_model:
     model.fit(X[features], y)
     
     print("Save model trained on entire training set: ")
-
+    pd.DataFrame(columns=features).to_csv('features.csv', index=None)
     dump(model, args.model_destination)
 
     print(f"Saved model trained on entire training set to: {args.model_destination} ")

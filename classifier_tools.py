@@ -73,7 +73,7 @@ def bootstrap_performance(X, y, model_name='logistic', n=20, test_size=.1, eps=.
             f'test_acc_avg: {accuracy_sum/20}'}
 
 def feature_selector(X, y, model):
-    RFE = RFECV(estimator=model, step=1, min_features_to_select=1, cv=10, scoring=None, verbose=0, n_jobs=None)
+    RFE = RFECV(estimator=model, step=1, min_features_to_select=1, cv=5, scoring=None, verbose=0, n_jobs=None)
     RFE.fit(X, y)
     all_features = list(X.columns)
     supported_features = [feature for feature, support in zip(all_features,list(RFE.support_)) if support]
