@@ -4,5 +4,10 @@ scikit-image
 torch
 torchvision
 robustness
+joblib
 chop
--e git+git://github.com/amirgholami/PyHessian.git#egg=PyHessian
+lightgbm==3.0.0rc1
+easydict
+dill
+tables
+-e git+https://github.com/openopt/chop.git@539cf615fa545d43a79441cc73baf32184b855bf#egg=chop

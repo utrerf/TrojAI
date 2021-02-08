@@ -18,7 +18,7 @@ From: pytorch/pytorch:latest
     /opt/conda/bin/conda install joblib
     /opt/conda/bin/conda install scikit-learn
     /opt/conda/bin/conda install pip
-    /opt/conda/bin/python3 -m pip install git+https://github.com/openopt/chop#egg=chop
+    /opt/conda/bin/python3 -m pip install git+https://github.com/openopt/chop.git@539cf615fa545d43a79441cc73baf32184b855bf#egg=chop
     /opt/conda/bin/python3 -m pip install lightgbm==3.0.0rc1
     /opt/conda/bin/python3 -m pip install robustness
     /opt/conda/bin/python3 -m pip install easydict

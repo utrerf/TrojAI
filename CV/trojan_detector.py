@@ -66,11 +66,6 @@ def trojan_detector(model_filepath, result_filepath, scratch_dirpath,
                                                            batch_size=20, iterations=20, 
                                                            adversary_alg=adversary_alg)
     
-    # scores = tools.artificial_trigger_success(adv_model, dataset, scores)
-
-    # charles
-    # scores = tools.charles_function(model, dataset, scores)
-
     results_df = pd.DataFrame(scores, [0])
     if is_train:
         # save results
