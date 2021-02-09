@@ -6,9 +6,10 @@ From: pytorch/pytorch:latest
     ./tools.py /
     ./custom_transforms.py /
     ./classifier.py /
-    ./model.joblib /
-    ./features.csv /
-
+    ./trojan_classifier/X_mean.csv /
+    ./trojan_classifier/X_std.csv /
+    ./trojan_classifier/features.csv / 
+    ./trojan_classifier/trojan_classifier.pt /
 
 %post
     apt-get update && apt-get install -y git 

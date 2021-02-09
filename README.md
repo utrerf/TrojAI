@@ -1,26 +1,25 @@
 # TrojAI
-Routines to detect backdoored AIs
+Routines to detect poisoned models.
 
-There are two use-cases: NLP and Computer Vision (CV)
+There are two use-cases: Natural Language Processing (NLP) and Computer Vision (CV)
+
+Each of these folders contain methods to extract features that are used by <code>train\_classifier.py</code> to train a classifier that detects if a model is poisoned. 
+
+NLP is currently under construction. Thus, the remaining sections are only applicable for CV.
+
 
 ## Prerequisites
 
-To install the required pacakages:
+Install the required pacakages:
 
 ```
-  $ git clone https://github.com/amirgholami/PyHessian.git
   $ pip install -r requirements.txt
 ```
 
 ## Example Run
 
-To run the example on backdoored AI:
+To run the example on a poisoned model:
 ```
-  $ python trojan_detector.py --model_filepath=./id-00000000/model.pt --result_filepath=./output.txt --scratch_dirpath=./scratch/ --examples_dirpath=./id-00000000/clean_example_data/
+  $ python trojan_detector.py --model_filepath=./id-00000000/model.pt --result_filepath=./output.txt --examples_dirpath=./id-00000000/clean_example_data/
 ```
 
-## Build singularity
-
-```
-sudo singularity build trojan_detector.simg trojan_detector.def
-```
