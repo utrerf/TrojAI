@@ -4,7 +4,7 @@ import subprocess
 import shlex
 
 # gpu_list = list(range(4,8))
-gpu_list = [1,2,3,4,5,6,7]
+gpu_list = [0,1,2,3,4,5,6,7]
 gpus_per_command = 1
 polling_delay_seconds = 1
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"

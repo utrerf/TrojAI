@@ -22,10 +22,12 @@ def get_X_and_y(features, metadata):
     all_features = list(features.columns)
     all_features.remove('model_name')
     X = df[all_features]
-    X = (X-X.mean())/X.std()
+    X_mean = X.mean()
+    X_std = X.std()
+    X = (X-X_mean)/X_std
 
     y = df['poisoned']
-    return X, y
+    return X, y, X_mean, X_std
 
 
 # MAKING MODELS
@@ -35,6 +37,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.feature_selection import RFECV
+from sklearn.feature_selection import RFE
+
 
 def init_logistic_reg():
     return LogisticRegression(penalty='l2', dual=False, tol=0.0001, C=1.0, fit_intercept=True, 
@@ -69,17 +73,20 @@ def bootstrap_performance(X, y, model_name='logistic', n=20, test_size=.1, eps=.
         model.fit(X_train, y_train)
         cross_entropy_sum += log_loss(y_test, model.predict_proba(X_test), eps=eps)
         accuracy_sum += model.score(X_test, y_test)
-    return {f'cross_entropy_avg: {cross_entropy_sum/20}', 
-            f'test_acc_avg: {accuracy_sum/20}'}
+    return {'cross_entropy_avg': cross_entropy_sum/n, 
+            'test_acc_avg': accuracy_sum/n}
 
-def feature_selector(X, y, model):
-    RFE = RFECV(estimator=model, step=1, min_features_to_select=1, cv=5, scoring=None, verbose=0, n_jobs=None)
-    RFE.fit(X, y)
+def feature_selector(X, y, model, n_feat=10):
+    #RFE = RFECV(estimator=model, step=1, min_features_to_select=1, cv=5, scoring=None, verbose=0, n_jobs=None)
+    RFE_model = RFE(model, n_feat)
+    RFE_model.fit(X, y)
     all_features = list(X.columns)
-    supported_features = [feature for feature, support in zip(all_features,list(RFE.support_)) if support]
+    supported_features = [feature for feature, support in zip(all_features,list(RFE_model.support_)) if support]
     
     return supported_features
 
+def print_performance_dict(d):
+    print(f'\t\t\taccuracy: {d["test_acc_avg"]} \tcross_entropy: {d["cross_entropy_avg"]}')
 
 # READING THE ARGS
 def read_args():
@@ -91,19 +98,22 @@ def read_args():
                         help='Filepath with all the metadata for a round.',
                         default='/scratch/utrerf/round4/METADATA.csv')
 
-    parser.add_argument('--explore_options', type=bool,
+    parser.add_argument('--explore_options', type=str,
                         help='Determines if we should calculate bootsrapping acc on a few out-of-the-box models.',
-                        default=True)
+                        default = 'True', choices = ['True', 'False'])
 
-    parser.add_argument('--save_model', type=bool,
+    parser.add_argument('--save_model', type=str,
                         help='Determines if we should save a model trained on the entire training data.',
-                        default=True)
+                        default = 'False', choices = ['True', 'False'])
     parser.add_argument('--model_name', type=str,
                         help='Model used for training.',
                         default='logistic', choices=model_init_functions.keys())
-    parser.add_argument('--feature_select', type=bool,
+    parser.add_argument('--feature_select', type=str,
                         help='Determine if we should do feature selection or not.',
-                        default=True)
+                        default = 'True', choices = ['True', 'False'])
+    parser.add_argument('--num_feat', type=int,
+                        help='How many features should we select.',
+                        default = 20)
     parser.add_argument('--model_destination', type=str,
                         help='Determine where the model should be saved',
                         default='trojan_classifier.pt')
