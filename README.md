@@ -1,3 +1,5 @@
+![alt text](http://www.icsi.berkeley.edu/icsi/sites/all/themes/icsi/logo.png)
+
 # TrojAI
 Routines to detect poisoned models.
 
