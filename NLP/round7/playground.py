@@ -16,7 +16,6 @@ def tokenize_and_align_labels(tokenizer, original_words,
     
     labels, label_mask = [], []
     word_ids = [tokenized_inputs.word_ids(i) for i in range(len(original_labels))]
-    print(f'Word IDS: {word_ids}')
     previous_word_idx = None
 
     for i, sentence in enumerate(word_ids):
@@ -35,7 +34,7 @@ def tokenize_and_align_labels(tokenizer, original_words,
                 temp_mask.append(0)
             previous_word_idx = word_idx
         labels.append(temp_labels)
-        label_mask = temp_mask
+        label_mask.append(temp_mask)
         
     return tokenized_inputs['input_ids'], tokenized_inputs['attention_mask'], \
            labels, label_mask
@@ -64,7 +63,6 @@ def get_words_and_labels(examples_dirpath):
     fns = [os.path.join(examples_dirpath, fn) \
            for fn in os.listdir(examples_dirpath) \
            if fn.endswith('.txt')]
-    print(f'Files: {fns}')
     fns.sort()
     original_words = []
     original_labels = []
@@ -98,19 +96,16 @@ def to_tensor_and_device(var, device):
     return var
 
 
-def predict_sentiment(classification_model, 
-                      input_ids, 
-                      attention_mask, 
-                      labels, 
-                      labels_mask):
+def predict_sentiment(classification_model, input_ids, 
+                      attention_mask, labels, labels_mask):
 
     _, logits = classification_model(input_ids, 
                                      attention_mask=attention_mask, 
                                      labels=labels)        
-    preds = torch.argmax(logits, dim=2).squeeze().cpu().detach().numpy()
+    preds = torch.argmax(logits, dim=2).squeeze()
     
-    masked_labels = labels.view(-1) * labels_mask.view(-1)
-    masked_preds = preds.view(-1) * labels_mask.view(-1)
+    masked_labels = labels.view(-1)[labels_mask.view(-1)]
+    masked_preds = preds.view(-1)[labels_mask.view(-1)]
     
     n_correct = torch.eq(masked_labels, masked_preds).sum()
     n_total = labels_mask.sum()
@@ -118,11 +113,14 @@ def predict_sentiment(classification_model,
     return preds, n_correct, n_total
 
 
-def trojan_detector(model_filepath, 
-                    tokenizer_filepath, 
-                    result_filepath, 
-                    scratch_dirpath, 
-                    examples_dirpath):
+def show_predictions_vs_originals(predicted_labels, original_words):
+    for i, sentence in enumerate(original_words):
+        print(f'Original Words: {sentence}')
+        print(f'Predicted Labels: {predicted_labels[i]}')
+
+
+def trojan_detector(model_filepath, tokenizer_filepath, 
+                    result_filepath, scratch_dirpath, examples_dirpath):
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     use_amp = False 
@@ -151,7 +149,7 @@ def trojan_detector(model_filepath,
         n_total = predict_sentiment(classification_model, input_ids, 
                                     attention_mask, labels, labels_mask)
 
-    print('Predictions: {} from Text: "{}"'.format(predicted_labels, original_words))
+    show_predictions_vs_originals(predicted_labels, original_words)
     print(f'Correct: {n_correct} Total: {n_total} Accuracy: {n_correct/n_total}')
     assert len(predicted_labels) == len(original_words)
     
@@ -161,6 +159,7 @@ def trojan_detector(model_filepath,
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='Trojan Detector for Round 7.')
+
     #TODO: REMEMBER TO CHANGE DEFAULT OF IS_TRAINING BACK TO 0
     parser.add_argument('--is_training', type=int, choices=[0, 1], 
                         help='Helps determine if we are training or testing.'\
