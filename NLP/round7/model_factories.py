@@ -8,22 +8,32 @@ import torch
 from transformers import AutoModel
 
 class NerLinearModel(torch.nn.Module):
-	def forward(self, input_ids, attention_mask=None, labels=None):
+	def forward(self, input_ids, attention_mask=None, labels=None,
+			         is_triggered=False, class_token_indices=None):
+
 		outputs = self.transformer(input_ids, attention_mask=attention_mask)
 		sequence_output = outputs[0]
 		valid_output = self.dropout(sequence_output)
-		emissions = self.classifier(valid_output)
+		predictions = self.classifier(valid_output)
+		loss_fct = torch.nn.CrossEntropyLoss(ignore_index=self.ignore_index)
 		
 		loss = None
-		if labels is not None:
-			loss_fct = torch.nn.CrossEntropyLoss(ignore_index=self.ignore_index)
+		if is_triggered and class_token_indices is not None:
+			mask = class_token_indices.split(1, dim=1)
+			active_logits = predictions[mask]
+			active_logits = active_logits.view(-1, self.num_labels)
+			active_labels = labels[mask].view(-1)
 			
+			loss = loss_fct(active_logits, active_labels)
+
+		else:
 			if attention_mask is not None:
 				active_loss = attention_mask.view(-1) == 1
-				active_logits = emissions.view(-1, self.num_labels)
-				active_labels = torch.where(active_loss, labels.view(-1), torch.tensor(loss_fct.ignore_index).type_as(labels))
+				active_logits = predictions.view(-1, self.num_labels)
+				active_labels = torch.where(active_loss, labels.view(-1), 
+											torch.tensor(loss_fct.ignore_index).type_as(labels))
 				loss = loss_fct(active_logits, active_labels)
 			else:
-				loss = loss_fct(emissions.view(-1, self.num_labels), labels.view(-1))
-		
-		return loss, emissions
+				loss = loss_fct(predictions.view(-1, self.num_labels), labels.view(-1))
+				
+		return loss, predictions
