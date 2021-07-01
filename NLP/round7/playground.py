@@ -2,108 +2,21 @@
 # https://github.com/Eric-Wallace/universal-triggers/blob/ed657674862c965b31e0728d71765d0b6fe18f22/gpt2/create_adv_token.py#L28
 
 # TODO:
-# - Split out a function that inserts a trigger into token_ids
-
-# DONE:
-# Implement beam search to pick best candidate
+# Test code
 
 import argparse
 import torch
-import json
-import os
-from os.path import join as join
-import model_factories
-import numpy as np
-import pandas as pd
 import torch.nn.functional as F
 from copy import deepcopy
 import torch.optim as optim
 from operator import itemgetter
 import heapq
+import tools
+
 
 # CONSTANTS
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 EXTRACTED_GRADS = []
-
-def tokenize_and_align_labels(tokenizer, original_words, 
-                              original_labels, max_input_length):
-
-    tokenized_inputs = tokenizer(original_words, padding=True, truncation=True, 
-                                 is_split_into_words=True, max_length=max_input_length)
-    
-    word_ids = [tokenized_inputs.word_ids(i) for i in range(len(original_labels))]
-    labels, label_mask = [], []
-    previous_word_idx = None
-
-    for i, sentence in enumerate(word_ids):
-        temp_labels, temp_mask = [], []
-        for word_idx in sentence:
-            if word_idx is not None:
-                cur_label = original_labels[i][word_idx]
-            if word_idx is None:
-                temp_labels.append(-100)
-                temp_mask.append(0)
-            elif word_idx != previous_word_idx:
-                temp_labels.append(cur_label)
-                temp_mask.append(1)
-            else:
-                temp_labels.append(-100)
-                temp_mask.append(0)
-            previous_word_idx = word_idx
-        labels.append(temp_labels)
-        label_mask.append(temp_mask)
-        
-    return tokenized_inputs['input_ids'], tokenized_inputs['attention_mask'], \
-           labels, label_mask
-
-
-def load_config(model_filepath):
-    model_dirpath, _ = os.path.split(model_filepath)
-    with open(os.path.join(model_dirpath, 'config.json')) as json_file:
-        config = json.load(json_file)
-    print('Source dataset name = "{}"'.format(config['source_dataset']))
-    if 'data_filepath' in config.keys():
-        print('Source dataset filepath = "{}"'.format(config['data_filepath']))
-    return config
-
-
-def get_max_input_length(config, tokenizer):
-    if config['embedding'] == 'MobileBERT':
-        max_input_length = \
-            tokenizer.max_model_input_sizes[tokenizer.name_or_path.split('/')[1]]
-    else:
-        max_input_length = tokenizer.max_model_input_sizes[tokenizer.name_or_path]
-    return max_input_length
-
-
-def get_words_and_labels(examples_dirpath):
-    fns = [os.path.join(examples_dirpath, fn) \
-           for fn in os.listdir(examples_dirpath) \
-           if fn.endswith('.txt')]
-    fns.sort()
-    original_words = []
-    original_labels = []
-
-    for fn in fns:
-        if fn.endswith('_tokenized.txt'):
-            continue
-        # load the example
-        with open(fn, 'r') as fh:
-            lines = fh.readlines()
-            temp_words = []
-            temp_labels = []
-
-            for line in lines:
-                split_line = line.split('\t')
-                word = split_line[0].strip()
-                label = split_line[2].strip()
-                
-                temp_words.append(word)
-                temp_labels.append(int(label))
-        original_words.append(temp_words)
-        original_labels.append(temp_labels)
-
-    return original_words, original_labels
 
 
 def to_tensor_and_device(var):
@@ -112,40 +25,13 @@ def to_tensor_and_device(var):
     return var
 
 
-def predict_sentiment(classification_model, input_ids, 
-                      attention_mask, labels, labels_mask):
-
-    loss, logits = classification_model(input_ids, 
-                                     attention_mask=attention_mask, 
-                                     labels=labels)        
-    preds = torch.argmax(logits, dim=2).squeeze()
-    
-    masked_labels = labels.view(-1)[labels_mask.view(-1)]
-    masked_preds = preds.view(-1)[labels_mask.view(-1)]
-    
-    n_correct = torch.eq(masked_labels, masked_preds).sum()
-    n_total = labels_mask.sum()
-
-    return preds, n_correct, n_total
-
-
-def show_predictions_vs_originals(predicted_labels, input_ids, 
-                                     tokenizer, num_examples=1):
-    decoded_input = tokenizer.batch_decode(input_ids)
-    for input, prediction, _ in zip(predicted_labels, 
-                                    decoded_input, 
-                                    range(num_examples)):
-        print(f'Input: {input}')
-        print(f'Prediction: {prediction}')
+def extract_grad_hook(module, grad_in, grad_out):
+    EXTRACTED_GRADS.append(grad_out[0])    
 
 
 def get_embedding_weight(classification_model):
-    module = find_word_embedding_module(classification_model)
-    return module.weight.detach()
-
-
-def extract_grad_hook(module, grad_in, grad_out):
-    EXTRACTED_GRADS.append(grad_out[0])    
+    word_embedding = find_word_embedding_module(classification_model)
+    return deepcopy(word_embedding.weight)
 
 
 def find_word_embedding_module(classification_model):
@@ -154,11 +40,6 @@ def find_word_embedding_module(classification_model):
         if 'embeddings.word_embeddings' in name]
     assert len(word_embedding_tuple) == 1
     return word_embedding_tuple[0][1]
-
-
-def get_embedding_weight(classification_model):
-    word_embedding = find_word_embedding_module(classification_model)
-    return deepcopy(word_embedding.weight)
 
 
 def add_hooks(classification_model):
@@ -172,11 +53,13 @@ def get_source_class_token_locations(source_class, labels):
     source_class_token_locations = torch.nonzero(source_class_token_locations)
     return source_class_token_locations
 
+
 def insert_trigger(all_vars, trigger_mask, trigger_token_ids):
     repeated_trigger = \
         trigger_token_ids.repeat(1, all_vars['input_ids'].shape[0]).long().view(-1)
     all_vars['input_ids'][trigger_mask] = repeated_trigger.to(DEVICE)
     return all_vars
+
 
 def expand_and_insert_tokens(trigger_token_ids, masked_vars, 
                             source_class_token_locations):
@@ -209,7 +92,6 @@ def expand_and_insert_tokens(trigger_token_ids, masked_vars,
     masked_vars = insert_trigger(masked_vars, trigger_mask, trigger_token_ids)
     masked_vars['attention_mask'][trigger_mask] = 1           # set attention to 1
     masked_vars['labels'][trigger_mask] = -100                # set label to -100
-
     masked_sorce_class_token_locations = \
         shift_source_class_token_locations(source_class_token_locations, num_tokens)
 
@@ -230,6 +112,7 @@ def make_initial_trigger_tokens(tokenizer, num_tokens=10, initial_trigger_word='
         torch.tensor(tokenized_initial_trigger_word * num_tokens).cpu()
     return trigger_token_ids
 
+
 def shift_source_class_token_locations(source_class_token_locations, num_tokens):
     class_token_indices = deepcopy(source_class_token_locations)
     class_token_indices[:, 1] += num_tokens
@@ -237,35 +120,11 @@ def shift_source_class_token_locations(source_class_token_locations, num_tokens)
         torch.arange(class_token_indices.shape[0], device=DEVICE).long()
     return class_token_indices
 
-def load_tokenizer(tokenizer_filepath):
-    tokenizer = torch.load(tokenizer_filepath)
-    if not hasattr(tokenizer, 'pad_token') or tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    return tokenizer
 
 def clear_model_grads(classification_model):
     EXTRACTED_GRADS = []
     optimizer = optim.Adam(classification_model.parameters())
     optimizer.zero_grad()
-
-
-def eval_batch_helper(classification_model, all_vars, source_class_token_locations):
-    loss, _ = \
-        classification_model(all_vars['input_ids'], all_vars['attention_mask'], 
-                            all_vars['labels'], is_triggered=True,
-                            class_token_indices=source_class_token_locations)
-    return loss
-
-def evaluate_batch(classification_model, all_vars, source_class_token_locations,
-                                                                 use_grad=False):
-    if use_grad:
-        loss = eval_batch_helper(classification_model, all_vars, 
-                                 source_class_token_locations)
-    else:
-        with torch.no_grad():
-            loss = eval_batch_helper(classification_model, all_vars, 
-                                    source_class_token_locations)
-    return loss
 
 
 def get_loss_per_candidate(classification_model, all_vars, source_class_token_locations, 
@@ -284,7 +143,7 @@ def get_loss_per_candidate(classification_model, all_vars, source_class_token_lo
 
     # save current loss with old triggers
     loss_per_candidate = []
-    curr_loss = evaluate_batch(classification_model, all_vars, 
+    curr_loss = tools.evaluate_batch(classification_model, all_vars, 
                                source_class_token_locations, use_grad=False)
     curr_loss = curr_loss.cpu().numpy()
     loss_per_candidate.append((deepcopy(trigger_token_ids), curr_loss))
@@ -295,9 +154,7 @@ def get_loss_per_candidate(classification_model, all_vars, source_class_token_lo
         trigger_token_ids_one_replaced[trigger_token_pos] = cand_token_id # replace one token
         temp_all_vars = deepcopy(all_vars)
         temp_all_vars = insert_trigger(temp_all_vars, trigger_mask, trigger_token_ids_one_replaced)
-        # temp_all_vars['input_ids'][trigger_mask] = \
-        #     trigger_token_ids_one_replaced.repeat(1, temp_all_vars['input_ids'].shape[0]).view(-1).to(DEVICE)
-        loss = evaluate_batch(classification_model, temp_all_vars, 
+        loss = tools.evaluate_batch(classification_model, temp_all_vars, 
                               source_class_token_locations, use_grad=False).cpu().numpy()
         loss_per_candidate.append((deepcopy(trigger_token_ids_one_replaced), loss))
     return loss_per_candidate
@@ -341,18 +198,18 @@ def decode_tensor_of_token_ids(tokenizer, word_id_tensor):
 def trojan_detector(model_filepath, tokenizer_filepath, 
                     result_filepath, scratch_dirpath, examples_dirpath):
     # 1. LOAD EVERYTHING
-    config = load_config(model_filepath)
+    config = tools.load_config(model_filepath)
     classification_model = torch.load(model_filepath, map_location=DEVICE)
     classification_model.eval()
     add_hooks(classification_model)
     embedding_matrix = get_embedding_weight(classification_model)
     
-    tokenizer = load_tokenizer(tokenizer_filepath) 
-    max_input_length = get_max_input_length(config, tokenizer)
+    tokenizer = tools.load_tokenizer(tokenizer_filepath) 
+    max_input_length = tools.get_max_input_length(config, tokenizer)
 
-    original_words, original_labels = get_words_and_labels(examples_dirpath)
+    original_words, original_labels = tools.get_words_and_labels(examples_dirpath)
     var_names = ['input_ids', 'attention_mask', 'labels', 'labels_mask']
-    vars = list(tokenize_and_align_labels(tokenizer, original_words, 
+    vars = list(tools.tokenize_and_align_labels(tokenizer, original_words, 
                                           original_labels, max_input_length))
     all_vars = {k:to_tensor_and_device(v) for k, v in zip(var_names, vars)}
 
@@ -378,7 +235,7 @@ def trojan_detector(model_filepath, tokenizer_filepath,
     clear_model_grads(classification_model)
 
     # forward prop with the current masked vars
-    initial_loss = evaluate_batch(classification_model, masked_vars, 
+    initial_loss = tools.evaluate_batch(classification_model, masked_vars, 
                           masked_source_class_token_locations, use_grad=True)
     
     num_candidates = 10
@@ -392,19 +249,13 @@ def trojan_detector(model_filepath, tokenizer_filepath,
     
     decoded_top_candidate = decode_tensor_of_token_ids(tokenizer, top_candidate)
 
-    print('end')
-    # This is unnecessary
-    # trigger_token_embeds = F.embedding(trigger_tokens.cpu().long(),
-                                    #    embedding_matrix.cpu()).detach().unsqueeze(0)
-    
-    
-    # predicted_labels, n_correct, \
-    #     n_total = predict_sentiment(classification_model, input_ids, 
-    #                                 attention_mask, labels, labels_mask, trigger_mask)
+    # test for a single sentence
+    temp_vars = deepcopy(masked_vars)
+    temp_vars = insert_trigger(temp_vars, trigger_mask, top_candidate)
+    tools.evaluate_batch(classification_model, all_vars, source_class_token_locations,
+                                                                 use_grad=False)
 
-    # show_predictions_vs_originals(predicted_labels, input_ids, tokenizer)
-    # print(f'Correct: {n_correct} Total: {n_total} Accuracy: {n_correct/n_total}')
-    # assert len(predicted_labels) == len(original_words)
+    print('end')
     
     
 
@@ -449,21 +300,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.is_training:
-        metadata = pd.read_csv(join(args.training_data_path, 'METADATA.csv'))
-
-        id_str = str(100000000 + args.model_num)[1:]
-        model_id = 'id-'+id_str
-
-        data = metadata[metadata.model_name==model_id]
-        
-        # get the tokenizer name
-        embedding_level = data.embedding.item()
-        tokenizer_name = data.embedding_flavor.item().replace("/", "-")
-        full_tokenizer_name = embedding_level+'-'+tokenizer_name+'.pt'
-
-        args.model_filepath = join(args.training_data_path, 'models', model_id, 'model.pt')
-        args.tokenizer_filepath = join(args.training_data_path, 'tokenizers', full_tokenizer_name)
-        args.examples_dirpath = join(args.training_data_path, 'models', model_id, 'clean_example_data')
+        args = tools.modify_args_for_training(args)
 
     trojan_detector(args.model_filepath, 
                     args.tokenizer_filepath, 
