@@ -3,6 +3,13 @@ import os
 import torch
 from os.path import join as join
 import pandas as pd
+import torch.optim as optim
+from copy import deepcopy
+
+
+''' CONSTANTS '''
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+EXTRACTED_GRADS = []
 
 def modify_args_for_training(args):
     metadata = pd.read_csv(join(args.training_data_path, 'METADATA.csv'))
@@ -23,24 +30,21 @@ def modify_args_for_training(args):
     return args
 
 
-def eval_batch_helper(classification_model, all_vars, source_class_token_locations):
-    loss, _ = \
-        classification_model(all_vars['input_ids'], all_vars['attention_mask'], 
-                            all_vars['labels'], is_triggered=True,
-                            class_token_indices=source_class_token_locations)
-    return loss
+def load_config(model_filepath):
+    model_dirpath, _ = os.path.split(model_filepath)
+    with open(os.path.join(model_dirpath, 'config.json')) as json_file:
+        config = json.load(json_file)
+    print('Source dataset name = "{}"'.format(config['source_dataset']))
+    if 'data_filepath' in config.keys():
+        print('Source dataset filepath = "{}"'.format(config['data_filepath']))
+    return config
 
 
-def evaluate_batch(classification_model, all_vars, source_class_token_locations,
-                                                                 use_grad=False):
-    if use_grad:
-        loss = eval_batch_helper(classification_model, all_vars, 
-                                 source_class_token_locations)
-    else:
-        with torch.no_grad():
-            loss = eval_batch_helper(classification_model, all_vars, 
-                                    source_class_token_locations)
-    return loss
+def load_tokenizer(tokenizer_filepath):
+    tokenizer = torch.load(tokenizer_filepath)
+    if not hasattr(tokenizer, 'pad_token') or tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
 
 
 def get_max_input_length(config, tokenizer):
@@ -50,6 +54,29 @@ def get_max_input_length(config, tokenizer):
     else:
         max_input_length = tokenizer.max_model_input_sizes[tokenizer.name_or_path]
     return max_input_length
+
+
+def get_embedding_weight(classification_model):
+    word_embedding = find_word_embedding_module(classification_model)
+    return deepcopy(word_embedding.weight)
+
+
+def find_word_embedding_module(classification_model):
+    word_embedding_tuple = [(name, module) 
+        for name, module in classification_model.named_modules() 
+        if 'embeddings.word_embeddings' in name]
+    assert len(word_embedding_tuple) == 1
+    return word_embedding_tuple[0][1]
+
+
+def add_hooks(classification_model):
+    module = find_word_embedding_module(classification_model)
+    module.weight.requires_grad = True
+    module.register_backward_hook(extract_grad_hook)
+
+
+def extract_grad_hook(module, grad_in, grad_out):
+    EXTRACTED_GRADS.append(grad_out[0])  
 
 
 def get_words_and_labels(examples_dirpath):
@@ -82,22 +109,6 @@ def get_words_and_labels(examples_dirpath):
     return original_words, original_labels
 
 
-def load_tokenizer(tokenizer_filepath):
-    tokenizer = torch.load(tokenizer_filepath)
-    if not hasattr(tokenizer, 'pad_token') or tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    return tokenizer
-
-
-def load_config(model_filepath):
-    model_dirpath, _ = os.path.split(model_filepath)
-    with open(os.path.join(model_dirpath, 'config.json')) as json_file:
-        config = json.load(json_file)
-    print('Source dataset name = "{}"'.format(config['source_dataset']))
-    if 'data_filepath' in config.keys():
-        print('Source dataset filepath = "{}"'.format(config['data_filepath']))
-    return config
-
 def tokenize_and_align_labels(tokenizer, original_words, 
                               original_labels, max_input_length):
 
@@ -128,3 +139,42 @@ def tokenize_and_align_labels(tokenizer, original_words,
         
     return tokenized_inputs['input_ids'], tokenized_inputs['attention_mask'], \
            labels, label_mask
+
+
+def to_tensor_and_device(var):
+    var = torch.as_tensor(var)
+    var = var.to(DEVICE)
+    return var
+
+
+def clear_model_grads(classification_model):
+    EXTRACTED_GRADS = []
+    optimizer = optim.Adam(classification_model.parameters())
+    optimizer.zero_grad()
+
+
+def eval_batch_helper(classification_model, all_vars, source_class_token_locations):
+    loss, logits = \
+        classification_model(all_vars['input_ids'], all_vars['attention_mask'], 
+                            all_vars['labels'], is_triggered=True,
+                            class_token_indices=source_class_token_locations)
+    return loss, logits
+
+
+def evaluate_batch(classification_model, all_vars, source_class_token_locations,
+                                                                 use_grad=False):
+    if use_grad:
+        loss, logits = eval_batch_helper(classification_model, all_vars, 
+                                         source_class_token_locations)
+    else:
+        with torch.no_grad():
+            loss, logits = eval_batch_helper(classification_model, all_vars, 
+                                    source_class_token_locations)
+    return loss, logits
+
+
+def decode_tensor_of_token_ids(tokenizer, word_id_tensor):
+    word_list = []
+    for word_id in word_id_tensor:
+        word_list.append(tokenizer.decode(word_id))
+    return ' '.join(word_list)
