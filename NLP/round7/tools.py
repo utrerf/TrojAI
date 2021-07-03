@@ -3,13 +3,13 @@ import os
 import torch
 from os.path import join as join
 import pandas as pd
-import torch.optim as optim
 from copy import deepcopy
 
 
 ''' CONSTANTS '''
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 EXTRACTED_GRADS = []
+TRAINING_DATA_PATH = '/scratch/data/TrojAI/round7-train-dataset/'
 
 def modify_args_for_training(args):
     metadata = pd.read_csv(join(args.training_data_path, 'METADATA.csv'))
@@ -145,12 +145,6 @@ def to_tensor_and_device(var):
     var = torch.as_tensor(var)
     var = var.to(DEVICE)
     return var
-
-
-def clear_model_grads(classification_model):
-    EXTRACTED_GRADS = []
-    optimizer = optim.Adam(classification_model.parameters())
-    optimizer.zero_grad()
 
 
 def eval_batch_helper(classification_model, all_vars, source_class_token_locations):
