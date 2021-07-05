@@ -7,19 +7,27 @@
 import torch
 from transformers import AutoModel
 
+def CXE(predicted, target):
+	s = torch.nn.Softmax(dim=1)
+	return -(s(target) * torch.log(s(predicted))).sum(dim=1).mean()
+
 class NerLinearModel(torch.nn.Module):
-	def forward(self, input_ids, attention_mask=None, labels=None,
+	def get_logits(self, input_ids, attention_mask, transformer, classifier):
+		outputs = transformer(input_ids, attention_mask=attention_mask)
+		sequence_output = outputs[0]
+		valid_output = self.dropout(sequence_output)
+		logits = classifier(valid_output)
+		return logits
+
+	def forward(self, clean_model, input_ids, attention_mask=None, labels=None,
 			         is_triggered=False, class_token_indices=None):
 		'''
 		Inputs
 		- class_token_indices: row,col of each of the source class tokens
 			shape=(num_sentences, 2) 
 		'''
-
-		outputs = self.transformer(input_ids, attention_mask=attention_mask)
-		sequence_output = outputs[0]
-		valid_output = self.dropout(sequence_output)
-		logits = self.classifier(valid_output)
+		logits = self.get_logits(input_ids, attention_mask, 
+								 self.transformer, self.classifier)
 		loss_fct = torch.nn.CrossEntropyLoss(ignore_index=self.ignore_index)
 		
 		loss = None
@@ -27,9 +35,15 @@ class NerLinearModel(torch.nn.Module):
 			mask = class_token_indices.split(1, dim=1)
 			active_logits = logits[mask]
 			active_logits = active_logits.view(-1, self.num_labels)
-			active_labels = labels[mask].view(-1)
+			clean_logits = self.get_logits(input_ids, attention_mask, 
+										   clean_model.transformer, 
+										   clean_model.classifier)
+			active_clean_logits = clean_logits[mask].view(-1, self.num_labels)
+			loss = CXE(active_logits, active_clean_logits)
+			# clean_predictions = torch.argmax(clean_logits, dim=2)
+			# active_labels = clean_predictions[mask].view(-1)
 			
-			loss = loss_fct(active_logits, active_labels)
+			#loss = loss_fct(active_logits, active_labels)
 
 		else:
 			if attention_mask is not None:

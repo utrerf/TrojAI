@@ -9,7 +9,9 @@ from copy import deepcopy
 ''' CONSTANTS '''
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 EXTRACTED_GRADS = []
+EXTRACTED_CLEAN_GRADS = []
 TRAINING_DATA_PATH = '/scratch/data/TrojAI/round7-train-dataset/'
+CLEAN_MODELS_PATH = '/scratch/utrerf/TrojAI/NLP/round7/clean_models'
 
 def modify_args_for_training(args):
     metadata = pd.read_csv(join(args.training_data_path, 'METADATA.csv'))
@@ -69,14 +71,21 @@ def find_word_embedding_module(classification_model):
     return word_embedding_tuple[0][1]
 
 
-def add_hooks(classification_model):
+def add_hooks(classification_model, is_clean):
     module = find_word_embedding_module(classification_model)
     module.weight.requires_grad = True
-    module.register_backward_hook(extract_grad_hook)
+    if is_clean:
+        module.register_backward_hook(extract_clean_grad_hook)
+    else:
+        module.register_backward_hook(extract_grad_hook)
 
 
 def extract_grad_hook(module, grad_in, grad_out):
     EXTRACTED_GRADS.append(grad_out[0])  
+
+
+def extract_clean_grad_hook(module, grad_in, grad_out):
+    EXTRACTED_CLEAN_GRADS.append(grad_out[0])  
 
 
 def get_words_and_labels(examples_dirpath):
@@ -147,22 +156,22 @@ def to_tensor_and_device(var):
     return var
 
 
-def eval_batch_helper(classification_model, all_vars, source_class_token_locations):
+def eval_batch_helper(clean_model, classification_model, all_vars, source_class_token_locations):
     loss, logits = \
-        classification_model(all_vars['input_ids'], all_vars['attention_mask'], 
+        classification_model(clean_model, all_vars['input_ids'], all_vars['attention_mask'], 
                             all_vars['labels'], is_triggered=True,
                             class_token_indices=source_class_token_locations)
     return loss, logits
 
 
-def evaluate_batch(classification_model, all_vars, source_class_token_locations,
+def evaluate_batch(clean_model, classification_model, all_vars, source_class_token_locations,
                                                                  use_grad=False):
     if use_grad:
-        loss, logits = eval_batch_helper(classification_model, all_vars, 
+        loss, logits = eval_batch_helper(clean_model, classification_model, all_vars, 
                                          source_class_token_locations)
     else:
         with torch.no_grad():
-            loss, logits = eval_batch_helper(classification_model, all_vars, 
+            loss, logits = eval_batch_helper(clean_model, classification_model, all_vars, 
                                     source_class_token_locations)
     return loss, logits
 
