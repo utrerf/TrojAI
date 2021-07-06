@@ -4,6 +4,7 @@ import torch
 from os.path import join as join
 import pandas as pd
 from copy import deepcopy
+import transformers
 
 
 ''' CONSTANTS '''
@@ -42,8 +43,13 @@ def load_config(model_filepath):
     return config
 
 
-def load_tokenizer(tokenizer_filepath):
-    tokenizer = torch.load(tokenizer_filepath)
+def load_tokenizer(tokenizer_filepath, config):
+    if config['embedding'] == 'RoBERTa':
+        tokenizer = \
+            transformers.AutoTokenizer.from_pretrained(config['embedding_flavor'], 
+                                                       use_fast=True, add_prefix_space=True)
+    else:
+        tokenizer = torch.load(tokenizer_filepath)
     if not hasattr(tokenizer, 'pad_token') or tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     return tokenizer
@@ -150,29 +156,25 @@ def tokenize_and_align_labels(tokenizer, original_words,
            labels, label_mask
 
 
-def to_tensor_and_device(var):
-    var = torch.as_tensor(var)
-    var = var.to(DEVICE)
-    return var
-
-
-def eval_batch_helper(clean_model, classification_model, all_vars, source_class_token_locations):
+def eval_batch_helper(clean_model, classification_model, all_vars, source_class_token_locations,
+                      is_targetted=False, source_class=0):
     loss, logits = \
         classification_model(clean_model, all_vars['input_ids'], all_vars['attention_mask'], 
                             all_vars['labels'], is_triggered=True,
-                            class_token_indices=source_class_token_locations)
+                            class_token_indices=source_class_token_locations,
+                            is_targetted=is_targetted, source_class=source_class)
     return loss, logits
 
 
 def evaluate_batch(clean_model, classification_model, all_vars, source_class_token_locations,
-                                                                 use_grad=False):
+                   use_grad=False, is_targetted=False, source_class=0):
     if use_grad:
         loss, logits = eval_batch_helper(clean_model, classification_model, all_vars, 
-                                         source_class_token_locations)
+                                    source_class_token_locations, is_targetted, source_class)
     else:
         with torch.no_grad():
             loss, logits = eval_batch_helper(clean_model, classification_model, all_vars, 
-                                    source_class_token_locations)
+                                    source_class_token_locations, is_targetted, source_class)
     return loss, logits
 
 
