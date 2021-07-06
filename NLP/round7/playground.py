@@ -27,6 +27,7 @@ DISCUSSION:
     Why would we want to try untargetted inversion instead of targetted inversion?
 '''
 
+import numpy as np
 import argparse
 import torch
 import torch.nn.functional as F
@@ -252,7 +253,7 @@ def get_clean_model_filepath(config):
 def get_trigger(classification_model, clean_model, vars, masked_source_class_token_locations, 
                 is_targetted, source_class, target_class, initial_trigger_token_ids, 
                 trigger_mask, trigger_length, embedding_matrix):
-    num_iterations, num_candidates = 10, 1
+    num_iterations, num_candidates = 10, 3
     insert_trigger(vars, trigger_mask, initial_trigger_token_ids)
     trigger_token_ids = deepcopy(initial_trigger_token_ids)
     insert_target_class(vars, masked_source_class_token_locations, target_class)
