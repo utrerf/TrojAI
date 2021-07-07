@@ -5,6 +5,7 @@ from os.path import join as join
 import pandas as pd
 from copy import deepcopy
 import transformers
+import re
 
 
 ''' CONSTANTS '''
@@ -32,6 +33,14 @@ def modify_args_for_training(args):
     args.examples_dirpath = join(args.training_data_path, 'models', model_id, 'clean_example_data')
     return args
 
+
+def get_class_list(examples_dirpath):
+    file_list = os.listdir(examples_dirpath)
+    class_set = set()
+    for f in file_list:
+        class_num = int(re.findall(r'class_(\d+)_', f)[0])
+        class_set.add(class_num)
+    return list(class_set)
 
 def load_config(model_filepath):
     model_dirpath, _ = os.path.split(model_filepath)

@@ -3,9 +3,7 @@ Code inspired by: Eric Wallace Universal Triggers Repo
 https://github.com/Eric-Wallace/universal-triggers/blob/ed657674862c965b31e0728d71765d0b6fe18f22/gpt2/create_adv_token.py#L28
 
 TODO:
-- Copy a clean model for each architecture/dataset pair into a new clean_models folder
-- Add code to load the right clean model at eval time and add the hooks
-- Modify the loss function to be H(y_clean, y_eval)
+- Check that the code is working for a smaller subset of data
 
 DISCUSSION:
     ATTACKER
@@ -253,7 +251,7 @@ def get_clean_model_filepath(config):
 def get_trigger(classification_model, clean_model, vars, masked_source_class_token_locations, 
                 is_targetted, source_class, target_class, initial_trigger_token_ids, 
                 trigger_mask, trigger_length, embedding_matrix):
-    num_iterations, num_candidates = 10, 3
+    num_iterations, num_candidates = 10, 1
     insert_trigger(vars, trigger_mask, initial_trigger_token_ids)
     trigger_token_ids = deepcopy(initial_trigger_token_ids)
     insert_target_class(vars, masked_source_class_token_locations, target_class)
@@ -328,6 +326,7 @@ def trojan_detector(model_filepath, tokenizer_filepath,
 
     ''' 1.3 Load clean sentences, and transform it to variables '''
     original_words, original_labels = tools.get_words_and_labels(examples_dirpath)
+    class_list = tools.get_class_list(examples_dirpath)
     vars = list(tools.tokenize_and_align_labels(tokenizer, original_words, 
                                           original_labels, max_input_length))
     var_names = ['input_ids', 'attention_mask', 'labels', 'labels_mask']
@@ -335,20 +334,19 @@ def trojan_detector(model_filepath, tokenizer_filepath,
 
 
     ''' 2. INITIALIZE ATTACK FOR A SOURCE CLASS AND TRIGGER LENGTH '''
-    trigger_length = 2
+    trigger_length = 4
     is_targetted = True
     initial_trigger_word = 'dessert'
     initial_trigger_token_ids = make_initial_trigger_tokens(tokenizer, trigger_length, initial_trigger_word)
     
     ''' 3. ITERATIVELY ATTACK THE MODEL CONSIDERING NUM CANDIDATES PER TOKEN '''
     df = pd.DataFrame(columns=['source_class', 'target_class', 'decoded_top_candidate', 'trigger_asr', 'loss'])
-    labels_list = range(classification_model.num_labels)
-    for source_class, target_class in tqdm(list(itertools.product(labels_list, labels_list))):
+    for source_class, target_class in tqdm(list(itertools.product(class_list, class_list))):
         if source_class == target_class:
             continue
         vars, trigger_mask, masked_source_class_token_locations =\
             initialize_attack_for_source_class(source_class, original_vars, initial_trigger_token_ids)
-        if vars['input_ids'].shape[0] == 0:
+        if vars['input_ids'].shape[0] <= 10:
             continue
         trigger_token_ids, loss, logits = \
             get_trigger(classification_model, clean_model, vars, 
@@ -375,7 +373,7 @@ if __name__ == "__main__":
                         default=1)
     parser.add_argument('--model_num', type=int, 
                         help='Model id number', 
-                        default=4)
+                        default=188)
     parser.add_argument('--training_data_path', type=str, 
                         help='Folder that contains the training data', 
                         default=TRAINING_DATA_PATH)
