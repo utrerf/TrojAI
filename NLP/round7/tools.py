@@ -166,24 +166,24 @@ def tokenize_and_align_labels(tokenizer, original_words,
 
 
 def eval_batch_helper(clean_model, classification_model, all_vars, source_class_token_locations,
-                      is_targetted=False, source_class=0):
+                      is_targetted=False, source_class=0, class_list=[]):
     loss, logits = \
         classification_model(clean_model, all_vars['input_ids'], all_vars['attention_mask'], 
                             all_vars['labels'], is_triggered=True,
                             class_token_indices=source_class_token_locations,
-                            is_targetted=is_targetted, source_class=source_class)
+                            is_targetted=is_targetted, source_class=source_class, class_list=class_list)
     return loss, logits
 
 
 def evaluate_batch(clean_model, classification_model, all_vars, source_class_token_locations,
-                   use_grad=False, is_targetted=False, source_class=0):
+                   use_grad=False, is_targetted=False, source_class=0, class_list=[]):
     if use_grad:
         loss, logits = eval_batch_helper(clean_model, classification_model, all_vars, 
-                                    source_class_token_locations, is_targetted, source_class)
+                                    source_class_token_locations, is_targetted, source_class, class_list)
     else:
         with torch.no_grad():
             loss, logits = eval_batch_helper(clean_model, classification_model, all_vars, 
-                                    source_class_token_locations, is_targetted, source_class)
+                                    source_class_token_locations, is_targetted, source_class, class_list)
     return loss, logits
 
 

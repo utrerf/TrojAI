@@ -18,6 +18,16 @@ def entropy(predicted):
 	entropy = Categorical(probs=s(predicted).mean(dim=0)).entropy()
 	return entropy
 
+def apply_class_mask_to_logits(logits, class_list):
+		logits_class_mask = torch.ones_like(logits)
+		logits_class_mask[:, class_list] = 0
+		logits_class_mask *= -1e8
+		logits += logits_class_mask
+		# num_zeroed_classes = logits_class_mask.shape[1]-len(class_list)
+		# logits[logits_class_mask] = logits.min(dim=1)[0]\
+		# 							.unsqueeze(1).repeat((1, num_zeroed_classes)).flatten()
+		return logits
+
 class NerLinearModel(torch.nn.Module):
 	def get_logits(self, input_ids, attention_mask, transformer, classifier):
 		sequence_output = transformer(input_ids, attention_mask=attention_mask)[0]
@@ -26,7 +36,7 @@ class NerLinearModel(torch.nn.Module):
 		return logits
 
 	def forward(self, clean_model, input_ids, attention_mask=None, labels=None, is_triggered=False, 
-				class_token_indices=None, is_targetted=False, source_class=0):
+				class_token_indices=None, is_targetted=False, source_class=0, class_list=[]):
 		'''
 		Inputs
 		- class_token_indices: row,col of each of the source class tokens
@@ -41,10 +51,13 @@ class NerLinearModel(torch.nn.Module):
 			mask = class_token_indices.split(1, dim=1)
 			eval_logits = logits[mask]
 			eval_logits = eval_logits.view(-1, self.num_labels)
+			eval_logits = apply_class_mask_to_logits(eval_logits, class_list)
 			clean_logits = self.get_logits(input_ids, attention_mask, 
 										   clean_model.transformer, 
 										   clean_model.classifier)
 			clean_logits = clean_logits[mask].view(-1, self.num_labels)
+
+			clean_logits = apply_class_mask_to_logits(clean_logits, class_list)
 			true_labels = labels[mask].view(-1)
 			
 			if is_targetted:
@@ -52,9 +65,8 @@ class NerLinearModel(torch.nn.Module):
 				target_labels = deepcopy(true_labels)
 				source_labels = torch.zeros_like(target_labels) + source_class
 				# we want to minimize the loss
-				loss = loss_fct(eval_logits, target_labels) \
-					    + loss_fct(clean_logits, source_labels)\
-						+ lambd*entropy(eval_logits) # concentrate on a single class
+				loss = loss_fct(eval_logits, target_labels)
+					    # + lambd*loss_fct(clean_logits, source_labels)
 			else:
 				lambd = 1.
 				# we want to maximize the loss
@@ -62,13 +74,6 @@ class NerLinearModel(torch.nn.Module):
 						- loss_fct(clean_logits, true_labels)\
 						- lambd*entropy(eval_logits) # concentrate on a single class
 
-			# loss = CXE(active_logits, active_clean_logits) - lambd*entropy(active_logits)
-			# clean_predictions = torch.argmax(clean_logits, dim=2)
-			
- 			# loss = CXE(active_logits, active_clean_logits) - loss_fct(active_clean_logits, active_labels)
-			# Note: this is the untargetted loss
-
-			#loss = loss_fct(active_logits, active_labels)
 
 		else:
 			if attention_mask is not None:
