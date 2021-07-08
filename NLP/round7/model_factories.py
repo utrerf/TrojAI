@@ -8,6 +8,9 @@ from copy import deepcopy
 import torch
 from transformers import AutoModel
 from torch.distributions import Categorical
+import tools
+import numpy as np
+
 
 def CXE(predicted, target):
 	s = torch.nn.Softmax(dim=1)
@@ -36,7 +39,7 @@ class NerLinearModel(torch.nn.Module):
 		return logits
 
 	def forward(self, clean_model, input_ids, attention_mask=None, labels=None, is_triggered=False, 
-				class_token_indices=None, is_targetted=False, source_class=0, class_list=[]):
+				class_token_indices=None, is_targetted=False, source_class=0, target_class=0, class_list=[]):
 		'''
 		Inputs
 		- class_token_indices: row,col of each of the source class tokens
@@ -51,22 +54,24 @@ class NerLinearModel(torch.nn.Module):
 			mask = class_token_indices.split(1, dim=1)
 			eval_logits = logits[mask]
 			eval_logits = eval_logits.view(-1, self.num_labels)
-			eval_logits = apply_class_mask_to_logits(eval_logits, class_list)
+			eval_logits = eval_logits@tools.LOGITS_CLASS_MASK
+			# eval_logits = apply_class_mask_to_logits(eval_logits, class_list)
 			clean_logits = self.get_logits(input_ids, attention_mask, 
 										   clean_model.transformer, 
 										   clean_model.classifier)
 			clean_logits = clean_logits[mask].view(-1, self.num_labels)
+			clean_logits = clean_logits@tools.LOGITS_CLASS_MASK
 
-			clean_logits = apply_class_mask_to_logits(clean_logits, class_list)
+			# clean_logits = apply_class_mask_to_logits(clean_logits, class_list)
 			true_labels = labels[mask].view(-1)
 			
 			if is_targetted:
 				lambd = 1.
-				target_labels = deepcopy(true_labels)
-				source_labels = torch.zeros_like(target_labels) + source_class
+				target_labels = torch.zeros_like(true_labels) + np.argwhere(np.array(class_list)==target_class)[0,0]
+				source_labels = torch.zeros_like(target_labels) + np.argwhere(np.array(class_list)==source_class)[0,0]
 				# we want to minimize the loss
-				loss = loss_fct(eval_logits, target_labels)
-					    # + lambd*loss_fct(clean_logits, source_labels)
+				loss = loss_fct(eval_logits, target_labels)\
+					    + lambd*loss_fct(clean_logits, source_labels)
 			else:
 				lambd = 1.
 				# we want to maximize the loss

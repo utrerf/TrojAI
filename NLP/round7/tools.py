@@ -14,6 +14,14 @@ EXTRACTED_GRADS = []
 EXTRACTED_CLEAN_GRADS = []
 TRAINING_DATA_PATH = '/scratch/data/TrojAI/round7-train-dataset/'
 CLEAN_MODELS_PATH = '/scratch/utrerf/TrojAI/NLP/round7/clean_models'
+LOGITS_CLASS_MASK = None
+
+def get_logit_class_mask(class_list, classification_model):
+	logits_class_mask = torch.zeros([classification_model.num_labels, len(class_list)])
+	for new_cls, old_cls in enumerate(class_list):
+		logits_class_mask[old_cls][new_cls] = 1
+		logits_class_mask[old_cls+1][new_cls] = 1
+	return logits_class_mask
 
 def modify_args_for_training(args):
     metadata = pd.read_csv(join(args.training_data_path, 'METADATA.csv'))
@@ -103,10 +111,12 @@ def extract_clean_grad_hook(module, grad_in, grad_out):
     EXTRACTED_CLEAN_GRADS.append(grad_out[0])  
 
 
-def get_words_and_labels(examples_dirpath):
+def get_words_and_labels(examples_dirpath, source_class=None):
     fns = [os.path.join(examples_dirpath, fn) \
            for fn in os.listdir(examples_dirpath) \
            if fn.endswith('.txt')]
+    if source_class is not None:
+        fns = [i for i in fns if f'class_{source_class}' in i]
     fns.sort()
     original_words = []
     original_labels = []
@@ -166,24 +176,24 @@ def tokenize_and_align_labels(tokenizer, original_words,
 
 
 def eval_batch_helper(clean_model, classification_model, all_vars, source_class_token_locations,
-                      is_targetted=False, source_class=0, class_list=[]):
+                      is_targetted=False, source_class=0, target_class=0, class_list=[]):
     loss, logits = \
         classification_model(clean_model, all_vars['input_ids'], all_vars['attention_mask'], 
                             all_vars['labels'], is_triggered=True,
                             class_token_indices=source_class_token_locations,
-                            is_targetted=is_targetted, source_class=source_class, class_list=class_list)
+                            is_targetted=is_targetted, source_class=source_class, target_class=target_class, class_list=class_list)
     return loss, logits
 
 
 def evaluate_batch(clean_model, classification_model, all_vars, source_class_token_locations,
-                   use_grad=False, is_targetted=False, source_class=0, class_list=[]):
+                   use_grad=False, is_targetted=False, source_class=0, target_class=0, class_list=[]):
     if use_grad:
         loss, logits = eval_batch_helper(clean_model, classification_model, all_vars, 
-                                    source_class_token_locations, is_targetted, source_class, class_list)
+                                    source_class_token_locations, is_targetted, source_class, target_class, class_list)
     else:
         with torch.no_grad():
             loss, logits = eval_batch_helper(clean_model, classification_model, all_vars, 
-                                    source_class_token_locations, is_targetted, source_class, class_list)
+                                    source_class_token_locations, is_targetted, source_class, target_class, class_list)
     return loss, logits
 
 
