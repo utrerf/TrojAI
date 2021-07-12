@@ -23,6 +23,7 @@ def get_logit_class_mask(class_list, classification_model):
 		logits_class_mask[old_cls+1][new_cls] = 1
 	return logits_class_mask
 
+
 def modify_args_for_training(args):
     metadata = pd.read_csv(join(args.training_data_path, 'METADATA.csv'))
 
@@ -49,6 +50,7 @@ def get_class_list(examples_dirpath):
         class_num = int(re.findall(r'class_(\d+)_', f)[0])
         class_set.add(class_num)
     return list(class_set)
+
 
 def load_config(model_filepath):
     model_dirpath, _ = os.path.split(model_filepath)

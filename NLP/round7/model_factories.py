@@ -66,12 +66,13 @@ class NerLinearModel(torch.nn.Module):
 			true_labels = labels[mask].view(-1)
 			
 			if is_targetted:
-				lambd = 1.
+				lambd = 1
 				target_labels = torch.zeros_like(true_labels) + np.argwhere(np.array(class_list)==target_class)[0,0]
 				source_labels = torch.zeros_like(target_labels) + np.argwhere(np.array(class_list)==source_class)[0,0]
 				# we want to minimize the loss
 				loss = loss_fct(eval_logits, target_labels)\
 					    + lambd*loss_fct(clean_logits, source_labels)
+				# loss = CXE(eval_logits, lo)
 			else:
 				lambd = 1.
 				# we want to maximize the loss

@@ -41,6 +41,7 @@ from os.path import join as join
 import os
 import pandas as pd
 import itertools
+import random
 from tqdm import tqdm
 
 
@@ -134,9 +135,13 @@ def filter_vars_to_sentences_with_source_class(original_vars, source_class_token
     return masked_vars
 
 
-def make_initial_trigger_tokens(tokenizer, initial_trigger_words):
-    tokenized_initial_trigger_word = \
-        tokenizer.encode(initial_trigger_words, add_special_tokens=False)
+def make_initial_trigger_tokens(tokenizer, initial_trigger_words, is_random=False, num_random_tokens=0):
+    if is_random:
+        tokenized_initial_trigger_word = \
+            random.sample(list(tokenizer.vocab.values()), num_random_tokens)
+    else:
+        tokenized_initial_trigger_word = \
+            tokenizer.encode(initial_trigger_words, add_special_tokens=False)
     trigger_token_ids = \
         torch.tensor(tokenized_initial_trigger_word).cpu()
     return trigger_token_ids
@@ -206,10 +211,11 @@ def best_k_candidates_for_each_trigger_token(trigger_token_ids, trigger_mask, tr
     equation 2: (embedding_matrix - trigger embedding)T @ trigger_grad
     '''
     trigger_grad_shape = [max(trigger_mask.shape[0],1), trigger_length, -1]
-    trigger_grads = tools.EXTRACTED_GRADS[0][trigger_mask].reshape(trigger_grad_shape)
-    clean_trigger_grads = tools.EXTRACTED_CLEAN_GRADS[0][trigger_mask].reshape(trigger_grad_shape)
-    trigger_grads = (trigger_grads + clean_trigger_grads)/2
-    mean_grads = torch.mean(trigger_grads,dim=0).unsqueeze(0)
+    trigger_grads = tools.EXTRACTED_GRADS[0][trigger_mask].reshape(trigger_grad_shape).mean(0)
+    trigger_grads /= trigger_grads.norm()
+    clean_trigger_grads = tools.EXTRACTED_CLEAN_GRADS[0][trigger_mask].reshape(trigger_grad_shape).mean(0)
+    clean_trigger_grads /= clean_trigger_grads.norm()
+    mean_grads = ((trigger_grads + clean_trigger_grads)/2).unsqueeze(0)
     sign = 1
     if is_targetted:
         sign = -1
@@ -217,9 +223,14 @@ def best_k_candidates_for_each_trigger_token(trigger_token_ids, trigger_mask, tr
                                                          embedding_matrix).detach().unsqueeze(1)
     gradient_dot_embedding_matrix = sign * torch.einsum("bij,ikj->bik",
                                                  (mean_grads, embedding_matrix - trigger_token_embeds))[0]
+
     # gradient_dot_embedding_matrix = sign * torch.einsum("bij,kj->bik",
     #                                              (mean_grads, embedding_matrix))[0]                                                 
-    _, best_k_ids = torch.topk(gradient_dot_embedding_matrix, num_candidates, dim=1)
+    gradient_dot_embedding_matrix /= (embedding_matrix - trigger_token_embeds).norm(dim=2)
+
+    
+    _, best_k_ids = torch.topk(gradient_dot_embedding_matrix, num_candidates+1, dim=1)
+    best_k_ids = best_k_ids[:, 1:]
 
     return best_k_ids
 
@@ -274,7 +285,7 @@ def get_random_triggers(embedding_matrix, trigger_token_ids, num_candidates=1):
 def get_trigger(classification_model, clean_model, vars, masked_source_class_token_locations, 
                 is_targetted, class_list, source_class, target_class, initial_trigger_token_ids, 
                 trigger_mask, trigger_length, embedding_matrix):
-    num_iterations, num_candidates = 100, 1
+    num_iterations, num_candidates = 100, 100
     insert_trigger(vars, trigger_mask, initial_trigger_token_ids)
     trigger_token_ids = deepcopy(initial_trigger_token_ids)
     insert_target_class(vars, masked_source_class_token_locations, target_class)
@@ -338,6 +349,7 @@ def get_embedding_matrix(classification_model, clean_model):
     embedding_matrix = (embedding_matrix_eval+embedding_matrix_clean)/2
     return embedding_matrix
 
+
 def trojan_detector(model_filepath, tokenizer_filepath, 
                     result_filepath, scratch_dirpath, examples_dirpath):
     ''' 1. LOAD EVERYTHING '''
@@ -358,18 +370,27 @@ def trojan_detector(model_filepath, tokenizer_filepath,
 
     ''' 2. INITIALIZE ATTACK FOR A SOURCE CLASS AND TRIGGER LENGTH '''
     is_targetted = True
-    initial_trigger_words = 'bad'
+    initial_trigger_words = 'fragile'
+    initial_trigger_list = []
+    # num_initial_triggers = 20
+    # for i in range(num_initial_triggers):
+    #     initial_trigger_token_ids = make_initial_trigger_tokens(tokenizer, initial_trigger_words, True, 1)
+    #     initial_trigger_list.append(initial_trigger_token_ids)
     initial_trigger_token_ids = make_initial_trigger_tokens(tokenizer, initial_trigger_words)
+    initial_trigger_list.append(initial_trigger_token_ids)
     trigger_length = len(initial_trigger_token_ids)
     
     ''' 3. ITERATIVELY ATTACK THE MODEL CONSIDERING NUM CANDIDATES PER TOKEN '''
-    df = pd.DataFrame(columns=['source_class', 'target_class', 'decoded_top_candidate', 'trigger_asr', 'loss'])
+    df = pd.DataFrame(columns=['source_class', 'target_class', 'decoded_top_candidate', 'trigger_asr', 'loss', 'decoded_initial_candidate'])
     # class_list=[5,7]
     class_list = tools.get_class_list(examples_dirpath)
+    class_list=[1,7]
     tools.LOGITS_CLASS_MASK = tools.get_logit_class_mask(class_list, classification_model).to(DEVICE)
     tools.LOGITS_CLASS_MASK.requires_grad = False
 
-    for source_class, target_class in tqdm(list(itertools.product(class_list, class_list))):
+    TRIGGER_ASR_THRESHOLD = 0.95
+    TRIGGER_LOSS_THRESHOLD = 0.01
+    for initial_trigger_token_ids, source_class, target_class in tqdm(list(itertools.product(initial_trigger_list, class_list, class_list))):
         if source_class == target_class:
             continue
         vars, trigger_mask, masked_source_class_token_locations =\
@@ -382,11 +403,14 @@ def trojan_detector(model_filepath, tokenizer_filepath,
                         masked_source_class_token_locations, is_targetted, class_list, source_class, target_class,
                         initial_trigger_token_ids, trigger_mask, trigger_length, embedding_matrix)
         decoded_top_candidate = tools.decode_tensor_of_token_ids(tokenizer, trigger_token_ids)
+        decoded_initial_candidate = tools.decode_tensor_of_token_ids(tokenizer, initial_trigger_token_ids)
         source_class_loc_mask = masked_source_class_token_locations.split(1, dim=1)
         relevant_logits = logits[source_class_loc_mask]
         final_predictions = torch.argmax(relevant_logits, dim=2)
         trigger_asr = (torch.eq(final_predictions, target_class).sum()/final_predictions.shape[0]).detach().cpu().numpy()
-        df.loc[len(df)] = [source_class, target_class, decoded_top_candidate, trigger_asr, loss.detach().cpu().numpy()]
+        df.loc[len(df)] = [source_class, target_class, decoded_top_candidate, trigger_asr, loss.detach().cpu().numpy(), decoded_initial_candidate]
+        if trigger_asr > TRIGGER_ASR_THRESHOLD and loss < TRIGGER_LOSS_THRESHOLD:
+            break
 
     df.to_csv(f'/scratch/utrerf/TrojAI/NLP/round7/results/{args.model_num}.csv')
     
@@ -402,7 +426,7 @@ if __name__ == "__main__":
                         default=1)
     parser.add_argument('--model_num', type=int, 
                         help='Model id number', 
-                        default=144)
+                        default=190)
     parser.add_argument('--training_data_path', type=str, 
                         help='Folder that contains the training data', 
                         default=TRAINING_DATA_PATH)
