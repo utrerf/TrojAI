@@ -439,8 +439,6 @@ def trojan_detector(model_filepath, tokenizer_filepath,
     ''' 3. ITERATIVELY ATTACK THE MODEL CONSIDERING NUM CANDIDATES PER TOKEN '''
     df = pd.DataFrame(columns=['source_class', 'target_class', 'decoded_top_candidate', 'trigger_asr', 'loss', 'decoded_initial_candidate'])
     class_list = tools.get_class_list(examples_dirpath)
-    # TODO: Remove this
-    class_list = [1, 3]
     
     TRIGGER_ASR_THRESHOLD = 0.95
     TRIGGER_LOSS_THRESHOLD = 0.1
