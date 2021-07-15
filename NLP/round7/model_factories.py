@@ -32,46 +32,53 @@ def apply_class_mask_to_logits(logits, class_list):
 		return logits
 
 class NerLinearModel(torch.nn.Module):
-	def get_logits(self, input_ids, attention_mask, transformer, classifier):
+	def get_logits(self, input_ids, attention_mask, transformer, classifier, num_triggers_in_batch):
 		sequence_output = transformer(input_ids, attention_mask=attention_mask)[0]
-		sequence_output = self.dropout(sequence_output)
+		# sequence_output = self.dropout(sequence_output)
 		logits = classifier(sequence_output)
-		return logits
+		return logits.reshape([num_triggers_in_batch] + [-1] + list(logits.shape)[1:])
 
-	def forward(self, clean_model, input_ids, attention_mask=None, labels=None, is_triggered=False, 
-				class_token_indices=None, is_targetted=False, source_class=0, target_class=0, class_list=[]):
+	def forward(self, clean_model, input_ids, attention_mask=None, labels=None, 
+				is_triggered=False, class_token_indices=None, is_targetted=False, 
+				source_class=0, target_class=0, class_list=[], num_triggers_in_batch=1):
 		'''
 		Inputs
 		- class_token_indices: row,col of each of the source class tokens
 			shape=(num_sentences, 2) 
 		'''
 		logits = self.get_logits(input_ids, attention_mask, 
-								 self.transformer, self.classifier)
+								 self.transformer, self.classifier, num_triggers_in_batch)
 		loss_fct = torch.nn.CrossEntropyLoss(ignore_index=self.ignore_index)
 		
 		loss = None
 		if is_triggered and class_token_indices is not None:
 			mask = class_token_indices.split(1, dim=1)
-			eval_logits = logits[mask]
-			eval_logits = eval_logits.view(-1, self.num_labels)
+			# mask = ([[i] for i in range(num_triggers_in_batch)], mask[0], mask[1])
+			mask = ([list(range(num_triggers_in_batch)) for _ in range(len(mask[0]))], mask[0], mask[1])
+			eval_logits = logits[mask].permute(1,0,2)
+			eval_logits = eval_logits.view(num_triggers_in_batch, -1, self.num_labels)
 			eval_logits = eval_logits@tools.LOGITS_CLASS_MASK
 			# eval_logits = apply_class_mask_to_logits(eval_logits, class_list)
 			clean_logits = self.get_logits(input_ids, attention_mask, 
 										   clean_model.transformer, 
-										   clean_model.classifier)
-			clean_logits = clean_logits[mask].view(-1, self.num_labels)
+										   clean_model.classifier, num_triggers_in_batch)
+			clean_logits = clean_logits[mask].view(num_triggers_in_batch, -1, self.num_labels)
 			clean_logits = clean_logits@tools.LOGITS_CLASS_MASK
 
 			# clean_logits = apply_class_mask_to_logits(clean_logits, class_list)
-			true_labels = labels[mask].view(-1)
+			true_labels = labels.reshape([num_triggers_in_batch] + [-1] + list(labels.shape)[1:])[mask].view((num_triggers_in_batch, -1))
 			
 			if is_targetted:
-				lambd = 1
+				lambd = 2.
 				target_labels = torch.zeros_like(true_labels) + np.argwhere(np.array(class_list)==target_class)[0,0]
 				source_labels = torch.zeros_like(target_labels) + np.argwhere(np.array(class_list)==source_class)[0,0]
+				losses_list = []
 				# we want to minimize the loss
-				loss = loss_fct(eval_logits, target_labels)\
-					    + lambd*loss_fct(clean_logits, source_labels)
+				for eval_logit, clean_logit, target_label, source_label \
+					in zip(eval_logits, clean_logits, target_labels, source_labels):
+					loss = loss_fct(eval_logit, target_label)\
+							+ lambd*loss_fct(clean_logit, source_label)
+					losses_list.append(loss)
 				# loss = CXE(eval_logits, lo)
 			else:
 				lambd = 1.
@@ -91,4 +98,4 @@ class NerLinearModel(torch.nn.Module):
 			else:
 				loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
 				
-		return loss, logits
+		return losses_list, logits
