@@ -54,7 +54,8 @@ from tqdm import tqdm
 DEVICE = tools.DEVICE
 TRAINING_DATA_PATH = tools.TRAINING_DATA_PATH
 CLEAN_MODELS_PATH = tools.CLEAN_MODELS_PATH
-BATCH_SIZE = 256
+BATCH_SIZE = 64
+
 
 
 @torch.no_grad()
@@ -284,8 +285,10 @@ def get_best_candidate(clean_model, classification_model, vars, source_class_tok
         loss_per_candidate = []
         for cand, _ in top_candidates:
             loss_per_candidate.extend(\
-                get_loss_per_candidate(clean_model, classification_model, vars, source_class_token_locations,
-                                       trigger_mask, cand, best_k_ids, idx, is_targetted, source_class, target_class, class_list))
+                get_loss_per_candidate(clean_model, classification_model, vars, 
+                                        source_class_token_locations, trigger_mask, 
+                                        cand, best_k_ids, idx, is_targetted, source_class, 
+                                        target_class, class_list))
         top_candidates = heapq.nlargest(beam_size, loss_per_candidate, key=itemgetter(1))                               
     return max(top_candidates, key=itemgetter(1))
 
@@ -321,36 +324,38 @@ def get_random_triggers(embedding_matrix, trigger_token_ids, num_candidates=1):
 def get_trigger(classification_model, clean_model, vars, masked_source_class_token_locations, 
                 is_targetted, class_list, source_class, target_class, initial_trigger_token_ids, 
                 trigger_mask, trigger_length, embedding_matrix):
-    # num_iterations, num_candidates = 100, 300
     num_candidate_schedule = [200, 100, 1, 1, 1, 1, 1, 1, 1, 1]
     insert_trigger(vars, trigger_mask, initial_trigger_token_ids)
     trigger_token_ids = deepcopy(initial_trigger_token_ids)
+    ''' TODO: CHECK THAT I CAN REMOVE THIS'''
     insert_target_class(vars, masked_source_class_token_locations, target_class)
     for num_candidates in num_candidate_schedule:
         clear_model_grads(classification_model)
         clear_model_grads(clean_model)
 
-        # forward prop with the current masked vars
+        # forward prop with the current vars
         initial_loss, initial_logits = \
             tools.evaluate_batch(clean_model, classification_model, vars, 
                                  masked_source_class_token_locations, use_grad=True,
-                                 is_targetted=is_targetted, source_class=source_class, target_class=target_class, class_list=class_list)
+                                 is_targetted=is_targetted, source_class=source_class, 
+                                 target_class=target_class, class_list=class_list)
         initial_loss[0].backward()
         
     
         best_k_ids = \
             best_k_candidates_for_each_trigger_token(trigger_token_ids, trigger_mask, trigger_length, 
                                                      embedding_matrix, num_candidates, is_targetted)
+        ''' THANKS YAOQING! '''
+        clear_model_grads(classification_model)
+        clear_model_grads(clean_model)
         ''' Commented code below can be used to get random triggers inside of the candidate selection process '''
         # random_triggers = get_random_triggers(embedding_matrix, trigger_token_ids, num_candidates=10)
         # best_k_ids = torch.cat((best_k_ids, torch.tensor(random_triggers).to(DEVICE)), dim=1)
-        ''' TODO: Figure out how to do this elegantly for random average grads '''
-        #  if iter == 0 and trigger_token_ids.ndim > 1:
-        #     trigger_token_ids = trigger_token_ids[:, 0]
         top_candidate, loss = \
             get_best_candidate(clean_model, classification_model, vars, 
-                               masked_source_class_token_locations, trigger_mask, 
-                               trigger_token_ids, best_k_ids, is_targetted, source_class, target_class, class_list)
+                               masked_source_class_token_locations, 
+                               trigger_mask, trigger_token_ids, best_k_ids, 
+                               is_targetted, source_class, target_class, class_list)
  
         if torch.equal(top_candidate, trigger_token_ids):
             break
@@ -393,6 +398,8 @@ def get_embedding_matrix(classification_model, clean_model):
     embedding_matrix_eval = tools.get_embedding_weight(classification_model)
     embedding_matrix_clean = tools.get_embedding_weight(clean_model)
     embedding_matrix = (embedding_matrix_eval+embedding_matrix_clean)/2
+    embedding_matrix = deepcopy(embedding_matrix.detach())
+    embedding_matrix.requires_grad = False
     return embedding_matrix
 
 
@@ -417,9 +424,10 @@ def trojan_detector(model_filepath, tokenizer_filepath,
     ''' 2. INITIALIZE ATTACK FOR A SOURCE CLASS AND TRIGGER LENGTH '''
     is_targetted = True
 
-    initial_trigger_token_ids = make_initial_trigger_tokens(tokenizer, is_random=False, initial_trigger_words='ok ok')
+    initial_trigger_token_ids = make_initial_trigger_tokens(tokenizer, is_random=False, 
+                                                        initial_trigger_words='ok ok')
     trigger_length = len(initial_trigger_token_ids)
-    ''' Code for random re-starts'''
+    ''' Code for random starts'''
     # initial_trigger_list = []
     # num_initial_triggers = 20
     # trigger_length = 1
@@ -427,13 +435,6 @@ def trojan_detector(model_filepath, tokenizer_filepath,
     # for i in range(num_initial_triggers):
     #     initial_trigger_token_ids = make_initial_trigger_tokens(tokenizer, is_random=True, num_random_tokens=1)
     #     initial_trigger_list.append(initial_trigger_token_ids)
-    ''' Code to get a bunch of random tokens repeated for an initial grad ''' 
-    # initial_trigger_list = []
-    # trigger_length = 1
-    # for i in range(trigger_length):
-    #     initial_trigger_token_ids = make_initial_trigger_tokens(tokenizer, '', True, BATCH_SIZE)
-    #     initial_trigger_list.append(initial_trigger_token_ids)
-    # initial_trigger_token_ids = torch.cat(initial_trigger_list).reshape((trigger_length, BATCH_SIZE))
  
     
     ''' 3. ITERATIVELY ATTACK THE MODEL CONSIDERING NUM CANDIDATES PER TOKEN '''
