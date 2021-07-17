@@ -12,90 +12,14 @@ import tools
 import numpy as np
 
 
-def CXE(predicted, target):
-	s = torch.nn.Softmax(dim=1)
-	return -(s(target) * torch.log(s(predicted))).sum(dim=1).mean()
-
-def entropy(predicted):
-	s = torch.nn.Softmax(dim=1)
-	entropy = Categorical(probs=s(predicted).mean(dim=0)).entropy()
-	return entropy
-
-def apply_class_mask_to_logits(logits, class_list):
-		logits_class_mask = torch.ones_like(logits)
-		logits_class_mask[:, class_list] = 0
-		logits_class_mask *= -1e8
-		logits += logits_class_mask
-		# num_zeroed_classes = logits_class_mask.shape[1]-len(class_list)
-		# logits[logits_class_mask] = logits.min(dim=1)[0]\
-		# 							.unsqueeze(1).repeat((1, num_zeroed_classes)).flatten()
-		return logits
-
 class NerLinearModel(torch.nn.Module):
-	def get_logits(self, input_ids, attention_mask, transformer, classifier, num_triggers_in_batch):
-		sequence_output = transformer(input_ids, attention_mask=attention_mask)[0]
-		# sequence_output = self.dropout(sequence_output)
-		logits = classifier(sequence_output)
-		return logits.reshape([num_triggers_in_batch] + [-1] + list(logits.shape)[1:])
 
-	def forward(self, clean_model, input_ids, attention_mask=None, labels=None, 
-				is_triggered=False, class_token_indices=None, is_targetted=False, 
-				source_class=0, target_class=0, class_list=[], num_triggers_in_batch=1):
+	def forward(self, input_ids, attention_mask=None, num_triggers_in_batch=1):
 		'''
 		Inputs
 		- class_token_indices: row,col of each of the source class tokens
 			shape=(num_sentences, 2) 
 		'''
-		logits = self.get_logits(input_ids, attention_mask, 
-								 self.transformer, self.classifier, num_triggers_in_batch)
-		loss_fct = torch.nn.CrossEntropyLoss(ignore_index=self.ignore_index)
-		
-		loss = None
-		if is_triggered and class_token_indices is not None:
-			mask = class_token_indices.split(1, dim=1)
-			# mask = ([[i] for i in range(num_triggers_in_batch)], mask[0], mask[1])
-			mask = ([list(range(num_triggers_in_batch)) for _ in range(len(mask[0]))], mask[0], mask[1])
-			eval_logits = logits[mask].permute(1,0,2)
-			eval_logits = eval_logits.view(num_triggers_in_batch, -1, self.num_labels)
-			eval_logits = eval_logits@tools.LOGITS_CLASS_MASK
-			# eval_logits = apply_class_mask_to_logits(eval_logits, class_list)
-			clean_logits = self.get_logits(input_ids, attention_mask, 
-										   clean_model.transformer, 
-										   clean_model.classifier, num_triggers_in_batch)
-			clean_logits = clean_logits[mask].view(num_triggers_in_batch, -1, self.num_labels)
-			clean_logits = clean_logits@tools.LOGITS_CLASS_MASK
-
-			# clean_logits = apply_class_mask_to_logits(clean_logits, class_list)
-			true_labels = labels.reshape([num_triggers_in_batch] + [-1] + list(labels.shape)[1:])[mask].view((num_triggers_in_batch, -1))
-			
-			if is_targetted:
-				lambd = 2.
-				target_labels = torch.zeros_like(true_labels) + np.argwhere(np.array(class_list)==target_class)[0,0]
-				source_labels = torch.zeros_like(target_labels) + np.argwhere(np.array(class_list)==source_class)[0,0]
-				losses_list = []
-				# we want to minimize the loss
-				for eval_logit, clean_logit, target_label, source_label \
-					in zip(eval_logits, clean_logits, target_labels, source_labels):
-					loss = loss_fct(eval_logit, target_label)\
-							+ lambd*loss_fct(clean_logit, source_label)
-					losses_list.append(loss)
-				# loss = CXE(eval_logits, lo)
-			else:
-				lambd = 1.
-				# we want to maximize the loss
-				loss = loss_fct(eval_logits, true_labels) \
-						- loss_fct(clean_logits, true_labels)\
-						- lambd*entropy(eval_logits) # concentrate on a single class
-
-
-		else:
-			if attention_mask is not None:
-				active_loss = attention_mask.view(-1) == 1
-				active_logits = logits.view(-1, self.num_labels)
-				active_labels = torch.where(active_loss, labels.view(-1), 
-											torch.tensor(loss_fct.ignore_index).type_as(labels))
-				loss = loss_fct(active_logits, active_labels)
-			else:
-				loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-				
-		return losses_list, logits
+		sequence_output = self.transformer(input_ids, attention_mask=attention_mask)[0]
+		logits = self.classifier(sequence_output)
+		return logits.reshape([num_triggers_in_batch] + [-1] + list(logits.shape)[1:])

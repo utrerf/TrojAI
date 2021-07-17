@@ -33,6 +33,7 @@ DISCUSSION:
     Why would we want to try untargetted inversion instead of targetted inversion?
 '''
 
+from re import A
 import numpy as np
 import argparse
 import torch
@@ -54,7 +55,7 @@ from tqdm import tqdm
 DEVICE = tools.DEVICE
 TRAINING_DATA_PATH = tools.TRAINING_DATA_PATH
 CLEAN_MODELS_PATH = tools.CLEAN_MODELS_PATH
-BATCH_SIZE = 64
+BATCH_SIZE = 2048
 
 
 
@@ -158,7 +159,7 @@ def make_initial_trigger_tokens(tokenizer, is_random=True, initial_trigger_words
         tokenized_initial_trigger_word = \
             tokenizer.encode(initial_trigger_words, add_special_tokens=False)
     trigger_token_ids = \
-        torch.tensor(tokenized_initial_trigger_word).cpu()
+        torch.tensor(tokenized_initial_trigger_word).to(DEVICE)
     return trigger_token_ids
 
 
@@ -172,7 +173,7 @@ def shift_source_class_token_locations(source_class_token_locations, trigger_len
 
 
 @torch.no_grad()
-def get_loss_per_candidate(clean_model, classification_model, vars, 
+def get_loss_per_candidate(clean_models, classification_model, vars, 
                            source_class_token_locations, trigger_mask, 
                            trigger_token_ids, best_k_ids, trigger_token_pos, 
                            is_targetted, source_class, target_class, class_list):
@@ -193,7 +194,7 @@ def get_loss_per_candidate(clean_model, classification_model, vars,
 
     # save current loss with old triggers
     loss_per_candidate = []
-    curr_loss, _ = tools.evaluate_batch(clean_model, classification_model, vars, 
+    curr_loss, _, _ = tools.evaluate_batch(clean_models, classification_model, vars, 
                                source_class_token_locations, use_grad=False, 
                                is_targetted=is_targetted, source_class=source_class, target_class=target_class, class_list=class_list)
     curr_loss = sign * curr_loss[0].cpu().numpy()
@@ -202,31 +203,24 @@ def get_loss_per_candidate(clean_model, classification_model, vars,
     # evaluate loss with each of the candidate triggers
     # let's batch the candidates
     num_triggers_in_batch = BATCH_SIZE // len(vars['input_ids'])
-    iteration_list = list(range(0, len(best_k_ids[trigger_token_pos]), 9)) + \
-                                            [len(best_k_ids[trigger_token_pos])]
     num_batches = (len(best_k_ids[trigger_token_pos])//num_triggers_in_batch)+1
     batch_list = [best_k_ids[trigger_token_pos][i*num_triggers_in_batch:(i+1)*num_triggers_in_batch] for i in range(num_batches)]
     for cand_token_id_batch in batch_list:
         if len(cand_token_id_batch) == 0:
             continue
-        agg_vars = {k:[] for k in vars.keys()}
-        list_of_trigger_token_ids_one_replaced = []
-        for cand_token_id in cand_token_id_batch:
-            trigger_token_ids_one_replaced = deepcopy(trigger_token_ids) # copy trigger
-            trigger_token_ids_one_replaced[trigger_token_pos] = cand_token_id # replace one token
-            list_of_trigger_token_ids_one_replaced.append(trigger_token_ids_one_replaced)
-            temp_vars = deepcopy(vars)
-            insert_trigger(temp_vars, trigger_mask, trigger_token_ids_one_replaced)
-            for k, v in agg_vars.items():
-                v.append(temp_vars[k])
-        agg_vars = {k:torch.cat(v).reshape([-1]+list(v[0].shape)[1:]) for k,v in agg_vars.items()}
-        losses, _ = tools.evaluate_batch(clean_model, classification_model, agg_vars, 
+        trigger_token_ids_one_replaced = deepcopy(trigger_token_ids).repeat([len(cand_token_id_batch), 1]).to(DEVICE)
+        trigger_token_ids_one_replaced[:, trigger_token_pos] = cand_token_id_batch
+        trigger_token_ids_one_replaced = trigger_token_ids_one_replaced.repeat_interleave(vars['input_ids'].shape[0], 0)
+        temp_vars = deepcopy(vars)
+        temp_vars = {k:v.repeat([len(cand_token_id_batch), 1]) for k,v in temp_vars.items()}
+        temp_vars['input_ids'][trigger_mask.repeat([len(cand_token_id_batch), 1])] = trigger_token_ids_one_replaced.view(-1)
+        losses, _, _ = tools.evaluate_batch(clean_models, classification_model, temp_vars, 
                               source_class_token_locations, use_grad=False,
-                              is_targetted=is_targetted, source_class=source_class, target_class=target_class, class_list=class_list,
+                              is_targetted=is_targetted, source_class=source_class, 
+                              target_class=target_class, class_list=class_list,
                               num_triggers_in_batch=len(cand_token_id_batch))
-        losses = [sign * l.cpu().numpy() for l in losses]
-        for trigger_token_ids_one_replaced, loss in zip(list_of_trigger_token_ids_one_replaced, losses):
-            loss_per_candidate.append((deepcopy(trigger_token_ids_one_replaced), loss))
+        for trigger, loss in zip(trigger_token_ids_one_replaced[::vars['input_ids'].shape[0]], losses):
+            loss_per_candidate.append((deepcopy(trigger), sign*deepcopy(loss.detach().cpu().numpy())))
     return loss_per_candidate
 
 
@@ -245,7 +239,9 @@ def best_k_candidates_for_each_trigger_token(trigger_token_ids, trigger_mask, tr
     '''
     trigger_grad_shape = [max(trigger_mask.shape[0],1), trigger_length, -1]
     trigger_grads = tools.EXTRACTED_GRADS[0][trigger_mask].reshape(trigger_grad_shape).mean(0)
-    clean_trigger_grads = tools.EXTRACTED_CLEAN_GRADS[0][trigger_mask].reshape(trigger_grad_shape).mean(0)
+    clean_trigger_grads = torch.stack(tools.EXTRACTED_CLEAN_GRADS)\
+                            [trigger_mask.unsqueeze(0).repeat([len(tools.EXTRACTED_CLEAN_GRADS), 1, 1])]\
+                            .reshape([len(tools.EXTRACTED_CLEAN_GRADS)]+trigger_grad_shape).mean([0,1])
     mean_grads = ((trigger_grads + clean_trigger_grads)/2).unsqueeze(0)
     sign = 1
     if is_targetted:
@@ -272,11 +268,12 @@ def best_k_candidates_for_each_trigger_token(trigger_token_ids, trigger_mask, tr
     return best_k_ids
 
 
-def get_best_candidate(clean_model, classification_model, vars, source_class_token_locations,
-                       trigger_mask, trigger_token_ids, best_k_ids, is_targetted, source_class, target_class, class_list, beam_size=2):
+def get_best_candidate(clean_models, classification_model, vars, source_class_token_locations,
+                       trigger_mask, trigger_token_ids, best_k_ids, is_targetted, source_class, 
+                       target_class, class_list, beam_size=1):
     
     loss_per_candidate = \
-        get_loss_per_candidate(clean_model, classification_model, vars, 
+        get_loss_per_candidate(clean_models, classification_model, vars, 
                                source_class_token_locations, trigger_mask, 
                                trigger_token_ids, best_k_ids, 0, is_targetted, source_class, target_class, class_list) 
 
@@ -285,12 +282,19 @@ def get_best_candidate(clean_model, classification_model, vars, source_class_tok
         loss_per_candidate = []
         for cand, _ in top_candidates:
             loss_per_candidate.extend(\
-                get_loss_per_candidate(clean_model, classification_model, vars, 
+                get_loss_per_candidate(clean_models, classification_model, vars, 
                                         source_class_token_locations, trigger_mask, 
                                         cand, best_k_ids, idx, is_targetted, source_class, 
                                         target_class, class_list))
         top_candidates = heapq.nlargest(beam_size, loss_per_candidate, key=itemgetter(1))                               
     return max(top_candidates, key=itemgetter(1))
+
+
+def load_clean_models(clean_classification_model_path):
+    clean_models = []
+    for f in clean_classification_model_path:
+        clean_models.append(load_model(f))
+    return clean_models
 
 
 def load_model(model_filepath):
@@ -299,12 +303,14 @@ def load_model(model_filepath):
     return classification_model
 
 
-def get_clean_model_filepath(config):
+def get_clean_model_filepaths(config):
     key = f"{config['source_dataset'].lower()}_{config['embedding']}"
-    model_folder = [f for f in os.listdir(CLEAN_MODELS_PATH) if key in f][0]
-    clean_classification_model_path = \
-        join(CLEAN_MODELS_PATH, model_folder, 'model.pt')
-    return clean_classification_model_path
+    model_name = config['output_filepath'].split('/')[-1]
+    model_folders = [f for f in os.listdir(CLEAN_MODELS_PATH) \
+                        if (key in f and model_name not in f)]
+    clean_classification_model_paths = \
+        [join(CLEAN_MODELS_PATH, model_folder, 'model.pt') for model_folder in model_folders]
+    return clean_classification_model_paths
 
 
 def get_random_triggers(embedding_matrix, trigger_token_ids, num_candidates=1):
@@ -321,21 +327,22 @@ def get_random_triggers(embedding_matrix, trigger_token_ids, num_candidates=1):
     return new_trigger_token_ids
 
 
-def get_trigger(classification_model, clean_model, vars, masked_source_class_token_locations, 
+def get_trigger(classification_model, clean_models, vars, masked_source_class_token_locations, 
                 is_targetted, class_list, source_class, target_class, initial_trigger_token_ids, 
                 trigger_mask, trigger_length, embedding_matrix):
-    num_candidate_schedule = [200, 100, 1, 1, 1, 1, 1, 1, 1, 1]
+    num_candidate_schedule = [3]*30
     insert_trigger(vars, trigger_mask, initial_trigger_token_ids)
     trigger_token_ids = deepcopy(initial_trigger_token_ids)
     ''' TODO: CHECK THAT I CAN REMOVE THIS'''
     insert_target_class(vars, masked_source_class_token_locations, target_class)
-    for num_candidates in num_candidate_schedule:
+    for i, num_candidates in enumerate(num_candidate_schedule):
         clear_model_grads(classification_model)
-        clear_model_grads(clean_model)
+        for clean_model in clean_models:
+            clear_model_grads(clean_model)
 
         # forward prop with the current vars
-        initial_loss, initial_logits = \
-            tools.evaluate_batch(clean_model, classification_model, vars, 
+        initial_loss, initial_eval_logits, initial_clean_logits = \
+            tools.evaluate_batch(clean_models, classification_model, vars, 
                                  masked_source_class_token_locations, use_grad=True,
                                  is_targetted=is_targetted, source_class=source_class, 
                                  target_class=target_class, class_list=class_list)
@@ -347,22 +354,25 @@ def get_trigger(classification_model, clean_model, vars, masked_source_class_tok
                                                      embedding_matrix, num_candidates, is_targetted)
         ''' THANKS YAOQING! '''
         clear_model_grads(classification_model)
-        clear_model_grads(clean_model)
+        for clean_model in clean_models:
+            clear_model_grads(clean_model)
         ''' Commented code below can be used to get random triggers inside of the candidate selection process '''
         # random_triggers = get_random_triggers(embedding_matrix, trigger_token_ids, num_candidates=10)
         # best_k_ids = torch.cat((best_k_ids, torch.tensor(random_triggers).to(DEVICE)), dim=1)
         top_candidate, loss = \
-            get_best_candidate(clean_model, classification_model, vars, 
+            get_best_candidate(clean_models, classification_model, vars, 
                                masked_source_class_token_locations, 
                                trigger_mask, trigger_token_ids, best_k_ids, 
                                is_targetted, source_class, target_class, class_list)
  
+        print(f'iteration: {i} initial_loss: {round(initial_loss[0].item(), 2)} final_loss: {-loss.round(2)} initial_candidate: {trigger_token_ids} top_candidate: {top_candidate.detach().cpu().numpy()}')
         if torch.equal(top_candidate, trigger_token_ids):
             break
         insert_trigger(vars, trigger_mask, top_candidate)
         trigger_token_ids = deepcopy(top_candidate)
+        
 
-    return trigger_token_ids, initial_loss, initial_logits
+    return trigger_token_ids, initial_loss, initial_eval_logits, initial_clean_logits
 
 
 def initialize_attack_for_source_class(examples_dirpath, tokenizer, source_class, 
@@ -394,9 +404,15 @@ def initialize_attack_for_source_class(examples_dirpath, tokenizer, source_class
     return vars, trigger_mask, masked_source_class_token_locations
 
 
-def get_embedding_matrix(classification_model, clean_model):
+@torch.no_grad()
+def get_embedding_matrix(classification_model, clean_models):
     embedding_matrix_eval = tools.get_embedding_weight(classification_model)
-    embedding_matrix_clean = tools.get_embedding_weight(clean_model)
+    clean_embedding_matrices = []
+    for clean_model in clean_models:
+        clean_embedding_matrices.append(tools.get_embedding_weight(clean_model))
+    embedding_matrix_clean = torch.cat(clean_embedding_matrices)\
+        .reshape([len(clean_embedding_matrices), -1, embedding_matrix_eval.shape[-1]])\
+        .mean(0)
     embedding_matrix = (embedding_matrix_eval+embedding_matrix_clean)/2
     embedding_matrix = deepcopy(embedding_matrix.detach())
     embedding_matrix.requires_grad = False
@@ -411,11 +427,12 @@ def trojan_detector(model_filepath, tokenizer_filepath,
     classification_model = load_model(model_filepath)
     tools.add_hooks(classification_model, is_clean=False)
 
-    clean_classification_model_path = get_clean_model_filepath(config)
-    clean_model = load_model(clean_classification_model_path)
-    tools.add_hooks(clean_model, is_clean=True)
+    clean_classification_model_path = get_clean_model_filepaths(config)
+    clean_models = load_clean_models(clean_classification_model_path)
+    for clean_model in clean_models:
+        tools.add_hooks(clean_model, is_clean=True)
     
-    embedding_matrix = get_embedding_matrix(classification_model, clean_model)
+    embedding_matrix = get_embedding_matrix(classification_model, clean_models)
     
     ''' 1.2 Load Tokenizer '''
     tokenizer = tools.load_tokenizer(tokenizer_filepath, config)
@@ -425,22 +442,13 @@ def trojan_detector(model_filepath, tokenizer_filepath,
     is_targetted = True
 
     initial_trigger_token_ids = make_initial_trigger_tokens(tokenizer, is_random=False, 
-                                                        initial_trigger_words='ok ok')
+                                                        initial_trigger_words='ok ok ok ok ok ok ok')
     trigger_length = len(initial_trigger_token_ids)
-    ''' Code for random starts'''
-    # initial_trigger_list = []
-    # num_initial_triggers = 20
-    # trigger_length = 1
-    # initial_trigger_words = None
-    # for i in range(num_initial_triggers):
-    #     initial_trigger_token_ids = make_initial_trigger_tokens(tokenizer, is_random=True, num_random_tokens=1)
-    #     initial_trigger_list.append(initial_trigger_token_ids)
- 
     
     ''' 3. ITERATIVELY ATTACK THE MODEL CONSIDERING NUM CANDIDATES PER TOKEN '''
-    df = pd.DataFrame(columns=['source_class', 'target_class', 'decoded_top_candidate', 'trigger_asr', 'loss', 'decoded_initial_candidate'])
+    df = pd.DataFrame(columns=['source_class', 'target_class', 'top_candidate', 'decoded_top_candidate', 'trigger_asr', 'clean_asr', 'loss', 'decoded_initial_candidate'])
     class_list = tools.get_class_list(examples_dirpath)
-    
+
     TRIGGER_ASR_THRESHOLD = 0.95
     TRIGGER_LOSS_THRESHOLD = 0.1
     for source_class, target_class in tqdm(list(itertools.product(class_list, class_list))):
@@ -452,18 +460,30 @@ def trojan_detector(model_filepath, tokenizer_filepath,
         vars, trigger_mask, masked_source_class_token_locations =\
             initialize_attack_for_source_class(examples_dirpath, tokenizer, source_class, 
                                                initial_trigger_token_ids, max_input_length)
-        trigger_token_ids, loss, logits = \
-            get_trigger(classification_model, clean_model, vars, 
+        trigger_token_ids, loss, initial_eval_logits, initial_clean_logits = \
+            get_trigger(classification_model, clean_models, vars, 
                         masked_source_class_token_locations, is_targetted, temp_class_list, source_class, target_class,
                         initial_trigger_token_ids, trigger_mask, trigger_length, embedding_matrix)
+        
         decoded_top_candidate = tools.decode_tensor_of_token_ids(tokenizer, trigger_token_ids)
         decoded_initial_candidate = tools.decode_tensor_of_token_ids(tokenizer, initial_trigger_token_ids)
+        
         source_class_loc_mask = masked_source_class_token_locations.split(1, dim=1)
-        final_predictions = torch.argmax(logits[0][source_class_loc_mask], dim=2)
+        final_predictions = torch.argmax(initial_eval_logits[0][source_class_loc_mask], dim=-1)
         # TODO: Make more general. This is specific to round7
         flipped_predictions = torch.eq(final_predictions, target_class).sum() + torch.eq(final_predictions, target_class+1).sum()
         trigger_asr = (flipped_predictions/final_predictions.shape[0]).detach().cpu().numpy()
-        df.loc[len(df)] = [source_class, target_class, decoded_top_candidate, trigger_asr, loss[0].detach().cpu().numpy(), decoded_initial_candidate]
+
+        clean_asr_list = []
+        for clean_logits in initial_clean_logits:
+            final_clean_predictions = torch.argmax(clean_logits[0][source_class_loc_mask], dim=-1)
+            # TODO: Make more general. This is specific to round7
+            flipped_predictions = torch.eq(final_clean_predictions, target_class).sum() + torch.eq(final_clean_predictions, target_class+1).sum()
+            clean_asr = (flipped_predictions/final_clean_predictions.shape[0]).detach().cpu().numpy()
+            clean_asr_list.append(clean_asr)
+
+        df.loc[len(df)] = [source_class, target_class, trigger_token_ids.detach().cpu().numpy(), decoded_top_candidate, trigger_asr, \
+                           np.array(clean_asr_list).mean(), loss[0].detach().cpu().numpy(), decoded_initial_candidate]
         if trigger_asr > TRIGGER_ASR_THRESHOLD and loss[0] < TRIGGER_LOSS_THRESHOLD:
             break
 
@@ -481,7 +501,7 @@ if __name__ == "__main__":
                         default=1)
     parser.add_argument('--model_num', type=int, 
                         help='Model id number', 
-                        default=3)
+                        default=2)
     parser.add_argument('--training_data_path', type=str, 
                         help='Folder that contains the training data', 
                         default=TRAINING_DATA_PATH)

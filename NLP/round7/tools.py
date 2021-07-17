@@ -6,6 +6,7 @@ import pandas as pd
 from copy import deepcopy
 import transformers
 import re
+import numpy as np
 
 
 ''' CONSTANTS '''
@@ -177,30 +178,57 @@ def tokenize_and_align_labels(tokenizer, original_words,
            labels, label_mask
 
 
-def eval_batch_helper(clean_model, classification_model, all_vars, source_class_token_locations,
-                      is_targetted=False, source_class=0, target_class=0, class_list=[], num_triggers_in_batch=1):
-    loss, logits = \
-        classification_model(clean_model, all_vars['input_ids'], all_vars['attention_mask'], 
-                            all_vars['labels'], is_triggered=True,
-                            class_token_indices=source_class_token_locations,
-                            is_targetted=is_targetted, source_class=source_class, 
-                            target_class=target_class, class_list=class_list, 
-                            num_triggers_in_batch=num_triggers_in_batch)
-    return loss, logits
+def eval_batch_helper(clean_models, classification_model, all_vars, source_class_token_locations,
+                      is_targetted=False, source_class=0, target_class=0, class_list=[], num_triggers_in_batch=1, is_triggered=True):
+    clean_logits_list = []
+    for clean_model in clean_models:
+        clean_logits_list.append(clean_model(all_vars['input_ids'], all_vars['attention_mask'], num_triggers_in_batch))
+    original_clean_logits = torch.stack(clean_logits_list)
+    original_eval_logits = classification_model(all_vars['input_ids'], all_vars['attention_mask'], num_triggers_in_batch)
+    
+    loss_fct = torch.nn.CrossEntropyLoss(ignore_index=classification_model.ignore_index)
+
+    mask = source_class_token_locations.split(1, dim=1)
+    mask = ([list(range(num_triggers_in_batch)) for _ in range(len(mask[0]))], mask[0], mask[1])
+    eval_logits = original_eval_logits[mask].permute(1,0,2)
+    eval_logits = eval_logits.view(num_triggers_in_batch, -1, classification_model.num_labels)
+    eval_logits = eval_logits@LOGITS_CLASS_MASK
+
+    true_labels = all_vars['labels'].reshape([num_triggers_in_batch] + [-1] + list(all_vars['labels'].shape)[1:])[mask].view((num_triggers_in_batch, -1))
+        
+    lambd = 2.
+    target_labels = torch.zeros_like(true_labels) + np.argwhere(np.array(class_list)==target_class)[0,0]
+    source_labels = torch.zeros_like(target_labels) + np.argwhere(np.array(class_list)==source_class)[0,0]
+    
+    # we want to minimize the loss
+    losses_list = []
+    for eval_logit, clean_logit, target_label, source_label \
+        in zip(eval_logits, original_clean_logits.permute(1,0,2,3,4), target_labels, source_labels):
+        clean_losses = []
+        for cl in clean_logit:
+            clean_mask = source_class_token_locations.split(1, dim=1)
+            cl = cl[clean_mask].permute(1,0,2)
+            cl = cl@LOGITS_CLASS_MASK
+            clean_losses.append(loss_fct(cl[0], source_label))
+        avg_clean_loss = torch.stack(clean_losses).mean(0)
+        losses_list.append(loss_fct(eval_logit, target_label) \
+                            + lambd*avg_clean_loss)
+
+    return losses_list, original_eval_logits, original_clean_logits
 
 
-def evaluate_batch(clean_model, classification_model, all_vars, source_class_token_locations,
+def evaluate_batch(clean_models, classification_model, all_vars, source_class_token_locations,
                    use_grad=False, is_targetted=False, source_class=0, target_class=0, class_list=[], num_triggers_in_batch=1):
     if use_grad:
-        loss, logits = eval_batch_helper(clean_model, classification_model, all_vars, 
+        loss, original_eval_logits, original_clean_logits = eval_batch_helper(clean_models, classification_model, all_vars, 
                                     source_class_token_locations, is_targetted, source_class, 
                                     target_class, class_list, num_triggers_in_batch)
     else:
         with torch.no_grad():
-            loss, logits = eval_batch_helper(clean_model, classification_model, all_vars, 
+            loss, original_eval_logits, original_clean_logits = eval_batch_helper(clean_models, classification_model, all_vars, 
                                     source_class_token_locations, is_targetted, source_class, 
                                     target_class, class_list, num_triggers_in_batch)
-    return loss, logits
+    return loss, original_eval_logits, original_clean_logits
 
 
 def decode_tensor_of_token_ids(tokenizer, word_id_tensor):
