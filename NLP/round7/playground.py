@@ -3,12 +3,18 @@ Code inspired by: Eric Wallace Universal Triggers Repo
 https://github.com/Eric-Wallace/universal-triggers/blob/ed657674862c965b31e0728d71765d0b6fe18f22/gpt2/create_adv_token.py#L28
 
 TODO:
-- Get losses for multiple candidates at the same time
-    - Almost done but just need to figure out if the permute in model_factories is correct
 - Get candidate triggers as the ones that are expected to decrease the loss the most
     Start with m initial triggers that we do fwd and back
     For each of those m triggers choose the top 
-    
+
+IDEAS:
+- Start from right to left
+- Have an active num of candidates [20] and a passive one [3] for tokens that just changed and their neighbors
+- Remember results to avoid computing unneccessary things
+- Does beam size matter?
+- Can I use the old formula for computing the 1st order approx
+- Is the 1st order approx reliable?
+- Is it better to only use losses from the target and source classes? I think it underestimates the loss
 
 MAINTENANCE NOTES:
 - Need to update backward hook in tools to register_full_backward_hook 
@@ -55,8 +61,7 @@ from tqdm import tqdm
 DEVICE = tools.DEVICE
 TRAINING_DATA_PATH = tools.TRAINING_DATA_PATH
 CLEAN_MODELS_PATH = tools.CLEAN_MODELS_PATH
-BATCH_SIZE = 2048
-
+BATCH_SIZE = 256
 
 
 @torch.no_grad()
@@ -176,15 +181,12 @@ def shift_source_class_token_locations(source_class_token_locations, trigger_len
 def get_loss_per_candidate(clean_models, classification_model, vars, 
                            source_class_token_locations, trigger_mask, 
                            trigger_token_ids, best_k_ids, trigger_token_pos, 
-                           is_targetted, source_class, target_class, class_list):
+                           source_class, target_class, clean_class_list, class_list):
     '''
     vars: dictionary with input_ids, attention_mask, labels, labels_mask 
               already includes old triggers from previous iteration
     returns the loss per candidate trigger (all tokens)
     '''
-    sign = 1 # min loss if we're targetting a class
-    if is_targetted:
-        sign = -1
     # get the candidate trigger token location
     cand_trigger_token_location = deepcopy(source_class_token_locations)
     num_trigger_tokens = best_k_ids.shape[0]
@@ -194,17 +196,20 @@ def get_loss_per_candidate(clean_models, classification_model, vars,
 
     # save current loss with old triggers
     loss_per_candidate = []
+    insert_trigger(vars, trigger_mask, trigger_token_ids)
     curr_loss, _, _ = tools.evaluate_batch(clean_models, classification_model, vars, 
                                source_class_token_locations, use_grad=False, 
-                               is_targetted=is_targetted, source_class=source_class, target_class=target_class, class_list=class_list)
-    curr_loss = sign * curr_loss[0].cpu().numpy()
+                               source_class=source_class, target_class=target_class, 
+                               clean_class_list=clean_class_list, class_list=class_list)
+    curr_loss = tools.SIGN * curr_loss[0].cpu().numpy()
     loss_per_candidate.append((deepcopy(trigger_token_ids), curr_loss))
     
     # evaluate loss with each of the candidate triggers
     # let's batch the candidates
     num_triggers_in_batch = BATCH_SIZE // len(vars['input_ids'])
     num_batches = (len(best_k_ids[trigger_token_pos])//num_triggers_in_batch)+1
-    batch_list = [best_k_ids[trigger_token_pos][i*num_triggers_in_batch:(i+1)*num_triggers_in_batch] for i in range(num_batches)]
+    batch_list = [best_k_ids[trigger_token_pos][i*num_triggers_in_batch:(i+1)*num_triggers_in_batch] \
+                                                                            for i in range(num_batches)]
     for cand_token_id_batch in batch_list:
         if len(cand_token_id_batch) == 0:
             continue
@@ -216,11 +221,11 @@ def get_loss_per_candidate(clean_models, classification_model, vars,
         temp_vars['input_ids'][trigger_mask.repeat([len(cand_token_id_batch), 1])] = trigger_token_ids_one_replaced.view(-1)
         losses, _, _ = tools.evaluate_batch(clean_models, classification_model, temp_vars, 
                               source_class_token_locations, use_grad=False,
-                              is_targetted=is_targetted, source_class=source_class, 
-                              target_class=target_class, class_list=class_list,
+                              source_class=source_class, target_class=target_class, 
+                              clean_class_list=clean_class_list, class_list=class_list,
                               num_triggers_in_batch=len(cand_token_id_batch))
         for trigger, loss in zip(trigger_token_ids_one_replaced[::vars['input_ids'].shape[0]], losses):
-            loss_per_candidate.append((deepcopy(trigger), sign*deepcopy(loss.detach().cpu().numpy())))
+            loss_per_candidate.append((deepcopy(trigger), tools.SIGN*deepcopy(loss.detach().cpu().numpy())))
     return loss_per_candidate
 
 
@@ -233,7 +238,7 @@ def clear_model_grads(classification_model):
 
 @torch.no_grad()
 def best_k_candidates_for_each_trigger_token(trigger_token_ids, trigger_mask, trigger_length, 
-                                             embedding_matrix, num_candidates, is_targetted):    
+                                             embedding_matrix, num_candidates):    
     '''
     equation 2: (embedding_matrix - trigger embedding)T @ trigger_grad
     '''
@@ -243,16 +248,13 @@ def best_k_candidates_for_each_trigger_token(trigger_token_ids, trigger_mask, tr
                             [trigger_mask.unsqueeze(0).repeat([len(tools.EXTRACTED_CLEAN_GRADS), 1, 1])]\
                             .reshape([len(tools.EXTRACTED_CLEAN_GRADS)]+trigger_grad_shape).mean([0,1])
     mean_grads = ((trigger_grads + clean_trigger_grads)/2).unsqueeze(0)
-    sign = 1
-    if is_targetted:
-        sign = -1
     trigger_token_embeds = torch.nn.functional.embedding(trigger_token_ids.to(DEVICE),
                                                          embedding_matrix).detach().unsqueeze(1)
-    # gradient_dot_embedding_matrix = sign * torch.einsum("bij,ikj->bik",
-    #                                              (mean_grads, embedding_matrix - trigger_token_embeds))[0]
+    gradient_dot_embedding_matrix = tools.SIGN * torch.einsum("bij,ikj->bik",
+                                                 (mean_grads, embedding_matrix - trigger_token_embeds))[0]
 
-    gradient_dot_embedding_matrix = sign * torch.einsum("bij,kj->bik",
-                                                 (mean_grads, embedding_matrix))[0]                                                 
+    # gradient_dot_embedding_matrix = sign * torch.einsum("bij,kj->bik",
+    #                                              (mean_grads, embedding_matrix))[0]                                                 
     ''' Commented code below implements a penalty for embeddings that are further away '''
     # gradient_dot_embedding_matrix /= (embedding_matrix - trigger_token_embeds).norm(dim=2)
     ''' commented code below implement a PGD-like approach '''
@@ -269,23 +271,22 @@ def best_k_candidates_for_each_trigger_token(trigger_token_ids, trigger_mask, tr
 
 
 def get_best_candidate(clean_models, classification_model, vars, source_class_token_locations,
-                       trigger_mask, trigger_token_ids, best_k_ids, is_targetted, source_class, 
-                       target_class, class_list, beam_size=1):
+                       trigger_mask, trigger_token_ids, best_k_ids, source_class, 
+                       target_class, clean_class_list, class_list, beam_size=1):
     
-    loss_per_candidate = \
-        get_loss_per_candidate(clean_models, classification_model, vars, 
-                               source_class_token_locations, trigger_mask, 
-                               trigger_token_ids, best_k_ids, 0, is_targetted, source_class, target_class, class_list) 
+    initial_loss_per_candidate = \
+        get_loss_per_candidate(clean_models, classification_model, vars, source_class_token_locations, 
+                            trigger_mask, trigger_token_ids, best_k_ids, 0, source_class, target_class, clean_class_list, class_list) 
 
-    top_candidates = heapq.nlargest(beam_size, loss_per_candidate, key=itemgetter(1))                                         
+    top_candidates = heapq.nlargest(beam_size, initial_loss_per_candidate, key=itemgetter(1))                                     
     for idx in range(1, len(trigger_token_ids)):
         loss_per_candidate = []
         for cand, _ in top_candidates:
             loss_per_candidate.extend(\
                 get_loss_per_candidate(clean_models, classification_model, vars, 
                                         source_class_token_locations, trigger_mask, 
-                                        cand, best_k_ids, idx, is_targetted, source_class, 
-                                        target_class, class_list))
+                                        cand, best_k_ids, idx, source_class, 
+                                        target_class, clean_class_list, class_list))
         top_candidates = heapq.nlargest(beam_size, loss_per_candidate, key=itemgetter(1))                               
     return max(top_candidates, key=itemgetter(1))
 
@@ -327,14 +328,40 @@ def get_random_triggers(embedding_matrix, trigger_token_ids, num_candidates=1):
     return new_trigger_token_ids
 
 
+def evaluate_first_k_random_candidates(tokenizer, classification_model, clean_models, vars, masked_source_class_token_locations,
+                                       clean_class_list, class_list, source_class, target_class, initial_trigger_token_ids,
+                                       trigger_mask, trigger_length, num_random_candidates):
+    ''' 
+    Input: Integer k
+    Output: Best random start as defined by having the biggest or smallest loss
+    '''
+    vocab = np.array(list(tokenizer.vocab.values()))
+    random_tokens = np.random.choice(vocab, size=[num_random_candidates, trigger_length], replace=False)
+    all_initial_trigger_token_ids = torch.tensor(random_tokens).to(DEVICE)
+    loss_per_candidate = []
+    for initial_trigger_token_ids in all_initial_trigger_token_ids:
+        insert_trigger(vars, trigger_mask, initial_trigger_token_ids)
+        loss, eval_logits, clean_logits = \
+            tools.evaluate_batch(clean_models, classification_model, vars, 
+                                 masked_source_class_token_locations, use_grad=False,
+                                 source_class=source_class, target_class=target_class, 
+                                 clean_class_list=clean_class_list, class_list=class_list)
+        loss_per_candidate.append((initial_trigger_token_ids, tools.SIGN*loss[0].cpu().numpy()))
+    best_start = heapq.nlargest(1, loss_per_candidate, key=itemgetter(1))[0][0]
+    return best_start
+
+    
+
+
+
 def get_trigger(classification_model, clean_models, vars, masked_source_class_token_locations, 
-                is_targetted, class_list, source_class, target_class, initial_trigger_token_ids, 
+                clean_class_list, class_list, source_class, target_class, initial_trigger_token_ids, 
                 trigger_mask, trigger_length, embedding_matrix):
-    num_candidate_schedule = [3]*30
+    num_candidate_schedule = [5]*20
     insert_trigger(vars, trigger_mask, initial_trigger_token_ids)
     trigger_token_ids = deepcopy(initial_trigger_token_ids)
     ''' TODO: CHECK THAT I CAN REMOVE THIS'''
-    insert_target_class(vars, masked_source_class_token_locations, target_class)
+    # insert_target_class(vars, masked_source_class_token_locations, target_class)
     for i, num_candidates in enumerate(num_candidate_schedule):
         clear_model_grads(classification_model)
         for clean_model in clean_models:
@@ -344,14 +371,15 @@ def get_trigger(classification_model, clean_models, vars, masked_source_class_to
         initial_loss, initial_eval_logits, initial_clean_logits = \
             tools.evaluate_batch(clean_models, classification_model, vars, 
                                  masked_source_class_token_locations, use_grad=True,
-                                 is_targetted=is_targetted, source_class=source_class, 
-                                 target_class=target_class, class_list=class_list)
+                                 source_class=source_class, target_class=target_class, 
+                                 clean_class_list=clean_class_list, class_list=class_list)
         initial_loss[0].backward()
+
         
     
         best_k_ids = \
             best_k_candidates_for_each_trigger_token(trigger_token_ids, trigger_mask, trigger_length, 
-                                                     embedding_matrix, num_candidates, is_targetted)
+                                                     embedding_matrix, num_candidates)
         ''' THANKS YAOQING! '''
         clear_model_grads(classification_model)
         for clean_model in clean_models:
@@ -363,9 +391,9 @@ def get_trigger(classification_model, clean_models, vars, masked_source_class_to
             get_best_candidate(clean_models, classification_model, vars, 
                                masked_source_class_token_locations, 
                                trigger_mask, trigger_token_ids, best_k_ids, 
-                               is_targetted, source_class, target_class, class_list)
- 
-        print(f'iteration: {i} initial_loss: {round(initial_loss[0].item(), 2)} final_loss: {-loss.round(2)} initial_candidate: {trigger_token_ids} top_candidate: {top_candidate.detach().cpu().numpy()}')
+                               source_class, target_class, clean_class_list, class_list)
+        print(f'iteration: {i} \n\t initial_loss: {np.round(initial_loss[0].item(),3)} final_loss: {tools.SIGN*loss.round(3)} '+
+              f'\n\t initial_candidate:\t {trigger_token_ids.detach().cpu().numpy()} \n\t top_candidate:\t\t {top_candidate.detach().cpu().numpy()}')
         if torch.equal(top_candidate, trigger_token_ids):
             break
         insert_trigger(vars, trigger_mask, top_candidate)
@@ -439,30 +467,50 @@ def trojan_detector(model_filepath, tokenizer_filepath,
     max_input_length = tools.get_max_input_length(config, tokenizer)
 
     ''' 2. INITIALIZE ATTACK FOR A SOURCE CLASS AND TRIGGER LENGTH '''
-    is_targetted = True
-
     initial_trigger_token_ids = make_initial_trigger_tokens(tokenizer, is_random=False, 
                                                         initial_trigger_words='ok ok ok ok ok ok ok')
-    trigger_length = len(initial_trigger_token_ids)
+    #                                                     # initial_trigger_words='ok ok ok ok ok ok ok')
+    # trigger_length = len(initial_trigger_token_ids)
+    # initial_trigger_token_ids = torch.tensor([15505, 1638,  1638, 1638, 19131, 20425, 19105, 24625, 25247, 28193]).to(DEVICE)
+    # initial_trigger_token_ids = torch.tensor([27524, 20502,  6662, 16306, 20502,  7833,  8910, 16224, 19350, 21359, 19509]).to(DEVICE)
+    
+    trigger_length = 7
     
     ''' 3. ITERATIVELY ATTACK THE MODEL CONSIDERING NUM CANDIDATES PER TOKEN '''
     df = pd.DataFrame(columns=['source_class', 'target_class', 'top_candidate', 'decoded_top_candidate', 'trigger_asr', 'clean_asr', 'loss', 'decoded_initial_candidate'])
     class_list = tools.get_class_list(examples_dirpath)
+    # TODO: Remove this
+    # class_list = [7,1]
 
     TRIGGER_ASR_THRESHOLD = 0.95
     TRIGGER_LOSS_THRESHOLD = 0.1
     for source_class, target_class in tqdm(list(itertools.product(class_list, class_list))):
         if source_class == target_class:
             continue
-        temp_class_list = [source_class, target_class]
+        # TODO: CHECK IF THIS WORKS
+        # temp_class_list = [source_class, target_class]
+        temp_class_list = class_list
+        temp_class_list_clean = class_list
+        
+        temp_class_list = class_list
         tools.LOGITS_CLASS_MASK = tools.get_logit_class_mask(temp_class_list, classification_model).to(DEVICE)
         tools.LOGITS_CLASS_MASK.requires_grad = False
+        temp_class_list_clean = [source_class, target_class]
+        tools.LOGITS_CLASS_MASK_CLEAN = tools.get_logit_class_mask(temp_class_list_clean, classification_model, add_zero=False).to(DEVICE)
+        tools.LOGITS_CLASS_MASK_CLEAN.requires_grad = False
+
         vars, trigger_mask, masked_source_class_token_locations =\
             initialize_attack_for_source_class(examples_dirpath, tokenizer, source_class, 
-                                               initial_trigger_token_ids, max_input_length)
+                                        initial_trigger_token_ids, max_input_length)
+        ''' Code below can be used to use a number of random candidates to start with '''
+        # num_random_candidates=100
+        # initial_trigger_token_ids = evaluate_first_k_random_candidates(tokenizer, classification_model, clean_models, vars, 
+        #                     masked_source_class_token_locations, temp_class_list_clean, temp_class_list, source_class, target_class, 
+        #                     initial_trigger_token_ids, trigger_mask, trigger_length, num_random_candidates)
+
         trigger_token_ids, loss, initial_eval_logits, initial_clean_logits = \
             get_trigger(classification_model, clean_models, vars, 
-                        masked_source_class_token_locations, is_targetted, temp_class_list, source_class, target_class,
+                        masked_source_class_token_locations, temp_class_list_clean, temp_class_list, source_class, target_class,
                         initial_trigger_token_ids, trigger_mask, trigger_length, embedding_matrix)
         
         decoded_top_candidate = tools.decode_tensor_of_token_ids(tokenizer, trigger_token_ids)
@@ -482,7 +530,7 @@ def trojan_detector(model_filepath, tokenizer_filepath,
             clean_asr = (flipped_predictions/final_clean_predictions.shape[0]).detach().cpu().numpy()
             clean_asr_list.append(clean_asr)
 
-        df.loc[len(df)] = [source_class, target_class, trigger_token_ids.detach().cpu().numpy(), decoded_top_candidate, trigger_asr, \
+        df.loc[len(df)] = [source_class, target_class, trigger_token_ids.detach().cpu().numpy(), decoded_top_candidate, trigger_asr,\
                            np.array(clean_asr_list).mean(), loss[0].detach().cpu().numpy(), decoded_initial_candidate]
         if trigger_asr > TRIGGER_ASR_THRESHOLD and loss[0] < TRIGGER_LOSS_THRESHOLD:
             break
@@ -501,7 +549,7 @@ if __name__ == "__main__":
                         default=1)
     parser.add_argument('--model_num', type=int, 
                         help='Model id number', 
-                        default=2)
+                        default=15)
     parser.add_argument('--training_data_path', type=str, 
                         help='Folder that contains the training data', 
                         default=TRAINING_DATA_PATH)

@@ -4,7 +4,7 @@ import pandas as pd
 import tools
 import shutil
 
-NUM_CLEAN_MODELS = 5
+NUM_CLEAN_MODELS = 4
 
 ''' 1. Load metadata '''
 TRAINING_DATA_PATH = tools.TRAINING_DATA_PATH

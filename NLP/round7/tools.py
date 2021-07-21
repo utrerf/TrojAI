@@ -16,13 +16,21 @@ EXTRACTED_CLEAN_GRADS = []
 TRAINING_DATA_PATH = '/scratch/data/TrojAI/round7-train-dataset/'
 CLEAN_MODELS_PATH = '/scratch/utrerf/TrojAI/NLP/round7/clean_models'
 LOGITS_CLASS_MASK = None
+LOGITS_CLASS_MASK_CLEAN = None
+IS_TARGETTED = True
+SIGN = 1 # min loss if we're targetting a class
+if IS_TARGETTED:
+    SIGN = -1 
 
-def get_logit_class_mask(class_list, classification_model):
-	logits_class_mask = torch.zeros([classification_model.num_labels, len(class_list)])
-	for new_cls, old_cls in enumerate(class_list):
-		logits_class_mask[old_cls][new_cls] = 1
-		logits_class_mask[old_cls+1][new_cls] = 1
-	return logits_class_mask
+def get_logit_class_mask(class_list, classification_model, add_zero=False):
+    if add_zero:
+        class_list = [0] + class_list
+    logits_class_mask = torch.zeros([classification_model.num_labels, len(class_list)])
+    for new_cls, old_cls in enumerate(class_list):
+        logits_class_mask[old_cls][new_cls] = 1
+        if not add_zero or new_cls!=0:
+            logits_class_mask[old_cls+1][new_cls] = 1
+    return logits_class_mask
 
 
 def modify_args_for_training(args):
@@ -179,7 +187,7 @@ def tokenize_and_align_labels(tokenizer, original_words,
 
 
 def eval_batch_helper(clean_models, classification_model, all_vars, source_class_token_locations,
-                      is_targetted=False, source_class=0, target_class=0, class_list=[], num_triggers_in_batch=1, is_triggered=True):
+                      source_class=0, target_class=0, clean_class_list=[], class_list=[], num_triggers_in_batch=1, is_triggered=True):
     clean_logits_list = []
     for clean_model in clean_models:
         clean_logits_list.append(clean_model(all_vars['input_ids'], all_vars['attention_mask'], num_triggers_in_batch))
@@ -196,9 +204,8 @@ def eval_batch_helper(clean_models, classification_model, all_vars, source_class
 
     true_labels = all_vars['labels'].reshape([num_triggers_in_batch] + [-1] + list(all_vars['labels'].shape)[1:])[mask].view((num_triggers_in_batch, -1))
         
-    lambd = 2.
     target_labels = torch.zeros_like(true_labels) + np.argwhere(np.array(class_list)==target_class)[0,0]
-    source_labels = torch.zeros_like(target_labels) + np.argwhere(np.array(class_list)==source_class)[0,0]
+    source_labels = torch.zeros_like(target_labels) + np.argwhere(np.array(clean_class_list)==source_class)[0,0]
     
     # we want to minimize the loss
     losses_list = []
@@ -208,26 +215,33 @@ def eval_batch_helper(clean_models, classification_model, all_vars, source_class
         for cl in clean_logit:
             clean_mask = source_class_token_locations.split(1, dim=1)
             cl = cl[clean_mask].permute(1,0,2)
-            cl = cl@LOGITS_CLASS_MASK
+            cl = cl@LOGITS_CLASS_MASK_CLEAN
+            # TODO: THIS NEEDS TO CHANGE
             clean_losses.append(loss_fct(cl[0], source_label))
         avg_clean_loss = torch.stack(clean_losses).mean(0)
-        losses_list.append(loss_fct(eval_logit, target_label) \
-                            + lambd*avg_clean_loss)
+        if IS_TARGETTED==True:
+            lambd = 1.75
+            losses_list.append(loss_fct(eval_logit, target_label) \
+                                + lambd*avg_clean_loss)
+        else:
+            lambd = 4.
+            losses_list.append(loss_fct(eval_logit, source_label) \
+                                - lambd*avg_clean_loss)
 
     return losses_list, original_eval_logits, original_clean_logits
 
 
 def evaluate_batch(clean_models, classification_model, all_vars, source_class_token_locations,
-                   use_grad=False, is_targetted=False, source_class=0, target_class=0, class_list=[], num_triggers_in_batch=1):
+                   use_grad=False, source_class=0, target_class=0, clean_class_list=[], class_list=[], num_triggers_in_batch=1):
     if use_grad:
         loss, original_eval_logits, original_clean_logits = eval_batch_helper(clean_models, classification_model, all_vars, 
-                                    source_class_token_locations, is_targetted, source_class, 
-                                    target_class, class_list, num_triggers_in_batch)
+                                    source_class_token_locations, source_class, 
+                                    target_class, clean_class_list, class_list, num_triggers_in_batch)
     else:
         with torch.no_grad():
             loss, original_eval_logits, original_clean_logits = eval_batch_helper(clean_models, classification_model, all_vars, 
-                                    source_class_token_locations, is_targetted, source_class, 
-                                    target_class, class_list, num_triggers_in_batch)
+                                    source_class_token_locations, source_class, 
+                                    target_class, clean_class_list, class_list, num_triggers_in_batch)
     return loss, original_eval_logits, original_clean_logits
 
 
