@@ -477,21 +477,18 @@ def trojan_detector(model_filepath, tokenizer_filepath,
     trigger_length = 7
     
     ''' 3. ITERATIVELY ATTACK THE MODEL CONSIDERING NUM CANDIDATES PER TOKEN '''
-    df = pd.DataFrame(columns=['source_class', 'target_class', 'top_candidate', 'decoded_top_candidate', 'trigger_asr', 'clean_asr', 'loss', 'decoded_initial_candidate'])
+    df = pd.DataFrame(columns=['source_class', 'target_class', 'top_candidate', 'decoded_top_candidate', 'trigger_asr', 'clean_asr', 'loss', 'clean_accuracy', 'decoded_initial_candidate'])
     class_list = tools.get_class_list(examples_dirpath)
     # TODO: Remove this
-    # class_list = [7,1]
+    # class_list = [3, 1]
 
     TRIGGER_ASR_THRESHOLD = 0.95
     TRIGGER_LOSS_THRESHOLD = 0.1
     for source_class, target_class in tqdm(list(itertools.product(class_list, class_list))):
         if source_class == target_class:
             continue
-        # TODO: CHECK IF THIS WORKS
-        # temp_class_list = [source_class, target_class]
-        temp_class_list = class_list
-        temp_class_list_clean = class_list
         
+        # temp_class_list = [source_class, target_class]
         temp_class_list = class_list
         tools.LOGITS_CLASS_MASK = tools.get_logit_class_mask(temp_class_list, classification_model).to(DEVICE)
         tools.LOGITS_CLASS_MASK.requires_grad = False
@@ -522,16 +519,17 @@ def trojan_detector(model_filepath, tokenizer_filepath,
         flipped_predictions = torch.eq(final_predictions, target_class).sum() + torch.eq(final_predictions, target_class+1).sum()
         trigger_asr = (flipped_predictions/final_predictions.shape[0]).detach().cpu().numpy()
 
-        clean_asr_list = []
+        clean_asr_list, clean_accuracy_list = [], []
         for clean_logits in initial_clean_logits:
             final_clean_predictions = torch.argmax(clean_logits[0][source_class_loc_mask], dim=-1)
             # TODO: Make more general. This is specific to round7
             flipped_predictions = torch.eq(final_clean_predictions, target_class).sum() + torch.eq(final_clean_predictions, target_class+1).sum()
-            clean_asr = (flipped_predictions/final_clean_predictions.shape[0]).detach().cpu().numpy()
-            clean_asr_list.append(clean_asr)
+            clean_asr_list.append((flipped_predictions/final_clean_predictions.shape[0]).detach().cpu().numpy())
+            correct_predictions = torch.eq(final_clean_predictions, source_class).sum() + torch.eq(final_clean_predictions, source_class+1).sum()
+            clean_accuracy_list.append((correct_predictions/final_clean_predictions.shape[0]).detach().cpu().numpy())
 
         df.loc[len(df)] = [source_class, target_class, trigger_token_ids.detach().cpu().numpy(), decoded_top_candidate, trigger_asr,\
-                           np.array(clean_asr_list).mean(), loss[0].detach().cpu().numpy(), decoded_initial_candidate]
+                           np.array(clean_asr_list).mean(), loss[0].detach().cpu().numpy(), np.array(clean_accuracy_list).mean(), decoded_initial_candidate]
         if trigger_asr > TRIGGER_ASR_THRESHOLD and loss[0] < TRIGGER_LOSS_THRESHOLD:
             break
 
@@ -549,7 +547,7 @@ if __name__ == "__main__":
                         default=1)
     parser.add_argument('--model_num', type=int, 
                         help='Model id number', 
-                        default=15)
+                        default=23)
     parser.add_argument('--training_data_path', type=str, 
                         help='Folder that contains the training data', 
                         default=TRAINING_DATA_PATH)

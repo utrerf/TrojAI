@@ -220,7 +220,7 @@ def eval_batch_helper(clean_models, classification_model, all_vars, source_class
             clean_losses.append(loss_fct(cl[0], source_label))
         avg_clean_loss = torch.stack(clean_losses).mean(0)
         if IS_TARGETTED==True:
-            lambd = 1.75
+            lambd = 1.
             losses_list.append(loss_fct(eval_logit, target_label) \
                                 + lambd*avg_clean_loss)
         else:

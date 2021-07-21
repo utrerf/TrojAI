@@ -5,7 +5,7 @@ import shlex
 import pandas as pd
 import numpy as np
 
-gpu_list = [7]
+gpu_list = [6, 7]
 gpus_per_command = 1
 polling_delay_seconds = .1
 # os.environ['MKL_THREADING_LAYER'] = 'GNU'
