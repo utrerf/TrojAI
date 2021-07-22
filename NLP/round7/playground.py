@@ -478,6 +478,8 @@ def trojan_detector(model_filepath, tokenizer_filepath,
     ''' 1. LOAD EVERYTHING '''
     ''' 1.1 Load Models '''
     config = tools.load_config(model_filepath)
+    if config['embedding'] == 'MobileBERT':
+        tools.USE_AMP = False
     classification_model = load_model(model_filepath)
     tools.add_hooks(classification_model, is_clean=False)
 

@@ -26,6 +26,7 @@ SIGN = 1 # min loss if we're targetting a class
 if IS_TARGETTED:
     SIGN = -1 
 LAMBDA = .5
+USE_AMP = True
 
 def get_logit_class_mask(class_list, classification_model, add_zero=False):
     if add_zero:
@@ -192,7 +193,8 @@ def tokenize_and_align_labels(tokenizer, original_words,
 
 
 def eval_batch_helper(clean_models, classification_model, all_vars, source_class_token_locations,
-                      source_class=0, target_class=0, clean_class_list=[], class_list=[], num_triggers_in_batch=1, is_triggered=True):
+                      source_class=0, target_class=0, clean_class_list=[], class_list=[], 
+                      num_triggers_in_batch=1, is_triggered=True):
     clean_logits_list = []
     # for clean_model in random.sample(clean_models, min(len(clean_models), NUM_CLEAN_MODELS_AT_EVAL)):
     for clean_model in clean_models:
@@ -243,9 +245,12 @@ def evaluate_batch(clean_models, classification_model, all_vars, source_class_to
                                     target_class, clean_class_list, class_list, num_triggers_in_batch)
     else:
         with torch.no_grad():
-            loss, original_eval_logits, original_clean_logits = eval_batch_helper(clean_models, classification_model, all_vars, 
-                                    source_class_token_locations, source_class, 
-                                    target_class, clean_class_list, class_list, num_triggers_in_batch)
+            if USE_AMP:
+                with torch.cuda.amp.autocast():
+                    loss, original_eval_logits, original_clean_logits = \
+                        eval_batch_helper(clean_models, classification_model, all_vars, 
+                                            source_class_token_locations, source_class, 
+                                            target_class, clean_class_list, class_list, num_triggers_in_batch)
     return loss, original_eval_logits, original_clean_logits
 
 
