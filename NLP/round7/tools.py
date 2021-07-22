@@ -25,7 +25,7 @@ IS_TARGETTED = True
 SIGN = 1 # min loss if we're targetting a class
 if IS_TARGETTED:
     SIGN = -1 
-LAMBDA = .5
+LAMBDA = .1
 USE_AMP = True
 
 def get_logit_class_mask(class_list, classification_model, add_zero=False):
@@ -232,7 +232,7 @@ def eval_batch_helper(clean_models, classification_model, all_vars, source_class
                                 + LAMBDA*avg_clean_loss)
         else:
             losses_list.append(loss_fct(eval_logit, source_label) \
-                                - lambd*avg_clean_loss)
+                                - LAMBDA*avg_clean_loss)
 
     return losses_list, original_eval_logits, original_clean_logits
 

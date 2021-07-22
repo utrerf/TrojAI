@@ -500,13 +500,13 @@ def trojan_detector(model_filepath, tokenizer_filepath,
 
     ''' 2. INITIALIZE ATTACK FOR A SOURCE CLASS AND TRIGGER LENGTH '''
     initial_trigger_token_ids = make_initial_trigger_tokens(tokenizer, is_random=False, 
-                                                        initial_trigger_words='ok ok ok ok ok ok ok')
+                                                        initial_trigger_words="up ! pants bad hey ok / briefly curse |")
     #                                                     # initial_trigger_words='ok ok ok ok ok ok ok')
     # trigger_length = len(initial_trigger_token_ids)
     # initial_trigger_token_ids = torch.tensor([15505, 1638,  1638, 1638, 19131, 20425, 19105, 24625, 25247, 28193]).to(DEVICE)
     # initial_trigger_token_ids = torch.tensor([27524, 20502,  6662, 16306, 20502,  7833,  8910, 16224, 19350, 21359, 19509]).to(DEVICE)
     
-    trigger_length = 7
+    trigger_length = len(initial_trigger_token_ids)
     
     ''' 3. ITERATIVELY ATTACK THE MODEL CONSIDERING NUM CANDIDATES PER TOKEN '''
     df = pd.DataFrame(columns=['source_class', 'target_class', 'top_candidate', 'decoded_top_candidate', 'trigger_asr', 'clean_asr', \
@@ -516,14 +516,14 @@ def trojan_detector(model_filepath, tokenizer_filepath,
     # class_list = [3, 5]
 
     TRIGGER_ASR_THRESHOLD = 0.95
-    TRIGGER_LOSS_THRESHOLD = 0.1
+    TRIGGER_LOSS_THRESHOLD = 0.05
     for source_class, target_class in tqdm(list(itertools.product(class_list, class_list))):
         if source_class == target_class:
             continue
         
         # TODO: CHANGE THIS
-        temp_class_list = tools.get_class_list(examples_dirpath)
-        # temp_class_list = class_list
+        # temp_class_list = tools.get_class_list(examples_dirpath)
+        temp_class_list = class_list
         tools.LOGITS_CLASS_MASK = tools.get_logit_class_mask(temp_class_list, classification_model).to(DEVICE)
         tools.LOGITS_CLASS_MASK.requires_grad = False
         temp_class_list_clean = [source_class, target_class]
@@ -591,7 +591,7 @@ if __name__ == "__main__":
                         default=1)
     parser.add_argument('--model_num', type=int, 
                         help='Model id number', 
-                        default=15)
+                        default=12)
     parser.add_argument('--training_data_path', type=str, 
                         help='Folder that contains the training data', 
                         default=tools.TRAINING_DATA_PATH)

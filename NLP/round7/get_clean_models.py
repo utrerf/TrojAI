@@ -5,7 +5,7 @@ import tools
 import shutil
 
 
-NUM_CLEAN_TRAINING_MODELS = 2
+NUM_CLEAN_TRAINING_MODELS = 3
 # All other models are used for testing
 
 ''' 1. Load metadata '''
@@ -20,8 +20,14 @@ clean_metadata = metadata[metadata['poisoned'] == False]
 #           .agg({'final_clean_data_test_acc': 'max'})
 train_df = clean_metadata\
           .groupby(['embedding_flavor', 'source_dataset'], as_index=False)\
-          .apply(lambda x: x.nlargest(NUM_CLEAN_TRAINING_MODELS, 'final_clean_data_test_acc'))\
+          .apply(lambda x: x.nlargest(NUM_CLEAN_TRAINING_MODELS-1, 'final_clean_data_test_acc'))\
           .reset_index(drop=True)
+train_df2 = clean_metadata\
+          .groupby(['embedding_flavor', 'source_dataset'], as_index=False)\
+          .apply(lambda x: x.nsmallest(1, 'final_clean_data_test_acc'))\
+          .reset_index(drop=True)
+train_df = train_df.append(train_df2).reset_index(drop=True)    
+
 test_df = clean_metadata\
           .groupby(['embedding_flavor', 'source_dataset'], as_index=False)\
           .apply(lambda x: x.nlargest(100, 'final_clean_data_test_acc'))\
