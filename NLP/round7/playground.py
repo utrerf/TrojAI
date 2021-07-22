@@ -1,18 +1,20 @@
 '''
-Code inspired by: Eric Wallace Universal Triggers Repo
+Code inspired by: Eric Wallace Universal Triggers repo
 https://github.com/Eric-Wallace/universal-triggers/blob/ed657674862c965b31e0728d71765d0b6fe18f22/gpt2/create_adv_token.py#L28
 
 TODO:
-- Get candidate triggers as the ones that are expected to decrease the loss the most
-    Start with m initial triggers that we do fwd and back
-    For each of those m triggers choose the top 
+- Work on performance
+- Finish evaluating training set
+- Train LR
+- Clean up and open-source
+- Update candidate producing function to make taylor expansion with weighted lambda times the second term [yaoqing]
 
 IDEAS:
-- Start from right to left
+- Start from right to left (didn't work)
 - Have an active num of candidates [20] and a passive one [3] for tokens that just changed and their neighbors
 - Remember results to avoid computing unneccessary things
-- Does beam size matter?
-- Can I use the old formula for computing the 1st order approx
+- Does beam size matter? (No, BS=1 works)
+- Can I use the old formula for computing the 1st order approx (Yes, both work)
 - Is the 1st order approx reliable?
 - Is it better to only use losses from the target and source classes? I think it underestimates the loss
 
@@ -48,6 +50,7 @@ from copy import deepcopy
 from operator import is_, itemgetter, xor
 import heapq
 import torch.optim as optim
+from transformers.models.tapas.tokenization_tapas import format_text
 import tools
 from os.path import join as join
 import os
@@ -59,8 +62,6 @@ from tqdm import tqdm
 
 ''' CONSTANTS '''
 DEVICE = tools.DEVICE
-TRAINING_DATA_PATH = tools.TRAINING_DATA_PATH
-CLEAN_MODELS_PATH = tools.CLEAN_MODELS_PATH
 BATCH_SIZE = 256
 
 
@@ -304,13 +305,16 @@ def load_model(model_filepath):
     return classification_model
 
 
-def get_clean_model_filepaths(config):
+def get_clean_model_filepaths(config, for_testing=False):
     key = f"{config['source_dataset'].lower()}_{config['embedding']}"
     model_name = config['output_filepath'].split('/')[-1]
-    model_folders = [f for f in os.listdir(CLEAN_MODELS_PATH) \
+    base_path = tools.CLEAN_MODELS_PATH
+    if for_testing:
+        base_path = tools.TESTING_CLEAN_MODELS_PATH
+    model_folders = [f for f in os.listdir(base_path) \
                         if (key in f and model_name not in f)]
     clean_classification_model_paths = \
-        [join(CLEAN_MODELS_PATH, model_folder, 'model.pt') for model_folder in model_folders]
+        [join(base_path, model_folder, 'model.pt') for model_folder in model_folders]       
     return clean_classification_model_paths
 
 
@@ -350,14 +354,11 @@ def evaluate_first_k_random_candidates(tokenizer, classification_model, clean_mo
     best_start = heapq.nlargest(1, loss_per_candidate, key=itemgetter(1))[0][0]
     return best_start
 
-    
-
-
 
 def get_trigger(classification_model, clean_models, vars, masked_source_class_token_locations, 
                 clean_class_list, class_list, source_class, target_class, initial_trigger_token_ids, 
                 trigger_mask, trigger_length, embedding_matrix):
-    num_candidate_schedule = [5]*20
+    num_candidate_schedule = [10]*10
     insert_trigger(vars, trigger_mask, initial_trigger_token_ids)
     trigger_token_ids = deepcopy(initial_trigger_token_ids)
     ''' TODO: CHECK THAT I CAN REMOVE THIS'''
@@ -394,7 +395,8 @@ def get_trigger(classification_model, clean_models, vars, masked_source_class_to
                                source_class, target_class, clean_class_list, class_list)
         print(f'iteration: {i} \n\t initial_loss: {np.round(initial_loss[0].item(),3)} final_loss: {tools.SIGN*loss.round(3)} '+
               f'\n\t initial_candidate:\t {trigger_token_ids.detach().cpu().numpy()} \n\t top_candidate:\t\t {top_candidate.detach().cpu().numpy()}')
-        if torch.equal(top_candidate, trigger_token_ids):
+        # TODO: Fix this to also work for untargetted attacks
+        if torch.equal(top_candidate, trigger_token_ids) or tools.SIGN*loss.round(3) < 0.01:
             break
         insert_trigger(vars, trigger_mask, top_candidate)
         trigger_token_ids = deepcopy(top_candidate)
@@ -459,6 +461,9 @@ def trojan_detector(model_filepath, tokenizer_filepath,
     clean_models = load_clean_models(clean_classification_model_path)
     for clean_model in clean_models:
         tools.add_hooks(clean_model, is_clean=True)
+    testing_clean_classification_model_path = get_clean_model_filepaths(config, for_testing=True)
+    testing_clean_models = load_clean_models(testing_clean_classification_model_path)
+
     
     embedding_matrix = get_embedding_matrix(classification_model, clean_models)
     
@@ -477,10 +482,11 @@ def trojan_detector(model_filepath, tokenizer_filepath,
     trigger_length = 7
     
     ''' 3. ITERATIVELY ATTACK THE MODEL CONSIDERING NUM CANDIDATES PER TOKEN '''
-    df = pd.DataFrame(columns=['source_class', 'target_class', 'top_candidate', 'decoded_top_candidate', 'trigger_asr', 'clean_asr', 'loss', 'clean_accuracy', 'decoded_initial_candidate'])
+    df = pd.DataFrame(columns=['source_class', 'target_class', 'top_candidate', 'decoded_top_candidate', 'trigger_asr', 'clean_asr', \
+                               'loss', 'testing_loss', 'clean_accuracy', 'decoded_initial_candidate'])
     class_list = tools.get_class_list(examples_dirpath)
     # TODO: Remove this
-    # class_list = [3, 1]
+    # class_list = [5, 3]
 
     TRIGGER_ASR_THRESHOLD = 0.95
     TRIGGER_LOSS_THRESHOLD = 0.1
@@ -488,7 +494,8 @@ def trojan_detector(model_filepath, tokenizer_filepath,
         if source_class == target_class:
             continue
         
-        # temp_class_list = [source_class, target_class]
+        # TODO: CHANGE THIS
+        # temp_class_list = tools.get_class_list(examples_dirpath)
         temp_class_list = class_list
         tools.LOGITS_CLASS_MASK = tools.get_logit_class_mask(temp_class_list, classification_model).to(DEVICE)
         tools.LOGITS_CLASS_MASK.requires_grad = False
@@ -505,13 +512,10 @@ def trojan_detector(model_filepath, tokenizer_filepath,
         #                     masked_source_class_token_locations, temp_class_list_clean, temp_class_list, source_class, target_class, 
         #                     initial_trigger_token_ids, trigger_mask, trigger_length, num_random_candidates)
 
-        trigger_token_ids, loss, initial_eval_logits, initial_clean_logits = \
+        trigger_token_ids, loss, initial_eval_logits, _ = \
             get_trigger(classification_model, clean_models, vars, 
                         masked_source_class_token_locations, temp_class_list_clean, temp_class_list, source_class, target_class,
                         initial_trigger_token_ids, trigger_mask, trigger_length, embedding_matrix)
-        
-        decoded_top_candidate = tools.decode_tensor_of_token_ids(tokenizer, trigger_token_ids)
-        decoded_initial_candidate = tools.decode_tensor_of_token_ids(tokenizer, initial_trigger_token_ids)
         
         source_class_loc_mask = masked_source_class_token_locations.split(1, dim=1)
         final_predictions = torch.argmax(initial_eval_logits[0][source_class_loc_mask], dim=-1)
@@ -519,8 +523,17 @@ def trojan_detector(model_filepath, tokenizer_filepath,
         flipped_predictions = torch.eq(final_predictions, target_class).sum() + torch.eq(final_predictions, target_class+1).sum()
         trigger_asr = (flipped_predictions/final_predictions.shape[0]).detach().cpu().numpy()
 
+        with torch.no_grad():
+            insert_trigger(vars, trigger_mask, trigger_token_ids)
+            testing_loss, _, testing_clean_logits = \
+                tools.evaluate_batch(testing_clean_models, classification_model, vars, 
+                                 masked_source_class_token_locations, use_grad=False,
+                                 source_class=source_class, target_class=target_class, 
+                                 clean_class_list=temp_class_list_clean, class_list=temp_class_list)
+        
+        
         clean_asr_list, clean_accuracy_list = [], []
-        for clean_logits in initial_clean_logits:
+        for clean_logits in testing_clean_logits:
             final_clean_predictions = torch.argmax(clean_logits[0][source_class_loc_mask], dim=-1)
             # TODO: Make more general. This is specific to round7
             flipped_predictions = torch.eq(final_clean_predictions, target_class).sum() + torch.eq(final_clean_predictions, target_class+1).sum()
@@ -528,9 +541,13 @@ def trojan_detector(model_filepath, tokenizer_filepath,
             correct_predictions = torch.eq(final_clean_predictions, source_class).sum() + torch.eq(final_clean_predictions, source_class+1).sum()
             clean_accuracy_list.append((correct_predictions/final_clean_predictions.shape[0]).detach().cpu().numpy())
 
+        decoded_top_candidate = tools.decode_tensor_of_token_ids(tokenizer, trigger_token_ids)
+        decoded_initial_candidate = tools.decode_tensor_of_token_ids(tokenizer, initial_trigger_token_ids)
+
         df.loc[len(df)] = [source_class, target_class, trigger_token_ids.detach().cpu().numpy(), decoded_top_candidate, trigger_asr,\
-                           np.array(clean_asr_list).mean(), loss[0].detach().cpu().numpy(), np.array(clean_accuracy_list).mean(), decoded_initial_candidate]
-        if trigger_asr > TRIGGER_ASR_THRESHOLD and loss[0] < TRIGGER_LOSS_THRESHOLD:
+                           np.array(clean_asr_list).mean(), loss[0].detach().cpu().numpy(), testing_loss[0].detach().cpu().numpy(), \
+                           np.array(clean_accuracy_list).mean(), decoded_initial_candidate]
+        if trigger_asr > TRIGGER_ASR_THRESHOLD and testing_loss[0] < TRIGGER_LOSS_THRESHOLD:
             break
 
     df.to_csv(f'/scratch/utrerf/TrojAI/NLP/round7/results/{args.model_num}.csv')
@@ -547,10 +564,10 @@ if __name__ == "__main__":
                         default=1)
     parser.add_argument('--model_num', type=int, 
                         help='Model id number', 
-                        default=23)
+                        default=1)
     parser.add_argument('--training_data_path', type=str, 
                         help='Folder that contains the training data', 
-                        default=TRAINING_DATA_PATH)
+                        default=tools.TRAINING_DATA_PATH)
     parser.add_argument('--model_filepath', type=str, 
                         help='File path to the pytorch model file to be evaluated.', 
                         default='/scratch/data/TrojAI/round7-train-dataset/models/id-00000000')

@@ -7,6 +7,7 @@ from copy import deepcopy
 import transformers
 import re
 import numpy as np
+import random
 
 
 ''' CONSTANTS '''
@@ -15,8 +16,11 @@ EXTRACTED_GRADS = []
 EXTRACTED_CLEAN_GRADS = []
 TRAINING_DATA_PATH = '/scratch/data/TrojAI/round7-train-dataset/'
 CLEAN_MODELS_PATH = '/scratch/utrerf/TrojAI/NLP/round7/clean_models'
+TESTING_CLEAN_MODELS_PATH = '/scratch/utrerf/TrojAI/NLP/round7/clean_models_old_eight'
 LOGITS_CLASS_MASK = None
 LOGITS_CLASS_MASK_CLEAN = None
+# TODO: Change the number of clean models at eval to something that makes more sense
+NUM_CLEAN_MODELS_AT_EVAL = 8
 IS_TARGETTED = True
 SIGN = 1 # min loss if we're targetting a class
 if IS_TARGETTED:
@@ -189,7 +193,7 @@ def tokenize_and_align_labels(tokenizer, original_words,
 def eval_batch_helper(clean_models, classification_model, all_vars, source_class_token_locations,
                       source_class=0, target_class=0, clean_class_list=[], class_list=[], num_triggers_in_batch=1, is_triggered=True):
     clean_logits_list = []
-    for clean_model in clean_models:
+    for clean_model in random.sample(clean_models, min(len(clean_models), NUM_CLEAN_MODELS_AT_EVAL)):
         clean_logits_list.append(clean_model(all_vars['input_ids'], all_vars['attention_mask'], num_triggers_in_batch))
     original_clean_logits = torch.stack(clean_logits_list)
     original_eval_logits = classification_model(all_vars['input_ids'], all_vars['attention_mask'], num_triggers_in_batch)

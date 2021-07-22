@@ -4,7 +4,7 @@ import pandas as pd
 import tools
 import shutil
 
-NUM_CLEAN_MODELS = 8
+NUM_CLEAN_MODELS = 2
 
 ''' 1. Load metadata '''
 TRAINING_DATA_PATH = tools.TRAINING_DATA_PATH
@@ -18,7 +18,13 @@ clean_metadata = metadata[metadata['poisoned'] == False]
 #           .agg({'final_clean_data_test_acc': 'max'})
 groupby = clean_metadata\
           .groupby(['embedding_flavor', 'source_dataset'], as_index=False)\
-          .apply(lambda x: x.nlargest(NUM_CLEAN_MODELS, 'final_clean_data_test_acc'))\
+          .apply(lambda x: x.nlargest(NUM_CLEAN_MODELS//2, 'final_clean_data_test_acc'))\
+          .reset_index(drop=True)
+
+# TODO: Implement the mix
+groupby2 = clean_metadata\
+          .groupby(['embedding_flavor', 'source_dataset'], as_index=False)\
+          .apply(lambda x: x.nsmallest(NUM_CLEAN_MODELS//2, 'final_clean_data_test_acc'))\
           .reset_index(drop=True)
 
 # result = groupby.merge(metadata, how='left', 
