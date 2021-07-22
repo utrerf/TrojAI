@@ -15,8 +15,8 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 EXTRACTED_GRADS = []
 EXTRACTED_CLEAN_GRADS = []
 TRAINING_DATA_PATH = '/scratch/data/TrojAI/round7-train-dataset/'
-CLEAN_MODELS_PATH = '/scratch/utrerf/TrojAI/NLP/round7/clean_models'
-TESTING_CLEAN_MODELS_PATH = '/scratch/utrerf/TrojAI/NLP/round7/clean_models_old_eight'
+CLEAN_MODELS_PATH = '/scratch/utrerf/TrojAI/NLP/round7/clean_models_train'
+TESTING_CLEAN_MODELS_PATH = '/scratch/utrerf/TrojAI/NLP/round7/clean_models_test'
 LOGITS_CLASS_MASK = None
 LOGITS_CLASS_MASK_CLEAN = None
 # TODO: Change the number of clean models at eval to something that makes more sense
@@ -25,6 +25,7 @@ IS_TARGETTED = True
 SIGN = 1 # min loss if we're targetting a class
 if IS_TARGETTED:
     SIGN = -1 
+LAMBDA = .5
 
 def get_logit_class_mask(class_list, classification_model, add_zero=False):
     if add_zero:
@@ -193,7 +194,8 @@ def tokenize_and_align_labels(tokenizer, original_words,
 def eval_batch_helper(clean_models, classification_model, all_vars, source_class_token_locations,
                       source_class=0, target_class=0, clean_class_list=[], class_list=[], num_triggers_in_batch=1, is_triggered=True):
     clean_logits_list = []
-    for clean_model in random.sample(clean_models, min(len(clean_models), NUM_CLEAN_MODELS_AT_EVAL)):
+    # for clean_model in random.sample(clean_models, min(len(clean_models), NUM_CLEAN_MODELS_AT_EVAL)):
+    for clean_model in clean_models:
         clean_logits_list.append(clean_model(all_vars['input_ids'], all_vars['attention_mask'], num_triggers_in_batch))
     original_clean_logits = torch.stack(clean_logits_list)
     original_eval_logits = classification_model(all_vars['input_ids'], all_vars['attention_mask'], num_triggers_in_batch)
@@ -224,11 +226,9 @@ def eval_batch_helper(clean_models, classification_model, all_vars, source_class
             clean_losses.append(loss_fct(cl[0], source_label))
         avg_clean_loss = torch.stack(clean_losses).mean(0)
         if IS_TARGETTED==True:
-            lambd = 1.
             losses_list.append(loss_fct(eval_logit, target_label) \
-                                + lambd*avg_clean_loss)
+                                + LAMBDA*avg_clean_loss)
         else:
-            lambd = 4.
             losses_list.append(loss_fct(eval_logit, source_label) \
                                 - lambd*avg_clean_loss)
 

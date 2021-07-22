@@ -4,7 +4,9 @@ import pandas as pd
 import tools
 import shutil
 
-NUM_CLEAN_MODELS = 2
+
+NUM_CLEAN_TRAINING_MODELS = 2
+# All other models are used for testing
 
 ''' 1. Load metadata '''
 TRAINING_DATA_PATH = tools.TRAINING_DATA_PATH
@@ -16,16 +18,15 @@ clean_metadata = metadata[metadata['poisoned'] == False]
 # groupby = clean_metadata\
 #           .groupby(['embedding_flavor', 'source_dataset'], as_index=False)\
 #           .agg({'final_clean_data_test_acc': 'max'})
-groupby = clean_metadata\
+train_df = clean_metadata\
           .groupby(['embedding_flavor', 'source_dataset'], as_index=False)\
-          .apply(lambda x: x.nlargest(NUM_CLEAN_MODELS//2, 'final_clean_data_test_acc'))\
+          .apply(lambda x: x.nlargest(NUM_CLEAN_TRAINING_MODELS, 'final_clean_data_test_acc'))\
           .reset_index(drop=True)
-
-# TODO: Implement the mix
-groupby2 = clean_metadata\
+test_df = clean_metadata\
           .groupby(['embedding_flavor', 'source_dataset'], as_index=False)\
-          .apply(lambda x: x.nsmallest(NUM_CLEAN_MODELS//2, 'final_clean_data_test_acc'))\
+          .apply(lambda x: x.nlargest(100, 'final_clean_data_test_acc'))\
           .reset_index(drop=True)
+test_df = test_df[~test_df['model_name'].isin(train_df['model_name'])].reset_index(drop=True)
 
 # result = groupby.merge(metadata, how='left', 
 #                        on=['embedding_flavor', 'source_dataset', 'final_clean_data_test_acc'])
@@ -35,20 +36,25 @@ def check_if_folder_exists(folder):
     if not os.path.isdir(folder):
         os.mkdir(folder)
 
-check_if_folder_exists('clean_models')
 
-models_folder = join(TRAINING_DATA_PATH, 'models')
+def copy_models(dest_foldername, df):
+    check_if_folder_exists(dest_foldername)
+    models_folder = join(TRAINING_DATA_PATH, 'models')
 
-for i in range(len(groupby)):
-    entry = groupby.loc[i]
-    model_id = entry['model_name']
-    source_path = join(models_folder, model_id)
-    config = tools.load_config(join(source_path, 'model.pt'))
-    dataset = config['source_dataset'].lower()
-    embedding = config['embedding']
-    
-    destination = join('clean_models', f'{dataset}_{embedding}_{model_id}')
-    shutil.copytree(source_path, destination)
-    
+    for i in range(len(df)):
+        entry = df.loc[i]
+        model_id = entry['model_name']
+        source_path = join(models_folder, model_id)
+        config = tools.load_config(join(source_path, 'model.pt'))
+        dataset = config['source_dataset'].lower()
+        embedding = config['embedding']
+        
+        destination = join(dest_foldername, f'{dataset}_{embedding}_{model_id}')
+        shutil.copytree(source_path, destination)
+
+
+copy_models('clean_models_train', train_df)
+copy_models('clean_models_test', test_df)
+
 
 print('end')

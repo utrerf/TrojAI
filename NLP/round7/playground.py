@@ -9,6 +9,9 @@ TODO:
 - Clean up and open-source
 - Update candidate producing function to make taylor expansion with weighted lambda times the second term [yaoqing]
 
+NOTE:
+- Lambda of 0.5 seems to work well for targetted attacks with 5 candidates and 2 clean models with 6 at eval (non-overlapping)
+
 IDEAS:
 - Start from right to left (didn't work)
 - Have an active num of candidates [20] and a passive one [3] for tokens that just changed and their neighbors
@@ -239,20 +242,30 @@ def clear_model_grads(classification_model):
 
 @torch.no_grad()
 def best_k_candidates_for_each_trigger_token(trigger_token_ids, trigger_mask, trigger_length, 
-                                             embedding_matrix, num_candidates):    
+                                             embedding_matrices, num_candidates):    
     '''
     equation 2: (embedding_matrix - trigger embedding)T @ trigger_grad
     '''
     trigger_grad_shape = [max(trigger_mask.shape[0],1), trigger_length, -1]
-    trigger_grads = tools.EXTRACTED_GRADS[0][trigger_mask].reshape(trigger_grad_shape).mean(0)
+    trigger_grads = tools.EXTRACTED_GRADS[0][trigger_mask].reshape(trigger_grad_shape)\
+                        .mean(0).unsqueeze(0)
     clean_trigger_grads = torch.stack(tools.EXTRACTED_CLEAN_GRADS)\
                             [trigger_mask.unsqueeze(0).repeat([len(tools.EXTRACTED_CLEAN_GRADS), 1, 1])]\
-                            .reshape([len(tools.EXTRACTED_CLEAN_GRADS)]+trigger_grad_shape).mean([0,1])
-    mean_grads = ((trigger_grads + clean_trigger_grads)/2).unsqueeze(0)
+                            .reshape([len(tools.EXTRACTED_CLEAN_GRADS)]+trigger_grad_shape)\
+                            .mean([0,1]).unsqueeze(0)
+
+    # mean_grads = ((trigger_grads + clean_trigger_grads)/2).unsqueeze(0)
     trigger_token_embeds = torch.nn.functional.embedding(trigger_token_ids.to(DEVICE),
-                                                         embedding_matrix).detach().unsqueeze(1)
+                                                         embedding_matrices[0]).detach().unsqueeze(1)
     gradient_dot_embedding_matrix = tools.SIGN * torch.einsum("bij,ikj->bik",
-                                                 (mean_grads, embedding_matrix - trigger_token_embeds))[0]
+                                                 (trigger_grads, embedding_matrices[0] - trigger_token_embeds))[0]
+    
+    trigger_token_embeds = torch.nn.functional.embedding(trigger_token_ids.to(DEVICE),
+                                                         embedding_matrices[1]).detach().unsqueeze(1)
+    clean_gradient_dot_embedding_matrix = tools.SIGN * torch.einsum("bij,ikj->bik",
+                                                 (clean_trigger_grads, embedding_matrices[1] - trigger_token_embeds))[0]
+
+    gradient_dot_embedding_matrix += tools.LAMBDA*clean_gradient_dot_embedding_matrix
 
     # gradient_dot_embedding_matrix = sign * torch.einsum("bij,kj->bik",
     #                                              (mean_grads, embedding_matrix))[0]                                                 
@@ -357,8 +370,8 @@ def evaluate_first_k_random_candidates(tokenizer, classification_model, clean_mo
 
 def get_trigger(classification_model, clean_models, vars, masked_source_class_token_locations, 
                 clean_class_list, class_list, source_class, target_class, initial_trigger_token_ids, 
-                trigger_mask, trigger_length, embedding_matrix):
-    num_candidate_schedule = [10]*10
+                trigger_mask, trigger_length, embedding_matrices):
+    num_candidate_schedule = [5]*20
     insert_trigger(vars, trigger_mask, initial_trigger_token_ids)
     trigger_token_ids = deepcopy(initial_trigger_token_ids)
     ''' TODO: CHECK THAT I CAN REMOVE THIS'''
@@ -380,7 +393,7 @@ def get_trigger(classification_model, clean_models, vars, masked_source_class_to
     
         best_k_ids = \
             best_k_candidates_for_each_trigger_token(trigger_token_ids, trigger_mask, trigger_length, 
-                                                     embedding_matrix, num_candidates)
+                                                     embedding_matrices, num_candidates)
         ''' THANKS YAOQING! '''
         clear_model_grads(classification_model)
         for clean_model in clean_models:
@@ -393,15 +406,23 @@ def get_trigger(classification_model, clean_models, vars, masked_source_class_to
                                masked_source_class_token_locations, 
                                trigger_mask, trigger_token_ids, best_k_ids, 
                                source_class, target_class, clean_class_list, class_list)
+
         print(f'iteration: {i} \n\t initial_loss: {np.round(initial_loss[0].item(),3)} final_loss: {tools.SIGN*loss.round(3)} '+
               f'\n\t initial_candidate:\t {trigger_token_ids.detach().cpu().numpy()} \n\t top_candidate:\t\t {top_candidate.detach().cpu().numpy()}')
+        insert_trigger(vars, trigger_mask, top_candidate)
+
         # TODO: Fix this to also work for untargetted attacks
         if torch.equal(top_candidate, trigger_token_ids) or tools.SIGN*loss.round(3) < 0.01:
+            initial_loss, initial_eval_logits, initial_clean_logits = \
+                tools.evaluate_batch(clean_models, classification_model, vars, 
+                                 masked_source_class_token_locations, use_grad=False,
+                                 source_class=source_class, target_class=target_class, 
+                                 clean_class_list=clean_class_list, class_list=class_list)
+            trigger_token_ids = deepcopy(top_candidate)
             break
-        insert_trigger(vars, trigger_mask, top_candidate)
+
         trigger_token_ids = deepcopy(top_candidate)
         
-
     return trigger_token_ids, initial_loss, initial_eval_logits, initial_clean_logits
 
 
@@ -434,16 +455,19 @@ def initialize_attack_for_source_class(examples_dirpath, tokenizer, source_class
     return vars, trigger_mask, masked_source_class_token_locations
 
 
-@torch.no_grad()
-def get_embedding_matrix(classification_model, clean_models):
-    embedding_matrix_eval = tools.get_embedding_weight(classification_model)
+def get_average_clean_embedding_matrix(clean_models):
     clean_embedding_matrices = []
     for clean_model in clean_models:
         clean_embedding_matrices.append(tools.get_embedding_weight(clean_model))
     embedding_matrix_clean = torch.cat(clean_embedding_matrices)\
-        .reshape([len(clean_embedding_matrices), -1, embedding_matrix_eval.shape[-1]])\
-        .mean(0)
-    embedding_matrix = (embedding_matrix_eval+embedding_matrix_clean)/2
+                    .reshape([len(clean_embedding_matrices), -1, clean_embedding_matrices[0].shape[-1]])\
+                    .mean(0)
+    return embedding_matrix_clean
+
+
+@torch.no_grad()
+def get_embedding_matrix(model):
+    embedding_matrix = tools.get_embedding_weight(model)
     embedding_matrix = deepcopy(embedding_matrix.detach())
     embedding_matrix.requires_grad = False
     return embedding_matrix
@@ -464,8 +488,9 @@ def trojan_detector(model_filepath, tokenizer_filepath,
     testing_clean_classification_model_path = get_clean_model_filepaths(config, for_testing=True)
     testing_clean_models = load_clean_models(testing_clean_classification_model_path)
 
-    
-    embedding_matrix = get_embedding_matrix(classification_model, clean_models)
+    embedding_matrix = get_embedding_matrix(classification_model)
+    clean_embedding_matrix = get_average_clean_embedding_matrix(clean_models)
+    embedding_matrices = [embedding_matrix, clean_embedding_matrix]
     
     ''' 1.2 Load Tokenizer '''
     tokenizer = tools.load_tokenizer(tokenizer_filepath, config)
@@ -486,7 +511,7 @@ def trojan_detector(model_filepath, tokenizer_filepath,
                                'loss', 'testing_loss', 'clean_accuracy', 'decoded_initial_candidate'])
     class_list = tools.get_class_list(examples_dirpath)
     # TODO: Remove this
-    # class_list = [5, 3]
+    # class_list = [3, 5]
 
     TRIGGER_ASR_THRESHOLD = 0.95
     TRIGGER_LOSS_THRESHOLD = 0.1
@@ -495,8 +520,8 @@ def trojan_detector(model_filepath, tokenizer_filepath,
             continue
         
         # TODO: CHANGE THIS
-        # temp_class_list = tools.get_class_list(examples_dirpath)
-        temp_class_list = class_list
+        temp_class_list = tools.get_class_list(examples_dirpath)
+        # temp_class_list = class_list
         tools.LOGITS_CLASS_MASK = tools.get_logit_class_mask(temp_class_list, classification_model).to(DEVICE)
         tools.LOGITS_CLASS_MASK.requires_grad = False
         temp_class_list_clean = [source_class, target_class]
@@ -515,7 +540,7 @@ def trojan_detector(model_filepath, tokenizer_filepath,
         trigger_token_ids, loss, initial_eval_logits, _ = \
             get_trigger(classification_model, clean_models, vars, 
                         masked_source_class_token_locations, temp_class_list_clean, temp_class_list, source_class, target_class,
-                        initial_trigger_token_ids, trigger_mask, trigger_length, embedding_matrix)
+                        initial_trigger_token_ids, trigger_mask, trigger_length, embedding_matrices)
         
         source_class_loc_mask = masked_source_class_token_locations.split(1, dim=1)
         final_predictions = torch.argmax(initial_eval_logits[0][source_class_loc_mask], dim=-1)
@@ -564,7 +589,7 @@ if __name__ == "__main__":
                         default=1)
     parser.add_argument('--model_num', type=int, 
                         help='Model id number', 
-                        default=1)
+                        default=15)
     parser.add_argument('--training_data_path', type=str, 
                         help='Folder that contains the training data', 
                         default=tools.TRAINING_DATA_PATH)
