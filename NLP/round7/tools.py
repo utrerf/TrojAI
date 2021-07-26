@@ -25,7 +25,7 @@ IS_TARGETTED = True
 SIGN = 1 # min loss if we're targetting a class
 if IS_TARGETTED:
     SIGN = -1 
-LAMBDA = .1
+LAMBDA = .75
 USE_AMP = True
 
 def get_logit_class_mask(class_list, classification_model, add_zero=False):
@@ -68,8 +68,8 @@ def get_class_list(examples_dirpath):
 
 
 def load_config(model_filepath):
-    model_dirpath, _ = os.path.split(model_filepath)
-    with open(os.path.join(model_dirpath, 'config.json')) as json_file:
+    model_filepath, _ = os.path.split(model_filepath)
+    with open(os.path.join(model_filepath, 'config.json')) as json_file:
         config = json.load(json_file)
     print('Source dataset name = "{}"'.format(config['source_dataset']))
     if 'data_filepath' in config.keys():
@@ -251,6 +251,11 @@ def evaluate_batch(clean_models, classification_model, all_vars, source_class_to
                         eval_batch_helper(clean_models, classification_model, all_vars, 
                                             source_class_token_locations, source_class, 
                                             target_class, clean_class_list, class_list, num_triggers_in_batch)
+            else:
+                loss, original_eval_logits, original_clean_logits = \
+                        eval_batch_helper(clean_models, classification_model, all_vars, 
+                                            source_class_token_locations, source_class, 
+                                            target_class, clean_class_list, class_list, num_triggers_in_batch)
     return loss, original_eval_logits, original_clean_logits
 
 
@@ -259,3 +264,29 @@ def decode_tensor_of_token_ids(tokenizer, word_id_tensor):
     for word_id in word_id_tensor:
         word_list.append(tokenizer.decode(word_id))
     return ' '.join(word_list)
+
+
+def get_representative(df):
+
+    min_loss_df = df\
+                    .groupby('model_name', as_index=False)\
+                    .agg({'testing_loss':'min'})
+
+    def get_entry_with_min_loss(x):
+        loss = x['testing_loss']
+        asr = x['trigger_asr']
+        min_loss = min_loss_df['testing_loss']
+        x['mask'] = ((loss==min_loss).item())
+        return x
+
+    df_filtered = df.apply(get_entry_with_min_loss, axis=1)
+    df_filtered = df_filtered[df_filtered['mask']]
+    df_filtered
+
+    df_filtered['trigger_type'] = pd.Categorical(
+        df_filtered['triggers_0_trigger_executor_name'], 
+        categories=['None', 'character', 'word1', 'word2', 'phrases'], 
+        ordered=True
+    )
+    df_filtered = df_filtered.sort_values('trigger_type')
+    return df_filtered

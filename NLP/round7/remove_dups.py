@@ -3,6 +3,8 @@ import os
 import shutil
 from hashlib import sha256
 
+TRAINING_DATA_PATH = '/scratch/data/TrojAI/round7-train-dataset/datasets'
+
 class Duplython:
     def __init__(self):
         self.home_dir = os.getcwd(); self.File_hashes = []
@@ -60,7 +62,6 @@ class Duplython:
         self.welcome();self.clean();self.cleaning_summary()
 
 if __name__ == '__main__':
-    TRAINING_DATA_PATH = '/scratch/data/TrojAI/round7-train-dataset/datasets'
     os.chdir(TRAINING_DATA_PATH)
     App = Duplython()
     App.main()

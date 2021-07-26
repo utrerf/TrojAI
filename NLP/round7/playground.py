@@ -1,17 +1,14 @@
 '''
 Code inspired by: Eric Wallace Universal Triggers repo
 https://github.com/Eric-Wallace/universal-triggers/blob/ed657674862c965b31e0728d71765d0b6fe18f22/gpt2/create_adv_token.py#L28
-
 TODO:
 - Work on performance
 - Finish evaluating training set
 - Train LR
 - Clean up and open-source
 - Update candidate producing function to make taylor expansion with weighted lambda times the second term [yaoqing]
-
 NOTE:
 - Lambda of 0.5 seems to work well for targetted attacks with 5 candidates and 2 clean models with 6 at eval (non-overlapping)
-
 IDEAS:
 - Start from right to left (didn't work)
 - Have an active num of candidates [20] and a passive one [3] for tokens that just changed and their neighbors
@@ -20,27 +17,21 @@ IDEAS:
 - Can I use the old formula for computing the 1st order approx (Yes, both work)
 - Is the 1st order approx reliable?
 - Is it better to only use losses from the target and source classes? I think it underestimates the loss
-
 MAINTENANCE NOTES:
 - Need to update backward hook in tools to register_full_backward_hook 
-
 DISCUSSION:
     ATTACKER
     Triggers in round 7 are 1:1, that means that they are targetted in nature
-
     DEFENDER (US)
     Targetted inversion:
       Find me a trigger that turns source class A to target class B
           To solve this problem we need to invert a trigger for each A and each B
           If we have k classes, how many times to we need to do this? k^2
-
     Untargetted inversion:
       Find me a trigger that turns source class A into a class different from A
           How many times do we need to do this? k
-
     What about 'tame' k=10?
       100/10 = 10x speedup
-
     Why would we want to try untargetted inversion instead of targetted inversion?
 '''
 
@@ -61,6 +52,7 @@ import pandas as pd
 import itertools
 import random
 from tqdm import tqdm
+from joblib import load
 
 
 ''' CONSTANTS '''
@@ -474,7 +466,7 @@ def get_embedding_matrix(model):
 
 
 def trojan_detector(model_filepath, tokenizer_filepath, 
-                    result_filepath, scratch_dirpath, examples_dirpath):
+                    result_filepath, scratch_dirpath, examples_dirpath, is_training):
     ''' 1. LOAD EVERYTHING '''
     ''' 1.1 Load Models '''
     config = tools.load_config(model_filepath)
@@ -500,12 +492,7 @@ def trojan_detector(model_filepath, tokenizer_filepath,
 
     ''' 2. INITIALIZE ATTACK FOR A SOURCE CLASS AND TRIGGER LENGTH '''
     initial_trigger_token_ids = make_initial_trigger_tokens(tokenizer, is_random=False, 
-                                                        initial_trigger_words="up ! pants bad hey ok / briefly curse |")
-    #                                                     # initial_trigger_words='ok ok ok ok ok ok ok')
-    # trigger_length = len(initial_trigger_token_ids)
-    # initial_trigger_token_ids = torch.tensor([15505, 1638,  1638, 1638, 19131, 20425, 19105, 24625, 25247, 28193]).to(DEVICE)
-    # initial_trigger_token_ids = torch.tensor([27524, 20502,  6662, 16306, 20502,  7833,  8910, 16224, 19350, 21359, 19509]).to(DEVICE)
-    
+                                                        initial_trigger_words="up ! pants bad hey ok / briefly curse |")    
     trigger_length = len(initial_trigger_token_ids)
     
     ''' 3. ITERATIVELY ATTACK THE MODEL CONSIDERING NUM CANDIDATES PER TOKEN '''
@@ -577,7 +564,15 @@ def trojan_detector(model_filepath, tokenizer_filepath,
         if trigger_asr > TRIGGER_ASR_THRESHOLD and testing_loss[0] < TRIGGER_LOSS_THRESHOLD:
             break
 
-    df.to_csv(f'/scratch/utrerf/TrojAI/NLP/round7/results/{args.model_num}.csv')
+    if is_training:
+        df.to_csv(f'/scratch/utrerf/TrojAI/NLP/round7/results/{args.model_num}.csv')
+    else:
+        df = df.sort_values('testing_loss').reset_index(drop=True)
+        X = df.loc[0, ['testing_loss', 'clean_asr', 'trigger_asr']]
+        clf = load('NLP/round7/classifier.joblib')
+        pred = clf.predict_proba(X.to_numpy().reshape(1, -1))
+        with open(result_filepath, 'w') as f:
+            f.write("{}".format(pred))
     
 
 ''' MAIN '''
@@ -588,25 +583,25 @@ if __name__ == "__main__":
     parser.add_argument('--is_training', type=int, choices=[0, 1], 
                         help='Helps determine if we are training or testing.'\
                              ' If training just specify model number', 
-                        default=1)
+                        default=0)
     parser.add_argument('--model_num', type=int, 
                         help='Model id number', 
-                        default=12)
+                        default=15)
     parser.add_argument('--training_data_path', type=str, 
                         help='Folder that contains the training data', 
                         default=tools.TRAINING_DATA_PATH)
     parser.add_argument('--model_filepath', type=str, 
                         help='File path to the pytorch model file to be evaluated.', 
-                        default='/scratch/data/TrojAI/round7-train-dataset/models/id-00000000')
+                        default='/scratch/data/TrojAI/round7-train-dataset/models/id-00000000/model.pt')
     parser.add_argument('--tokenizer_filepath', type=str, 
                         help='File path to the pytorch model (.pt) file containing the '\
                              'correct tokenizer to be used with the model_filepath.', 
-                        default='./model/tokenizer.pt')
+                        default='/scratch/data/TrojAI/round7-train-dataset/tokenizers/MobileBERT-google-mobilebert-uncased.pt')
     parser.add_argument('--result_filepath', type=str, 
                         help='File path to the file where output result should be written. '\
                              'After execution this file should contain a single line with a'\
                              ' single floating point trojan probability.', 
-                        default='./results/')
+                        default='/scratch/utrerf/TrojAI/NLP/round7/result.csv')
     parser.add_argument('--scratch_dirpath', type=str, 
                         help='File path to the folder where scratch disk space exists. '\
                              'This folder will be empty at execution start and will be '\
@@ -615,7 +610,7 @@ if __name__ == "__main__":
     parser.add_argument('--examples_dirpath', type=str, 
                         help='File path to the folder of examples which might be useful '\
                              'for determining whether a model is poisoned.', 
-                        default='./test-model/clean_example_data')
+                        default='/scratch/data/TrojAI/round7-train-dataset/models/id-00000000/clean_example_data')
 
     args = parser.parse_args()
 
@@ -626,5 +621,5 @@ if __name__ == "__main__":
                     args.tokenizer_filepath, 
                     args.result_filepath, 
                     args.scratch_dirpath,
-                    args.examples_dirpath)
-
+                    args.examples_dirpath,
+                    args.is_training)
