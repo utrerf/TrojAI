@@ -493,7 +493,7 @@ def trojan_detector(model_filepath, tokenizer_filepath,
                                'loss', 'testing_loss', 'clean_accuracy', 'decoded_initial_candidate'])
     class_list = tools.get_class_list(examples_dirpath)
     # TODO: Remove this
-    class_list = [7, 1]
+    # class_list = [7, 1]
 
     TRIGGER_ASR_THRESHOLD = 0.95
     TRIGGER_LOSS_THRESHOLD = 0.001
