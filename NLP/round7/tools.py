@@ -25,10 +25,13 @@ IS_TARGETTED = True
 SIGN = 1 # min loss if we're targetting a class
 if IS_TARGETTED:
     SIGN = -1 
-LAMBDA = .75
+BETA = 1.
+LAMBDA = 1.
 USE_AMP = True
+TOKENIZER = None
 
-def get_logit_class_mask(class_list, classification_model, add_zero=False):
+
+def get_logit_class_mask(class_list, classification_model, add_zero=False, is_clean=False):
     if add_zero:
         class_list = [0] + class_list
     logits_class_mask = torch.zeros([classification_model.num_labels, len(class_list)])
@@ -36,6 +39,14 @@ def get_logit_class_mask(class_list, classification_model, add_zero=False):
         logits_class_mask[old_cls][new_cls] = 1
         if not add_zero or new_cls!=0:
             logits_class_mask[old_cls+1][new_cls] = 1
+    if is_clean:
+        logits_class_mask = torch.zeros([classification_model.num_labels, len(class_list)])
+        source, target = class_list
+        for i in range(classification_model.num_labels):
+            if (i != target) & (i != target+1):
+                logits_class_mask[i][0] = 1
+        logits_class_mask[target][1] = 1
+        logits_class_mask[target+1][1] = 1
     return logits_class_mask
 
 
@@ -133,7 +144,7 @@ def get_words_and_labels(examples_dirpath, source_class=None):
            for fn in os.listdir(examples_dirpath) \
            if fn.endswith('.txt')]
     if source_class is not None:
-        fns = [i for i in fns if f'class_{source_class}' in i]
+        fns = [i for i in fns if f'class_{source_class}_' in i]
     fns.sort()
     original_words = []
     original_labels = []
@@ -196,7 +207,6 @@ def eval_batch_helper(clean_models, classification_model, all_vars, source_class
                       source_class=0, target_class=0, clean_class_list=[], class_list=[], 
                       num_triggers_in_batch=1, is_triggered=True):
     clean_logits_list = []
-    # for clean_model in random.sample(clean_models, min(len(clean_models), NUM_CLEAN_MODELS_AT_EVAL)):
     for clean_model in clean_models:
         clean_logits_list.append(clean_model(all_vars['input_ids'], all_vars['attention_mask'], num_triggers_in_batch))
     original_clean_logits = torch.stack(clean_logits_list)
@@ -228,7 +238,7 @@ def eval_batch_helper(clean_models, classification_model, all_vars, source_class
             clean_losses.append(loss_fct(cl[0], source_label))
         avg_clean_loss = torch.stack(clean_losses).mean(0)
         if IS_TARGETTED==True:
-            losses_list.append(loss_fct(eval_logit, target_label) \
+            losses_list.append(BETA*loss_fct(eval_logit, target_label) \
                                 + LAMBDA*avg_clean_loss)
         else:
             losses_list.append(loss_fct(eval_logit, source_label) \
