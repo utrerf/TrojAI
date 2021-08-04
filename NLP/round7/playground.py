@@ -67,25 +67,6 @@ def get_source_class_token_locations(source_class, labels, max_sentences=MAX_SEN
 
 
 @torch.no_grad()
-def insert_trigger(vars, trigger_mask, trigger_token_ids):
-    '''
-    Inputs
-        var: dictionary with input_ids
-        trigger_mask: mask tensor with the locations of the trigger in each sentence
-        trigger_token_ids: trigger in token space
-    Output
-        None - vars is changed in place
-    '''
-    if trigger_token_ids.ndim > 1:
-        pass
-        # repeated_trigger = trigger_token_ids[:, :len(vars['input_ids'][trigger_mask])].long().view(-1)
-    else:
-        repeated_trigger = \
-            trigger_token_ids.repeat(1, vars['input_ids'].shape[0]).long().view(-1)
-    vars['input_ids'][trigger_mask] = repeated_trigger.to(DEVICE)
-
-
-@torch.no_grad()
 def expand_and_insert_tokens(trigger_token_ids, vars, 
                             source_class_token_locations):  
     '''
@@ -134,11 +115,11 @@ def expand_and_insert_tokens(trigger_token_ids, vars,
     trigger_mask = ~(expanded_priors_matrix + expanded_masked_after_matrix)
 
     # use the trigger mask to updata token_ids, attention_mask and labels
-    insert_trigger(vars, trigger_mask, trigger_token_ids)
+    tools.insert_trigger(vars, trigger_mask, trigger_token_ids)
     vars['attention_mask'][trigger_mask] = 1           # set attention to 1
     vars['labels'][trigger_mask] = -100                # set label to -100
     shifted_sorce_class_token_locations = \
-        shift_source_class_token_locations(source_class_token_locations, trigger_length)
+        tools.shift_source_class_token_locations(source_class_token_locations, trigger_length)
 
     return trigger_mask, shifted_sorce_class_token_locations
 
@@ -148,36 +129,18 @@ def filter_vars_to_sentences_with_source_class(original_vars, source_class_token
     '''
     Inputs
         original_vars: dictionary with the orifinal vars
+        source_class_token_locations
+    Output
+        new vars with only sentences that correspond to the source class
     '''
     new_vars = deepcopy(original_vars)
     # ensure that the attention mask on the source_class equal to 1
     mask = source_class_token_locations.to(DEVICE).split(1, dim=1)
     new_vars['attention_mask'][mask] = 1
+    # filter
     source_class_sentence_ids = source_class_token_locations[:, 0]
     new_vars = {k:v[source_class_sentence_ids].to(DEVICE) for k, v in new_vars.items()}
     return new_vars
-
-
-@torch.no_grad()
-def make_initial_trigger_tokens(tokenizer, is_random=True, initial_trigger_words=None, num_random_tokens=0):
-    if is_random:
-        tokenized_initial_trigger_word = \
-            random.sample(list(tokenizer.vocab.values()), num_random_tokens)
-    else:
-        tokenized_initial_trigger_word = \
-            tokenizer.encode(initial_trigger_words, add_special_tokens=False)
-    trigger_token_ids = \
-        torch.tensor(tokenized_initial_trigger_word).to(DEVICE)
-    return trigger_token_ids
-
-
-@torch.no_grad()
-def shift_source_class_token_locations(source_class_token_locations, trigger_length):
-    class_token_indices = deepcopy(source_class_token_locations)
-    class_token_indices[:, 1] += trigger_length
-    class_token_indices[:, 0] = \
-        torch.arange(class_token_indices.shape[0], device=DEVICE).long()
-    return class_token_indices
 
 
 @torch.no_grad()
@@ -199,7 +162,7 @@ def get_loss_per_candidate(clean_models, classification_model, vars,
 
     # save current loss with old triggers
     loss_per_candidate = []
-    insert_trigger(vars, trigger_mask, trigger_token_ids)
+    tools.insert_trigger(vars, trigger_mask, trigger_token_ids)
     curr_loss, _, _ = tools.evaluate_batch(clean_models, classification_model, vars, 
                                source_class_token_locations, use_grad=False, 
                                source_class=source_class, target_class=target_class, 
@@ -273,7 +236,7 @@ def best_k_candidates_for_each_trigger_token(trigger_token_ids, trigger_mask, tr
 
 def get_best_candidate(clean_models, classification_model, vars, source_class_token_locations,
                        trigger_mask, trigger_token_ids, best_k_ids, source_class, 
-                       target_class, clean_class_list, class_list, beam_size=5):
+                       target_class, clean_class_list, class_list, beam_size=2):
     
     initial_loss_per_candidate = \
         get_loss_per_candidate(clean_models, classification_model, vars, source_class_token_locations, 
@@ -292,74 +255,11 @@ def get_best_candidate(clean_models, classification_model, vars, source_class_to
     return max(top_candidates, key=itemgetter(1))
 
 
-def load_clean_models(clean_classification_model_path):
-    clean_models = []
-    for f in clean_classification_model_path:
-        clean_models.append(load_model(f))
-    return clean_models
-
-
-def load_model(model_filepath):
-    classification_model = torch.load(model_filepath, map_location=DEVICE)
-    classification_model.eval()
-    return classification_model
-
-
-def get_clean_model_filepaths(config, for_testing=False):
-    key = f"{config['source_dataset'].lower()}_{config['embedding']}"
-    model_name = config['output_filepath'].split('/')[-1]
-    base_path = tools.CLEAN_MODELS_PATH
-    if for_testing:
-        base_path = tools.TESTING_CLEAN_MODELS_PATH
-    model_folders = [f for f in os.listdir(base_path) \
-                        if (key in f and model_name not in f)]
-    clean_classification_model_paths = \
-        [join(base_path, model_folder, 'model.pt') for model_folder in model_folders]       
-    return clean_classification_model_paths
-
-
-def get_random_triggers(embedding_matrix, trigger_token_ids, num_candidates=1):
-    """
-    Randomly search over the vocabulary. Gets num_candidates random samples and returns all of them.
-    """
-    embedding_matrix = embedding_matrix.cpu()
-    new_trigger_token_ids = [[None]*num_candidates for _ in range(len(trigger_token_ids))]
-    for trigger_token_id in range(len(trigger_token_ids)):
-        for candidate_number in range(num_candidates):
-            # rand token in the embedding matrix
-            rand_token = np.random.randint(embedding_matrix.shape[0])
-            new_trigger_token_ids[trigger_token_id][candidate_number] = rand_token
-    return new_trigger_token_ids
-
-
-def evaluate_first_k_random_candidates(tokenizer, classification_model, clean_models, vars, masked_source_class_token_locations,
-                                       clean_class_list, class_list, source_class, target_class, initial_trigger_token_ids,
-                                       trigger_mask, trigger_length, num_random_candidates):
-    ''' 
-    Input: Integer k
-    Output: Best random start as defined by having the biggest or smallest loss
-    '''
-    vocab = np.array(list(tokenizer.vocab.values()))
-    random_tokens = np.random.choice(vocab, size=[num_random_candidates, trigger_length], replace=False)
-    all_initial_trigger_token_ids = torch.tensor(random_tokens).to(DEVICE)
-    loss_per_candidate = []
-    for initial_trigger_token_ids in all_initial_trigger_token_ids:
-        insert_trigger(vars, trigger_mask, initial_trigger_token_ids)
-        loss, eval_logits, clean_logits = \
-            tools.evaluate_batch(clean_models, classification_model, vars, 
-                                 masked_source_class_token_locations, use_grad=False,
-                                 source_class=source_class, target_class=target_class, 
-                                 clean_class_list=clean_class_list, class_list=class_list)
-        loss_per_candidate.append((initial_trigger_token_ids, tools.SIGN*loss[0].cpu().numpy()))
-    best_start = heapq.nlargest(1, loss_per_candidate, key=itemgetter(1))[0][0]
-    return best_start
-
-
 def get_trigger(classification_model, clean_models, vars, masked_source_class_token_locations, 
                 clean_class_list, class_list, source_class, target_class, initial_trigger_token_ids, 
                 trigger_mask, trigger_length, embedding_matrices):
-    num_candidate_schedule = [100]*20
-    insert_trigger(vars, trigger_mask, initial_trigger_token_ids)
+    num_candidate_schedule = [1]*20
+    tools.insert_trigger(vars, trigger_mask, initial_trigger_token_ids)
     trigger_token_ids = deepcopy(initial_trigger_token_ids)
     for i, num_candidates in enumerate(num_candidate_schedule):
         clear_model_grads(classification_model)
@@ -392,7 +292,7 @@ def get_trigger(classification_model, clean_models, vars, masked_source_class_to
         print(f'iteration: {i} \n\t initial_loss: {np.round(initial_loss[0].item(),3)} '+
               f'\t final_loss: {tools.SIGN*loss.round(3)} '+
               f'\n\t initial_candidate:\t {trigger_token_ids.detach().cpu().numpy()} \n\t top_candidate:\t\t {top_candidate.detach().cpu().numpy()}')
-        insert_trigger(vars, trigger_mask, top_candidate)
+        tools.insert_trigger(vars, trigger_mask, top_candidate)
 
         # TODO: Fix this to also work for untargetted attacks
         if torch.equal(top_candidate, trigger_token_ids) or tools.SIGN*loss.round(4) < 0.001:
@@ -422,11 +322,6 @@ def initialize_attack_for_source_class(examples_dirpath, tokenizer, source_class
     source_class_token_locations = \
         get_source_class_token_locations(source_class, original_vars['labels'], max_sentences)  
 
-    ''' TODO: Decide if this is something we want to keep'''
-    # Repeat it to fill the batch
-    # source_class_token_locations = \
-    #     source_class_token_locations.repeat((BATCH_SIZE//len(source_class_token_locations),1))
-
     # Apply the mask to get the sentences that correspond to the source_class
     vars = filter_vars_to_sentences_with_source_class(original_vars, 
                                             source_class_token_locations)
@@ -438,58 +333,39 @@ def initialize_attack_for_source_class(examples_dirpath, tokenizer, source_class
     return vars, trigger_mask, masked_source_class_token_locations
 
 
-def get_average_clean_embedding_matrix(clean_models):
-    clean_embedding_matrices = []
-    for clean_model in clean_models:
-        clean_embedding_matrices.append(tools.get_embedding_weight(clean_model))
-    embedding_matrix_clean = torch.cat(clean_embedding_matrices)\
-                    .reshape([len(clean_embedding_matrices), -1, clean_embedding_matrices[0].shape[-1]])\
-                    .mean(0)
-    return embedding_matrix_clean
-
-
-@torch.no_grad()
-def get_embedding_matrix(model):
-    embedding_matrix = tools.get_embedding_weight(model)
-    embedding_matrix = deepcopy(embedding_matrix.detach())
-    embedding_matrix.requires_grad = False
-    return embedding_matrix
-
-
 def trojan_detector(model_filepath, tokenizer_filepath, 
                     result_filepath, scratch_dirpath, examples_dirpath, is_training):
-    ''' 1. LOAD EVERYTHING '''
-    ''' 1.1 Load Models '''
+    ''' 1. LOAD MODELS, EMBEDDINGS AND TOKENIZER'''
     config = tools.load_config(model_filepath)
     if config['embedding'] == 'MobileBERT':
         tools.USE_AMP = False
-    classification_model = load_model(model_filepath)
+    classification_model = tools.load_model(model_filepath)
     tools.add_hooks(classification_model, is_clean=False)
 
-    clean_classification_model_path = get_clean_model_filepaths(config)
-    clean_models = load_clean_models(clean_classification_model_path)
+    clean_classification_model_path = tools.get_clean_model_filepaths(config)
+    clean_models = tools.load_clean_models(clean_classification_model_path)
     for clean_model in clean_models:
         tools.add_hooks(clean_model, is_clean=True)
-    testing_clean_classification_model_path = get_clean_model_filepaths(config, for_testing=True)
-    testing_clean_models = load_clean_models(testing_clean_classification_model_path)
+    testing_clean_classification_model_path = tools.get_clean_model_filepaths(config, for_testing=True)
+    testing_clean_models = tools.load_clean_models(testing_clean_classification_model_path)
 
-    embedding_matrix = get_embedding_matrix(classification_model)
-    clean_embedding_matrix = get_average_clean_embedding_matrix(clean_models)
+    embedding_matrix = tools.get_embedding_matrix(classification_model)
+    clean_embedding_matrix = tools.get_average_clean_embedding_matrix(clean_models)
     embedding_matrices = [embedding_matrix, clean_embedding_matrix]
     
-    ''' 1.2 Load Tokenizer '''
     tokenizer = tools.load_tokenizer(tokenizer_filepath, config)
     tools.TOKENIZER = tokenizer
     max_input_length = tools.get_max_input_length(config, tokenizer)
 
     ''' 2. INITIALIZE ATTACK FOR A SOURCE CLASS AND TRIGGER LENGTH '''
-    initial_trigger_token_ids = make_initial_trigger_tokens(tokenizer, is_random=False, 
+    initial_trigger_token_ids = tools.make_initial_trigger_tokens(tokenizer, is_random=False, 
                                                         initial_trigger_words="ok "*5)    
     # initial_trigger_token_ids = torch.tensor([28910, 28911, 28912, 28913, 28914, 28915, 28916, 28917, 28918, 28919]).to(tools.DEVICE)
     trigger_length = len(initial_trigger_token_ids)
     
     ''' 3. ITERATIVELY ATTACK THE MODEL CONSIDERING NUM CANDIDATES PER TOKEN '''
-    df = pd.DataFrame(columns=['source_class', 'target_class', 'top_candidate', 'decoded_top_candidate', 'trigger_asr', 'clean_asr', \
+    df = pd.DataFrame(columns=['source_class', 'target_class', 'top_candidate', 
+                               'decoded_top_candidate', 'trigger_asr', 'clean_asr',
                                'loss', 'testing_loss', 'clean_accuracy', 'decoded_initial_candidate'])
     class_list = tools.get_class_list(examples_dirpath)
     # TODO: Remove this
@@ -502,14 +378,11 @@ def trojan_detector(model_filepath, tokenizer_filepath,
             continue
         
         # TODO: PUT THIS IN A FUNCTION OUTSIDE
-        temp_class_list = tools.get_class_list(examples_dirpath)
         # temp_class_list = class_list
-        tools.LOGITS_CLASS_MASK = tools.get_logit_class_mask(temp_class_list, classification_model, add_zero=False).to(DEVICE)
-        tools.LOGITS_CLASS_MASK.requires_grad = False
+        temp_class_list = tools.get_class_list(examples_dirpath)
         temp_class_list_clean = [source_class, target_class]
-        tools.LOGITS_CLASS_MASK_CLEAN = tools.get_logit_class_mask(temp_class_list_clean, classification_model, 
-                                                                    add_zero=False, is_clean=True).to(DEVICE)
-        tools.LOGITS_CLASS_MASK_CLEAN.requires_grad = False
+        
+        tools.update_logits_masks(temp_class_list, temp_class_list_clean, classification_model)
         
         # TODO: Clean this and make it more elegant
         temp_examples_dirpath = join('/'.join(clean_classification_model_path[0].split('/')[:-1]), 
@@ -523,33 +396,20 @@ def trojan_detector(model_filepath, tokenizer_filepath,
                         masked_source_class_token_locations, temp_class_list_clean, temp_class_list, source_class, target_class,
                         initial_trigger_token_ids, trigger_mask, trigger_length, embedding_matrices)
         
-        source_class_loc_mask = masked_source_class_token_locations.split(1, dim=1)
-        final_predictions = torch.argmax(initial_eval_logits[0][source_class_loc_mask], dim=-1)
-        # TODO: Make more general. This is specific to round7
-        flipped_predictions = torch.eq(final_predictions, target_class).sum() + torch.eq(final_predictions, target_class+1).sum()
-        trigger_asr = (flipped_predictions/final_predictions.shape[0]).detach().cpu().numpy()
-        
-        
+
+        trigger_asr = tools.get_trigger_asr(masked_source_class_token_locations, 
+                                      initial_eval_logits, target_class)
+
         vars, trigger_mask, masked_source_class_token_locations =\
             initialize_attack_for_source_class(temp_examples_dirpath, tokenizer, source_class, 
-                                        initial_trigger_token_ids, max_input_length, max_sentences=25)
-        with torch.no_grad():
-            insert_trigger(vars, trigger_mask, trigger_token_ids)
-            testing_loss, _, testing_clean_logits = \
-                tools.evaluate_batch(testing_clean_models, classification_model, vars, 
-                                 masked_source_class_token_locations, use_grad=False,
-                                 source_class=source_class, target_class=target_class, 
-                                 clean_class_list=temp_class_list_clean, class_list=temp_class_list)
-        
-        
-        clean_asr_list, clean_accuracy_list = [], []
-        for clean_logits in testing_clean_logits:
-            final_clean_predictions = torch.argmax(clean_logits[0][source_class_loc_mask], dim=-1)
-            # TODO: Make more general. This is specific to round7
-            flipped_predictions = torch.eq(final_clean_predictions, target_class).sum() + torch.eq(final_clean_predictions, target_class+1).sum()
-            clean_asr_list.append((flipped_predictions/final_clean_predictions.shape[0]).detach().cpu().numpy())
-            correct_predictions = torch.eq(final_clean_predictions, source_class).sum() + torch.eq(final_clean_predictions, source_class+1).sum()
-            clean_accuracy_list.append((correct_predictions/final_clean_predictions.shape[0]).detach().cpu().numpy())
+                                    initial_trigger_token_ids, max_input_length, max_sentences=25)
+
+        clean_asr_list, clean_accuracy_list, testing_loss = \
+            tools.get_clean_asr_and_accuracy(vars, trigger_mask, trigger_token_ids,
+                                       temp_examples_dirpath, tokenizer, 
+                                       initial_trigger_token_ids, max_input_length, MAX_SENTENCES,
+                                       testing_clean_models, classification_model, source_class, target_class,
+                                       temp_class_list_clean, temp_class_list, masked_source_class_token_locations)
 
         decoded_top_candidate = tools.decode_tensor_of_token_ids(tokenizer, trigger_token_ids)
         decoded_initial_candidate = tools.decode_tensor_of_token_ids(tokenizer, initial_trigger_token_ids)

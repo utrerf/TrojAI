@@ -31,6 +31,141 @@ USE_AMP = True
 TOKENIZER = None
 
 
+def update_logits_masks(temp_class_list, temp_class_list_clean, classification_model):
+    global LOGITS_CLASS_MASK
+    global LOGITS_CLASS_MASK_CLEAN
+    LOGITS_CLASS_MASK = get_logit_class_mask(temp_class_list, classification_model, add_zero=False).to(DEVICE)
+    LOGITS_CLASS_MASK_CLEAN = \
+        get_logit_class_mask(temp_class_list_clean, classification_model, add_zero=False, is_clean=True).to(DEVICE)
+
+    LOGITS_CLASS_MASK.requires_grad = False
+    LOGITS_CLASS_MASK_CLEAN.requires_grad = False
+
+
+@torch.no_grad()
+def get_clean_asr_and_accuracy(vars, trigger_mask, trigger_token_ids,
+                                       temp_examples_dirpath, tokenizer, 
+                                       initial_trigger_token_ids, max_input_length, max_sentences,
+                                       testing_clean_models, classification_model, source_class, target_class,
+                                       temp_class_list_clean, temp_class_list, masked_source_class_token_locations):
+    
+    source_class_loc_mask = masked_source_class_token_locations.split(1, dim=1)
+    insert_trigger(vars, trigger_mask, trigger_token_ids)
+    testing_loss, _, testing_clean_logits = \
+        evaluate_batch(testing_clean_models, classification_model, vars, 
+                            masked_source_class_token_locations, use_grad=False,
+                            source_class=source_class, target_class=target_class, 
+                            clean_class_list=temp_class_list_clean, class_list=temp_class_list)
+
+
+    clean_asr_list, clean_accuracy_list = [], []
+    for clean_logits in testing_clean_logits:
+        final_clean_predictions = torch.argmax(clean_logits[0][source_class_loc_mask], dim=-1)
+        # TODO: Make more general. This is specific to round7
+        flipped_predictions = torch.eq(final_clean_predictions, target_class).sum() + torch.eq(final_clean_predictions, target_class+1).sum()
+        clean_asr_list.append((flipped_predictions/final_clean_predictions.shape[0]).detach().cpu().numpy())
+        correct_predictions = torch.eq(final_clean_predictions, source_class).sum() + torch.eq(final_clean_predictions, source_class+1).sum()
+        clean_accuracy_list.append((correct_predictions/final_clean_predictions.shape[0]).detach().cpu().numpy())                                       
+
+    return clean_asr_list, clean_accuracy_list, testing_loss
+
+
+@torch.no_grad()
+def get_trigger_asr(masked_source_class_token_locations, 
+                          initial_eval_logits, target_class):
+    source_class_loc_mask = masked_source_class_token_locations.split(1, dim=1)
+    final_predictions = torch.argmax(initial_eval_logits[0][source_class_loc_mask], dim=-1)
+    # TODO: Make more general. This is specific to round7
+    flipped_predictions = torch.eq(final_predictions, target_class).sum() + torch.eq(final_predictions, target_class+1).sum()
+    return (flipped_predictions/final_predictions.shape[0]).detach().cpu().numpy()
+
+
+
+@torch.no_grad()
+def get_average_clean_embedding_matrix(clean_models):
+    clean_embedding_matrices = []
+    for clean_model in clean_models:
+        clean_embedding_matrices.append(get_embedding_weight(clean_model))
+    embedding_matrix_clean = torch.cat(clean_embedding_matrices)\
+                    .reshape([len(clean_embedding_matrices), -1, clean_embedding_matrices[0].shape[-1]])\
+                    .mean(0)
+    return embedding_matrix_clean
+
+
+def get_clean_model_filepaths(config, for_testing=False):
+    key = f"{config['source_dataset'].lower()}_{config['embedding']}"
+    model_name = config['output_filepath'].split('/')[-1]
+    base_path = CLEAN_MODELS_PATH
+    if for_testing:
+        base_path = TESTING_CLEAN_MODELS_PATH
+    model_folders = [f for f in os.listdir(base_path) \
+                        if (key in f and model_name not in f)]
+    clean_classification_model_paths = \
+        [join(base_path, model_folder, 'model.pt') for model_folder in model_folders]       
+    return clean_classification_model_paths
+
+
+@torch.no_grad()
+def get_embedding_matrix(model):
+    embedding_matrix = get_embedding_weight(model)
+    embedding_matrix = deepcopy(embedding_matrix.detach())
+    embedding_matrix.requires_grad = False
+    return embedding_matrix
+
+
+def load_model(model_filepath):
+    classification_model = torch.load(model_filepath, map_location=DEVICE)
+    classification_model.eval()
+    return classification_model
+
+
+def load_clean_models(clean_classification_model_path):
+    clean_models = []
+    for f in clean_classification_model_path:
+        clean_models.append(load_model(f))
+    return clean_models
+
+
+@torch.no_grad()
+def shift_source_class_token_locations(source_class_token_locations, trigger_length):
+    class_token_indices = deepcopy(source_class_token_locations)
+    class_token_indices[:, 1] += trigger_length
+    class_token_indices[:, 0] = \
+        torch.arange(class_token_indices.shape[0], device=DEVICE).long()
+    return class_token_indices
+
+
+@torch.no_grad()
+def make_initial_trigger_tokens(tokenizer, is_random=True, initial_trigger_words=None, num_random_tokens=0):
+    if is_random:
+        tokenized_initial_trigger_word = \
+            random.sample(list(tokenizer.vocab.values()), num_random_tokens)
+    else:
+        tokenized_initial_trigger_word = \
+            tokenizer.encode(initial_trigger_words, add_special_tokens=False)
+    trigger_token_ids = \
+        torch.tensor(tokenized_initial_trigger_word).to(DEVICE)
+    return trigger_token_ids
+
+
+@torch.no_grad()
+def insert_trigger(vars, trigger_mask, trigger_token_ids):
+    '''
+    Inputs
+        var: dictionary with input_ids
+        trigger_mask: mask tensor with the locations of the trigger in each sentence
+        trigger_token_ids: trigger in token space
+    Output
+        None - vars is changed in place
+    '''
+    if trigger_token_ids.ndim > 1:
+        pass
+        # repeated_trigger = trigger_token_ids[:, :len(vars['input_ids'][trigger_mask])].long().view(-1)
+    else:
+        repeated_trigger = \
+            trigger_token_ids.repeat(1, vars['input_ids'].shape[0]).long().view(-1)
+    vars['input_ids'][trigger_mask] = repeated_trigger.to(DEVICE)
+
 def get_logit_class_mask(class_list, classification_model, add_zero=False, is_clean=False):
     if add_zero:
         class_list = [0] + class_list
