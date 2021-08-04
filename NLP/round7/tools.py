@@ -29,14 +29,37 @@ BETA = 1.
 LAMBDA = 1.
 USE_AMP = True
 TOKENIZER = None
+BEAM_SIZE = None
+NUM_CANDIDATES = None
+MAX_INPUT_LENGTH = None
+MAX_SENTENCES = None
 
 
-def update_logits_masks(temp_class_list, temp_class_list_clean, classification_model):
+''' TODO: Move add_hooks to a later part in the process'''
+def load_all_models(eval_model_filepath, clean_models_filepath, clean_testing_model_filepath):
+    classification_model = load_model(eval_model_filepath)
+    add_hooks(classification_model, is_clean=False)
+
+    clean_models = load_clean_models(clean_models_filepath)
+    for clean_model in clean_models:
+        add_hooks(clean_model, is_clean=True)
+
+    testing_clean_models = load_clean_models(clean_testing_model_filepath)
+
+    return {'eval_model': classification_model,
+            'clean_models': clean_models,
+            'clean_testing_models': testing_clean_models}
+
+def check_if_folder_exists(folder):
+    if not os.path.isdir(folder):
+        os.mkdir(folder)
+
+def update_logits_masks(temp_class_list, temp_class_list_clean, eval_model):
     global LOGITS_CLASS_MASK
     global LOGITS_CLASS_MASK_CLEAN
-    LOGITS_CLASS_MASK = get_logit_class_mask(temp_class_list, classification_model, add_zero=False).to(DEVICE)
+    LOGITS_CLASS_MASK = get_logit_class_mask(temp_class_list, eval_model, add_zero=False).to(DEVICE)
     LOGITS_CLASS_MASK_CLEAN = \
-        get_logit_class_mask(temp_class_list_clean, classification_model, add_zero=False, is_clean=True).to(DEVICE)
+        get_logit_class_mask(temp_class_list_clean, eval_model, add_zero=False, is_clean=True).to(DEVICE)
 
     LOGITS_CLASS_MASK.requires_grad = False
     LOGITS_CLASS_MASK_CLEAN.requires_grad = False
@@ -44,18 +67,16 @@ def update_logits_masks(temp_class_list, temp_class_list_clean, classification_m
 
 @torch.no_grad()
 def get_clean_asr_and_accuracy(vars, trigger_mask, trigger_token_ids,
-                                       temp_examples_dirpath, tokenizer, 
-                                       initial_trigger_token_ids, max_input_length, max_sentences,
-                                       testing_clean_models, classification_model, source_class, target_class,
-                                       temp_class_list_clean, temp_class_list, masked_source_class_token_locations):
+                               temp_examples_dirpath, initial_trigger_token_ids,
+                               models, source_class, target_class,
+                               temp_class_list_clean, temp_class_list, masked_source_class_token_locations):
     
     source_class_loc_mask = masked_source_class_token_locations.split(1, dim=1)
     insert_trigger(vars, trigger_mask, trigger_token_ids)
     testing_loss, _, testing_clean_logits = \
-        evaluate_batch(testing_clean_models, classification_model, vars, 
-                            masked_source_class_token_locations, use_grad=False,
-                            source_class=source_class, target_class=target_class, 
-                            clean_class_list=temp_class_list_clean, class_list=temp_class_list)
+        evaluate_batch(models, vars, masked_source_class_token_locations, use_grad=False,
+                       source_class=source_class, target_class=target_class, 
+                       clean_class_list=temp_class_list_clean, class_list=temp_class_list, is_testing=True)
 
 
     clean_asr_list, clean_accuracy_list = [], []
@@ -119,9 +140,9 @@ def load_model(model_filepath):
     return classification_model
 
 
-def load_clean_models(clean_classification_model_path):
+def load_clean_models(clean_model_filepath):
     clean_models = []
-    for f in clean_classification_model_path:
+    for f in clean_model_filepath:
         clean_models.append(load_model(f))
     return clean_models
 
@@ -136,13 +157,13 @@ def shift_source_class_token_locations(source_class_token_locations, trigger_len
 
 
 @torch.no_grad()
-def make_initial_trigger_tokens(tokenizer, is_random=True, initial_trigger_words=None, num_random_tokens=0):
+def make_initial_trigger_tokens(is_random=True, initial_trigger_words=None, num_random_tokens=0):
     if is_random:
         tokenized_initial_trigger_word = \
-            random.sample(list(tokenizer.vocab.values()), num_random_tokens)
+            random.sample(list(TOKENIZER.vocab.values()), num_random_tokens)
     else:
         tokenized_initial_trigger_word = \
-            tokenizer.encode(initial_trigger_words, add_special_tokens=False)
+            TOKENIZER.encode(initial_trigger_words, add_special_tokens=False)
     trigger_token_ids = \
         torch.tensor(tokenized_initial_trigger_word).to(DEVICE)
     return trigger_token_ids
@@ -166,18 +187,18 @@ def insert_trigger(vars, trigger_mask, trigger_token_ids):
             trigger_token_ids.repeat(1, vars['input_ids'].shape[0]).long().view(-1)
     vars['input_ids'][trigger_mask] = repeated_trigger.to(DEVICE)
 
-def get_logit_class_mask(class_list, classification_model, add_zero=False, is_clean=False):
+def get_logit_class_mask(class_list, eval_model, add_zero=False, is_clean=False):
     if add_zero:
         class_list = [0] + class_list
-    logits_class_mask = torch.zeros([classification_model.num_labels, len(class_list)])
+    logits_class_mask = torch.zeros([eval_model.num_labels, len(class_list)])
     for new_cls, old_cls in enumerate(class_list):
         logits_class_mask[old_cls][new_cls] = 1
         if not add_zero or new_cls!=0:
             logits_class_mask[old_cls+1][new_cls] = 1
     if is_clean:
-        logits_class_mask = torch.zeros([classification_model.num_labels, len(class_list)])
+        logits_class_mask = torch.zeros([eval_model.num_labels, len(class_list)])
         source, target = class_list
-        for i in range(classification_model.num_labels):
+        for i in range(eval_model.num_labels):
             if (i != target) & (i != target+1):
                 logits_class_mask[i][0] = 1
         logits_class_mask[target][1] = 1
@@ -235,12 +256,12 @@ def load_tokenizer(tokenizer_filepath, config):
     return tokenizer
 
 
-def get_max_input_length(config, tokenizer):
+def get_max_input_length(config):
     if config['embedding'] == 'MobileBERT':
         max_input_length = \
-            tokenizer.max_model_input_sizes[tokenizer.name_or_path.split('/')[1]]
+            TOKENIZER.max_model_input_sizes[TOKENIZER.name_or_path.split('/')[1]]
     else:
-        max_input_length = tokenizer.max_model_input_sizes[tokenizer.name_or_path]
+        max_input_length = TOKENIZER.max_model_input_sizes[TOKENIZER.name_or_path]
     return max_input_length
 
 
@@ -257,8 +278,8 @@ def find_word_embedding_module(classification_model):
     return word_embedding_tuple[0][1]
 
 
-def add_hooks(classification_model, is_clean):
-    module = find_word_embedding_module(classification_model)
+def add_hooks(model, is_clean):
+    module = find_word_embedding_module(model)
     module.weight.requires_grad = True
     if is_clean:
         module.register_backward_hook(extract_clean_grad_hook)
@@ -306,11 +327,11 @@ def get_words_and_labels(examples_dirpath, source_class=None):
     return original_words, original_labels
 
 
-def tokenize_and_align_labels(tokenizer, original_words, 
-                              original_labels, max_input_length):
+def tokenize_and_align_labels(original_words, 
+                              original_labels):
 
-    tokenized_inputs = tokenizer(original_words, padding=True, truncation=True, 
-                                 is_split_into_words=True, max_length=max_input_length)
+    tokenized_inputs = TOKENIZER(original_words, padding=True, truncation=True, 
+                                 is_split_into_words=True, max_length=MAX_INPUT_LENGTH)
     
     word_ids = [tokenized_inputs.word_ids(i) for i in range(len(original_labels))]
     labels, label_mask = [], []
@@ -338,21 +359,24 @@ def tokenize_and_align_labels(tokenizer, original_words,
            labels, label_mask
 
 
-def eval_batch_helper(clean_models, classification_model, all_vars, source_class_token_locations,
+def eval_batch_helper(models, all_vars, source_class_token_locations,
                       source_class=0, target_class=0, clean_class_list=[], class_list=[], 
-                      num_triggers_in_batch=1, is_triggered=True):
+                      num_triggers_in_batch=1, is_testing=False):
     clean_logits_list = []
+    clean_models = models['clean_models']
+    if is_testing:
+        clean_models = models['clean_testing_models']
     for clean_model in clean_models:
         clean_logits_list.append(clean_model(all_vars['input_ids'], all_vars['attention_mask'], num_triggers_in_batch))
     original_clean_logits = torch.stack(clean_logits_list)
-    original_eval_logits = classification_model(all_vars['input_ids'], all_vars['attention_mask'], num_triggers_in_batch)
+    original_eval_logits = models['eval_model'](all_vars['input_ids'], all_vars['attention_mask'], num_triggers_in_batch)
     
-    loss_fct = torch.nn.CrossEntropyLoss(ignore_index=classification_model.ignore_index)
+    loss_fct = torch.nn.CrossEntropyLoss(ignore_index=models['eval_model'].ignore_index)
 
     mask = source_class_token_locations.split(1, dim=1)
     mask = ([list(range(num_triggers_in_batch)) for _ in range(len(mask[0]))], mask[0], mask[1])
     eval_logits = original_eval_logits[mask].permute(1,0,2)
-    eval_logits = eval_logits.view(num_triggers_in_batch, -1, classification_model.num_labels)
+    eval_logits = eval_logits.view(num_triggers_in_batch, -1, models['eval_model'].num_labels)
     eval_logits = eval_logits@LOGITS_CLASS_MASK
 
     true_labels = all_vars['labels'].reshape([num_triggers_in_batch] + [-1] + list(all_vars['labels'].shape)[1:])[mask].view((num_triggers_in_batch, -1))
@@ -382,32 +406,31 @@ def eval_batch_helper(clean_models, classification_model, all_vars, source_class
     return losses_list, original_eval_logits, original_clean_logits
 
 
-def evaluate_batch(clean_models, classification_model, all_vars, source_class_token_locations,
-                   use_grad=False, source_class=0, target_class=0, clean_class_list=[], class_list=[], num_triggers_in_batch=1):
+def evaluate_batch(models, all_vars, source_class_token_locations, use_grad=False, 
+                   source_class=0, target_class=0, clean_class_list=[], class_list=[], 
+                   num_triggers_in_batch=1, is_testing=False):
     if use_grad:
-        loss, original_eval_logits, original_clean_logits = eval_batch_helper(clean_models, classification_model, all_vars, 
-                                    source_class_token_locations, source_class, 
-                                    target_class, clean_class_list, class_list, num_triggers_in_batch)
+        loss, original_eval_logits, original_clean_logits = \
+            eval_batch_helper(models, all_vars, source_class_token_locations, source_class, 
+                              target_class, clean_class_list, class_list, num_triggers_in_batch, is_testing)
     else:
         with torch.no_grad():
             if USE_AMP:
                 with torch.cuda.amp.autocast():
                     loss, original_eval_logits, original_clean_logits = \
-                        eval_batch_helper(clean_models, classification_model, all_vars, 
-                                            source_class_token_locations, source_class, 
-                                            target_class, clean_class_list, class_list, num_triggers_in_batch)
+                        eval_batch_helper(models, all_vars, source_class_token_locations, source_class, 
+                                          target_class, clean_class_list, class_list, num_triggers_in_batch, is_testing)
             else:
                 loss, original_eval_logits, original_clean_logits = \
-                        eval_batch_helper(clean_models, classification_model, all_vars, 
-                                            source_class_token_locations, source_class, 
-                                            target_class, clean_class_list, class_list, num_triggers_in_batch)
+                        eval_batch_helper(models, all_vars, source_class_token_locations, source_class, 
+                                          target_class, clean_class_list, class_list, num_triggers_in_batch, is_testing)
     return loss, original_eval_logits, original_clean_logits
 
 
-def decode_tensor_of_token_ids(tokenizer, word_id_tensor):
+def decode_tensor_of_token_ids(word_id_tensor):
     word_list = []
     for word_id in word_id_tensor:
-        word_list.append(tokenizer.decode(word_id))
+        word_list.append(TOKENIZER.decode(word_id))
     return ' '.join(word_list)
 
 
