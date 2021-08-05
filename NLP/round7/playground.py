@@ -43,7 +43,7 @@ from joblib import load
 
 ''' CONSTANTS '''
 DEVICE = tools.DEVICE
-BATCH_SIZE = 256
+BATCH_SIZE = 128
 
 @torch.no_grad()
 def get_source_class_token_locations(source_class, labels):   
@@ -146,7 +146,7 @@ def filter_vars_to_sentences_with_source_class(original_vars, source_class_token
 def get_loss_per_candidate(models, vars, 
                            source_class_token_locations, trigger_mask, 
                            trigger_token_ids, best_k_ids, trigger_token_pos, 
-                           source_class, target_class, clean_class_list, class_list):
+                           source_class, target_class, clean_class_list, class_list, is_testing=False):
     '''
     vars: dictionary with input_ids, attention_mask, labels, labels_mask 
               already includes old triggers from previous iteration
@@ -162,12 +162,13 @@ def get_loss_per_candidate(models, vars,
     # save current loss with old triggers
     loss_per_candidate = []
     tools.insert_trigger(vars, trigger_mask, trigger_token_ids)
-    curr_loss, _, _ = tools.evaluate_batch(models, vars, 
+    curr_loss, _, _, mean_sequence_output = tools.evaluate_batch(models, vars, 
                                source_class_token_locations, use_grad=False, 
                                source_class=source_class, target_class=target_class, 
-                               clean_class_list=clean_class_list, class_list=class_list)
-    curr_loss = tools.SIGN * curr_loss[0].cpu().numpy()
-    loss_per_candidate.append((deepcopy(trigger_token_ids), curr_loss))
+                               clean_class_list=clean_class_list, class_list=class_list, is_testing=is_testing)
+    mean_sequence_output = mean_sequence_output[torch.nonzero(trigger_mask).split(1, dim=1)].mean([0,1])
+    loss_per_candidate.append((deepcopy(trigger_token_ids), tools.SIGN*curr_loss[0].cpu().numpy(), 
+                               deepcopy(mean_sequence_output.detach().cpu().numpy())))
     
     # evaluate loss with each of the candidate triggers
     # let's batch the candidates
@@ -175,7 +176,7 @@ def get_loss_per_candidate(models, vars,
     num_batches = (len(best_k_ids[trigger_token_pos])//num_triggers_in_batch)+1
     batch_list = [best_k_ids[trigger_token_pos][i*num_triggers_in_batch:(i+1)*num_triggers_in_batch] \
                                                                             for i in range(num_batches)]
-    for cand_token_id_batch in batch_list:
+    for cand_token_id_batch in tqdm(batch_list):
         if len(cand_token_id_batch) == 0:
             continue
         trigger_token_ids_one_replaced = deepcopy(trigger_token_ids).repeat([len(cand_token_id_batch), 1]).to(DEVICE)
@@ -184,13 +185,17 @@ def get_loss_per_candidate(models, vars,
         temp_vars = deepcopy(vars)
         temp_vars = {k:v.repeat([len(cand_token_id_batch), 1]) for k,v in temp_vars.items()}
         temp_vars['input_ids'][trigger_mask.repeat([len(cand_token_id_batch), 1])] = trigger_token_ids_one_replaced.view(-1)
-        losses, _, _ = tools.evaluate_batch(models, temp_vars, 
+        losses, _, _, mean_sequence_outputs = tools.evaluate_batch(models, temp_vars, 
                               source_class_token_locations, use_grad=False,
                               source_class=source_class, target_class=target_class, 
                               clean_class_list=clean_class_list, class_list=class_list,
-                              num_triggers_in_batch=len(cand_token_id_batch))
-        for trigger, loss in zip(trigger_token_ids_one_replaced[::vars['input_ids'].shape[0]], losses):
-            loss_per_candidate.append((deepcopy(trigger), tools.SIGN*deepcopy(loss.detach().cpu().numpy())))
+                              num_triggers_in_batch=len(cand_token_id_batch), is_testing=is_testing)
+        mean_sequence_outputs = \
+            mean_sequence_outputs.reshape([len(cand_token_id_batch), -1] + list(mean_sequence_outputs.shape)[-2:])
+        for trigger, loss, mean_sequence_output in zip(trigger_token_ids_one_replaced[::vars['input_ids'].shape[0]], losses, mean_sequence_outputs):
+            mean_sequence_output = mean_sequence_output[torch.nonzero(trigger_mask).split(1, dim=1)].mean([0,1])
+            loss_per_candidate.append((deepcopy(trigger), tools.SIGN*deepcopy(loss.detach().cpu().numpy()),
+                                       deepcopy(mean_sequence_output.detach().cpu().numpy())))
     return loss_per_candidate
 
 
@@ -239,17 +244,15 @@ def get_best_candidate(models, vars, source_class_token_locations,
     beam_size = tools.BEAM_SIZE
     initial_loss_per_candidate = \
         get_loss_per_candidate(models, vars, source_class_token_locations, 
-                            trigger_mask, trigger_token_ids, best_k_ids, len(trigger_token_ids)-1, source_class, target_class, clean_class_list, class_list) 
+            trigger_mask, trigger_token_ids, best_k_ids, 0, source_class, target_class, clean_class_list, class_list) 
 
     top_candidates = heapq.nlargest(beam_size, initial_loss_per_candidate, key=itemgetter(1))                                     
-    for idx in range(len(trigger_token_ids)-2, -1, -1):
+    for idx in range(1, len(trigger_token_ids)):
         loss_per_candidate = []
-        for cand, _ in top_candidates:
+        for cand, _, _ in top_candidates:
             loss_per_candidate.extend(\
-                get_loss_per_candidate(models, vars, 
-                                        source_class_token_locations, trigger_mask, 
-                                        cand, best_k_ids, idx, source_class, 
-                                        target_class, clean_class_list, class_list))
+                get_loss_per_candidate(models, vars, source_class_token_locations, trigger_mask, 
+                    cand, best_k_ids, idx, source_class, target_class, clean_class_list, class_list))
         top_candidates = heapq.nlargest(beam_size, loss_per_candidate, key=itemgetter(1))                               
     return max(top_candidates, key=itemgetter(1))
 
@@ -266,7 +269,7 @@ def get_trigger(models, vars, masked_source_class_token_locations,
             clear_model_grads(clean_model)
 
         # forward prop with the current vars
-        initial_loss, initial_eval_logits, initial_clean_logits = \
+        initial_loss, initial_eval_logits, initial_clean_logits, _ = \
             tools.evaluate_batch(models, vars, masked_source_class_token_locations, use_grad=True,
                                  source_class=source_class, target_class=target_class, 
                                  clean_class_list=clean_class_list, class_list=class_list)
@@ -281,7 +284,7 @@ def get_trigger(models, vars, masked_source_class_token_locations,
         clear_model_grads(models['eval_model'])
         for clean_model in models['clean_models']:
             clear_model_grads(clean_model)
-        top_candidate, loss = \
+        top_candidate, loss, _ = \
             get_best_candidate(models, vars, 
                                masked_source_class_token_locations, 
                                trigger_mask, trigger_token_ids, best_k_ids, 
@@ -294,7 +297,7 @@ def get_trigger(models, vars, masked_source_class_token_locations,
 
         # TODO: Fix this to also work for untargetted attacks
         if torch.equal(top_candidate, trigger_token_ids) or tools.SIGN*loss.round(4) < 0.001:
-            initial_loss, initial_eval_logits, initial_clean_logits = \
+            initial_loss, initial_eval_logits, initial_clean_logits, _ = \
                 tools.evaluate_batch(models, vars, 
                                  masked_source_class_token_locations, use_grad=False,
                                  source_class=source_class, target_class=target_class, 
@@ -349,7 +352,7 @@ def trojan_detector(eval_model_filepath, tokenizer_filepath,
     tools.MAX_INPUT_LENGTH = tools.get_max_input_length(config)
 
     ''' 2. INITIALIZE ATTACK FOR A SOURCE CLASS AND TRIGGER LENGTH '''
-    initial_trigger_token_ids = tools.make_initial_trigger_tokens(is_random=False, initial_trigger_words="ok "*5)    
+    initial_trigger_token_ids = tools.make_initial_trigger_tokens(is_random=False, initial_trigger_words="ok "*7)    
     # initial_trigger_token_ids = torch.tensor([28910, 28911, 28912, 28913, 28914, 28915, 28916, 28917, 28918, 28919]).to(tools.DEVICE)
     trigger_length = len(initial_trigger_token_ids)
     
@@ -439,7 +442,8 @@ if __name__ == "__main__":
     parser.add_argument('--tokenizer_filepath', type=str, 
                         help='File path to the pytorch model (.pt) file containing the '\
                              'correct tokenizer to be used with the model_filepath.', 
-                        default='/scratch/data/TrojAI/round7-train-dataset/tokenizers/MobileBERT-google-mobilebert-uncased.pt')
+                        default='/scratch/data/TrojAI/round7-train-dataset/tokenizers/'+\
+                                'MobileBERT-google-mobilebert-uncased.pt')
     parser.add_argument('--result_filepath', type=str, 
                         help='File path to the file where output result should be written. '\
                              'After execution this file should contain a single line with a'\
@@ -456,13 +460,16 @@ if __name__ == "__main__":
                         default='/scratch/data/TrojAI/round7-train-dataset/models/id-00000000/clean_example_data')
     parser.add_argument('--lmbda', type=float, 
                         help='Lambda used for the second term of the loss function to weigh the clean accuracy loss', 
-                        default=1.)
+                        default=.25)
+    parser.add_argument('--beta', type=float, 
+                        help='Lambda used for the second term of the loss function to weigh the clean accuracy loss', 
+                        default=1.)                        
     parser.add_argument('--num_candidates', type=int, 
                         help='number of candidates per token', 
-                        default=1)   
+                        default=50)   
     parser.add_argument('--beam_size', type=int, 
                     help='number of candidates per token', 
-                    default=2)       
+                    default=5)       
     parser.add_argument('--max_sentences', type=int, 
                     help='number of sentences to use', 
                     default=25)                      
@@ -471,6 +478,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     tools.LAMBDA=args.lmbda
+    tools.BETA=args.beta
     tools.NUM_CANDIDATES = args.num_candidates
     tools.BEAM_SIZE = args.beam_size
     tools.MAX_SENTENCES = args.max_sentences

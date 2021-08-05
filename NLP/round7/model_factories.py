@@ -20,6 +20,7 @@ class NerLinearModel(torch.nn.Module):
 		- class_token_indices: row,col of each of the source class tokens
 			shape=(num_sentences, 2) 
 		'''
-		sequence_output = self.transformer(input_ids.to(self.transformer.device), attention_mask=attention_mask.to(self.transformer.device))[0]
+		sequence_output = self.transformer(input_ids.to(self.transformer.device),\
+							attention_mask=attention_mask.to(self.transformer.device))[0]
 		logits = self.classifier(sequence_output)
-		return logits.reshape([num_triggers_in_batch] + [-1] + list(logits.shape)[1:]).to(tools.DEVICE)
+		return logits.reshape([num_triggers_in_batch] + [-1] + list(logits.shape)[1:]).to(tools.DEVICE), sequence_output

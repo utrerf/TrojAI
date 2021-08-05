@@ -25,9 +25,10 @@ IS_TARGETTED = True
 SIGN = 1 # min loss if we're targetting a class
 if IS_TARGETTED:
     SIGN = -1 
-BETA = 1.
-LAMBDA = 1.
 USE_AMP = True
+''' These variables are set in the argparse at playground.py '''
+BETA = None
+LAMBDA = None
 TOKENIZER = None
 BEAM_SIZE = None
 NUM_CANDIDATES = None
@@ -73,7 +74,7 @@ def get_clean_asr_and_accuracy(vars, trigger_mask, trigger_token_ids,
     
     source_class_loc_mask = masked_source_class_token_locations.split(1, dim=1)
     insert_trigger(vars, trigger_mask, trigger_token_ids)
-    testing_loss, _, testing_clean_logits = \
+    testing_loss, _, testing_clean_logits, _ = \
         evaluate_batch(models, vars, masked_source_class_token_locations, use_grad=False,
                        source_class=source_class, target_class=target_class, 
                        clean_class_list=temp_class_list_clean, class_list=temp_class_list, is_testing=True)
@@ -362,15 +363,21 @@ def tokenize_and_align_labels(original_words,
 def eval_batch_helper(models, all_vars, source_class_token_locations,
                       source_class=0, target_class=0, clean_class_list=[], class_list=[], 
                       num_triggers_in_batch=1, is_testing=False):
-    clean_logits_list = []
+    clean_logits_list, clean_sequence_output_list = [], []
     clean_models = models['clean_models']
     if is_testing:
         clean_models = models['clean_testing_models']
     for clean_model in clean_models:
-        clean_logits_list.append(clean_model(all_vars['input_ids'], all_vars['attention_mask'], num_triggers_in_batch))
+        logits, sequence_output = clean_model(all_vars['input_ids'], all_vars['attention_mask'], num_triggers_in_batch)
+        clean_logits_list.append(logits)
+        clean_sequence_output_list.append(sequence_output)
     original_clean_logits = torch.stack(clean_logits_list)
-    original_eval_logits = models['eval_model'](all_vars['input_ids'], all_vars['attention_mask'], num_triggers_in_batch)
+    clean_sequence_output = torch.stack(clean_sequence_output_list).mean(0)
+
+    original_eval_logits, eval_sequence_output = \
+        models['eval_model'](all_vars['input_ids'], all_vars['attention_mask'], num_triggers_in_batch)
     
+    mean_sequence_output = torch.stack([clean_sequence_output, eval_sequence_output]).mean(0)
     loss_fct = torch.nn.CrossEntropyLoss(ignore_index=models['eval_model'].ignore_index)
 
     mask = source_class_token_locations.split(1, dim=1)
@@ -403,28 +410,28 @@ def eval_batch_helper(models, all_vars, source_class_token_locations,
             losses_list.append(loss_fct(eval_logit, source_label) \
                                 - LAMBDA*avg_clean_loss)
 
-    return losses_list, original_eval_logits, original_clean_logits
+    return losses_list, original_eval_logits, original_clean_logits, mean_sequence_output
 
 
 def evaluate_batch(models, all_vars, source_class_token_locations, use_grad=False, 
                    source_class=0, target_class=0, clean_class_list=[], class_list=[], 
                    num_triggers_in_batch=1, is_testing=False):
     if use_grad:
-        loss, original_eval_logits, original_clean_logits = \
+        loss, original_eval_logits, original_clean_logits, mean_sequence_output = \
             eval_batch_helper(models, all_vars, source_class_token_locations, source_class, 
                               target_class, clean_class_list, class_list, num_triggers_in_batch, is_testing)
     else:
         with torch.no_grad():
             if USE_AMP:
                 with torch.cuda.amp.autocast():
-                    loss, original_eval_logits, original_clean_logits = \
+                    loss, original_eval_logits, original_clean_logits, mean_sequence_output = \
                         eval_batch_helper(models, all_vars, source_class_token_locations, source_class, 
                                           target_class, clean_class_list, class_list, num_triggers_in_batch, is_testing)
             else:
-                loss, original_eval_logits, original_clean_logits = \
+                loss, original_eval_logits, original_clean_logits, mean_sequence_output = \
                         eval_batch_helper(models, all_vars, source_class_token_locations, source_class, 
                                           target_class, clean_class_list, class_list, num_triggers_in_batch, is_testing)
-    return loss, original_eval_logits, original_clean_logits
+    return loss, original_eval_logits, original_clean_logits, mean_sequence_output
 
 
 def decode_tensor_of_token_ids(word_id_tensor):
