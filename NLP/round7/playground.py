@@ -298,7 +298,7 @@ def get_trigger(models, vars, masked_source_class_token_locations,
 
         # TODO: Fix this to also work for untargetted attacks
         # tools.SIGN*loss.round(4) > initial_loss[0].item()/2 
-        if i >= 1 and (tools.SIGN*loss.round(4) < 0.005):
+        if i >= 1 and (tools.SIGN*loss.round(4) < 0.001):
         # if torch.equal(top_candidate, trigger_token_ids) or tools.SIGN*loss.round(4) < 0.002:
             initial_loss, initial_eval_logits, initial_clean_logits, _ = \
                 tools.evaluate_batch(models, vars, 
