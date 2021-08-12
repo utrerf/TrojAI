@@ -21,6 +21,7 @@ TESTING_CLEAN_MODELS_PATH = '/scratch/utrerf/TrojAI/NLP/round7/clean_models_test
 LOGITS_CLASS_MASK = None
 LOGITS_CLASS_MASK_CLEAN = None
 CLEAN_MODEL_LOGITS_WITHOUT_TRIGGER = None
+CLEAN_IX = None
 
 # TODO: Change the number of clean models at eval to something that makes more sense
 NUM_CLEAN_MODELS_AT_EVAL = 8
@@ -389,7 +390,7 @@ def eval_batch_helper(models, all_vars, source_class_token_locations,
     loss_fct = torch.nn.CrossEntropyLoss(ignore_index=models['eval_model'].ignore_index)
 
     mask = source_class_token_locations.split(1, dim=1)
-    mask = ([list(range(num_triggers_in_batch)) for _ in range(len(mask[0]))], mask[0], mask[1])
+    mask = ([list(range(num_triggers_in_batch)) for _ in [i.item() for i in mask[0]]], mask[0], mask[1])
     eval_logits = original_eval_logits[mask].permute(1,0,2)
     eval_logits = eval_logits.view(num_triggers_in_batch, -1, models['eval_model'].num_labels)
     eval_logits = eval_logits@LOGITS_CLASS_MASK
@@ -411,7 +412,10 @@ def eval_batch_helper(models, all_vars, source_class_token_locations,
             og_cl = og_cl.permute(1,0,2)@LOGITS_CLASS_MASK_CLEAN
             # TODO: THIS NEEDS TO CHANGE
             # clean_losses.append(softXEnt(cl[0], og_cl[0]))
-            clean_losses.append(loss_fct(cl[0], og_cl[0].argmax(-1)))
+            if CLEAN_IX is not None:
+                clean_losses.append(loss_fct(cl[0], og_cl[0][CLEAN_IX:CLEAN_IX+10].argmax(-1)))
+            else:
+                clean_losses.append(loss_fct(cl[0], og_cl[0].argmax(-1)))
         avg_clean_loss = torch.stack(clean_losses).mean(0)
         if IS_TARGETTED==True:
             losses_list.append(BETA*loss_fct(eval_logit, target_label) \

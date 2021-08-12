@@ -3,6 +3,7 @@ Code inspired by: Eric Wallace Universal Triggers repo
 https://github.com/Eric-Wallace/universal-triggers/blob/ed657674862c965b31e0728d71765d0b6fe18f22/gpt2/create_adv_token.py#L28
 TODO:
 - Need to update the clean loss to be the soft-label loss (precompute these!!)
+- Remove bad pred examples!
 - Work on performance
 - Finish evaluating training set
 - Train LR
@@ -261,7 +262,7 @@ def get_best_candidate(models, vars, source_class_token_locations,
 def get_trigger(models, vars, masked_source_class_token_locations, 
                 clean_class_list, class_list, source_class, target_class, initial_trigger_token_ids, 
                 trigger_mask, trigger_length, embedding_matrices):
-    num_candidate_schedule = [tools.NUM_CANDIDATES]*10
+    num_candidate_schedule = [10]+[tools.NUM_CANDIDATES]*10
     tools.insert_trigger(vars, trigger_mask, initial_trigger_token_ids)
     trigger_token_ids = deepcopy(initial_trigger_token_ids)
     for i, num_candidates in enumerate(num_candidate_schedule):
@@ -285,20 +286,44 @@ def get_trigger(models, vars, masked_source_class_token_locations,
         clear_model_grads(models['eval_model'])
         for clean_model in models['clean_models']:
             clear_model_grads(clean_model)
-        top_candidate, loss, _ = \
-            get_best_candidate(models, vars, 
+        
+        top_candidate, stochastic_loss, _ = \
+            get_best_candidate(models, vars, # revert back to vars
                                masked_source_class_token_locations, 
                                trigger_mask, trigger_token_ids, best_k_ids, 
                                source_class, target_class, clean_class_list, class_list)
 
-        print(f'iteration: {i} \n\t initial_loss: {np.round(initial_loss[0].item(),3)} '+
-              f'\t final_loss: {tools.SIGN*loss.round(3)} '+
-              f'\n\t initial_candidate:\t {trigger_token_ids.detach().cpu().numpy()} \n\t top_candidate:\t\t {top_candidate.detach().cpu().numpy()}')
-        tools.insert_trigger(vars, trigger_mask, top_candidate)
+        # tools.CLEAN_IX = random.randint(0,10)
+        # tools.CLEAN_IX = 0
+        # temp_vars = deepcopy(vars)
+        # temp_vars = {k: v[tools.CLEAN_IX:tools.CLEAN_IX+10] for k,v in temp_vars.items()}
+        # temp_trigger_mask = trigger_mask[tools.CLEAN_IX:tools.CLEAN_IX+10]
+        # temp_masked_source_class_token_locations = masked_source_class_token_locations[tools.CLEAN_IX:tools.CLEAN_IX+10]
+        # temp_masked_source_class_token_locations[:, 0] = torch.arange(temp_masked_source_class_token_locations.shape[0], device=DEVICE).long()
+        # top_candidate, stochastic_loss, _ = \
+        #     get_best_candidate(models, temp_vars, # revert back to vars
+        #                        temp_masked_source_class_token_locations, 
+        #                        temp_trigger_mask, trigger_token_ids, best_k_ids, 
+        #                        source_class, target_class, clean_class_list, class_list)
+        # tools.CLEAN_IX = None
 
+        final_loss, final_eval_logits, final_clean_logits, _ = \
+            tools.evaluate_batch(models, vars, masked_source_class_token_locations, use_grad=False,
+                                 source_class=source_class, target_class=target_class, 
+                                 clean_class_list=clean_class_list, class_list=class_list)
+        
+        tools.insert_trigger(vars, trigger_mask, top_candidate)
+        
+        print(f'iteration: {i} \n\t initial_loss: {np.round(initial_loss[0].item(),3)} '+
+              f'\t final_loss: {np.round(final_loss[0].item(), 3)} '+
+              f'\n\t initial_candidate:\t {trigger_token_ids.detach().cpu().numpy()} \n\t top_candidate:\t\t {top_candidate.detach().cpu().numpy()}')
+        
+        trigger_token_ids = deepcopy(top_candidate)
         # TODO: Fix this to also work for untargetted attacks
         # tools.SIGN*loss.round(4) > initial_loss[0].item()/2 
-        if i >= 1 and (tools.SIGN*loss.round(4) < 0.001):
+        if i >= 1 and (final_loss[0].item() < 0.001):
+                    #    or initial_loss[0].item()-final_loss[0].item() < 0.01
+                    #    ):
         # if torch.equal(top_candidate, trigger_token_ids) or tools.SIGN*loss.round(4) < 0.002:
             initial_loss, initial_eval_logits, initial_clean_logits, _ = \
                 tools.evaluate_batch(models, vars, 
@@ -307,8 +332,6 @@ def get_trigger(models, vars, masked_source_class_token_locations,
                                  clean_class_list=clean_class_list, class_list=class_list)
             trigger_token_ids = deepcopy(top_candidate)
             break
-
-        trigger_token_ids = deepcopy(top_candidate)
         
     return trigger_token_ids, initial_loss, initial_eval_logits, initial_clean_logits
 
@@ -378,7 +401,7 @@ def trojan_detector(eval_model_filepath, tokenizer_filepath,
                                'loss', 'testing_loss', 'clean_accuracy', 'decoded_initial_candidate'])
     class_list = tools.get_class_list(examples_dirpath)
     # TODO: Remove this
-    # class_list = [5, 7]
+    # class_list = [7, 1]
 
     TRIGGER_ASR_THRESHOLD, TRIGGER_LOSS_THRESHOLD = 0.95, 0.001
     for source_class, target_class in tqdm(list(itertools.product(class_list, class_list))):
@@ -392,6 +415,7 @@ def trojan_detector(eval_model_filepath, tokenizer_filepath,
 
         # TODO: Clean this and make it more elegant
         temp_examples_dirpath = join('/'.join(clean_models_filepath[0].split('/')[:-1]), 'clean_example_data')
+        # temp_examples_dirpath = examples_dirpath
         update_clean_logits(models['clean_models'], temp_examples_dirpath, source_class, initial_trigger_token_ids=torch.tensor([]))
 
         vars, trigger_mask, masked_source_class_token_locations =\
@@ -403,6 +427,7 @@ def trojan_detector(eval_model_filepath, tokenizer_filepath,
         ''' Evaluate the trigger and save results to df'''
         trigger_asr = tools.get_trigger_asr(masked_source_class_token_locations, initial_eval_logits, target_class)
         update_clean_logits(models['clean_testing_models'], temp_examples_dirpath, source_class, initial_trigger_token_ids=torch.tensor([]))
+        
         vars, trigger_mask, masked_source_class_token_locations =\
             initialize_attack_for_source_class(temp_examples_dirpath, source_class, initial_trigger_token_ids)
         clean_asr_list, clean_accuracy_list, testing_loss = \
@@ -450,7 +475,7 @@ if __name__ == "__main__":
                         default=1)
     parser.add_argument('--model_num', type=int, 
                         help='Model id number', 
-                        default=6)
+                        default=15)
     parser.add_argument('--training_data_path', type=str, 
                         help='Folder that contains the training data', 
                         default=tools.TRAINING_DATA_PATH)
@@ -484,13 +509,13 @@ if __name__ == "__main__":
                         default=1.)
     parser.add_argument('--num_candidates', type=int, 
                         help='number of candidates per token', 
-                        default=300)   
+                        default=1000)   
     parser.add_argument('--beam_size', type=int, 
                     help='number of candidates per token', 
                     default=1)       
     parser.add_argument('--max_sentences', type=int, 
                     help='number of sentences to use', 
-                    default=25)                      
+                    default=50)                      
     
 
     args = parser.parse_args()
