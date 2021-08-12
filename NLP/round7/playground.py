@@ -2,6 +2,7 @@
 Code inspired by: Eric Wallace Universal Triggers repo
 https://github.com/Eric-Wallace/universal-triggers/blob/ed657674862c965b31e0728d71765d0b6fe18f22/gpt2/create_adv_token.py#L28
 TODO:
+- Need to update the clean loss to be the soft-label loss (precompute these!!)
 - Work on performance
 - Finish evaluating training set
 - Train LR
@@ -43,7 +44,7 @@ from joblib import load
 
 ''' CONSTANTS '''
 DEVICE = tools.DEVICE
-BATCH_SIZE = 128
+BATCH_SIZE = 256
 
 @torch.no_grad()
 def get_source_class_token_locations(source_class, labels):   
@@ -260,7 +261,7 @@ def get_best_candidate(models, vars, source_class_token_locations,
 def get_trigger(models, vars, masked_source_class_token_locations, 
                 clean_class_list, class_list, source_class, target_class, initial_trigger_token_ids, 
                 trigger_mask, trigger_length, embedding_matrices):
-    num_candidate_schedule = [tools.NUM_CANDIDATES]*20
+    num_candidate_schedule = [tools.NUM_CANDIDATES]*10
     tools.insert_trigger(vars, trigger_mask, initial_trigger_token_ids)
     trigger_token_ids = deepcopy(initial_trigger_token_ids)
     for i, num_candidates in enumerate(num_candidate_schedule):
@@ -296,7 +297,9 @@ def get_trigger(models, vars, masked_source_class_token_locations,
         tools.insert_trigger(vars, trigger_mask, top_candidate)
 
         # TODO: Fix this to also work for untargetted attacks
-        if torch.equal(top_candidate, trigger_token_ids) or tools.SIGN*loss.round(4) < 0.001:
+        # tools.SIGN*loss.round(4) > initial_loss[0].item()/2 
+        if i >= 1 and (tools.SIGN*loss.round(4) < 0.005):
+        # if torch.equal(top_candidate, trigger_token_ids) or tools.SIGN*loss.round(4) < 0.002:
             initial_loss, initial_eval_logits, initial_clean_logits, _ = \
                 tools.evaluate_batch(models, vars, 
                                  masked_source_class_token_locations, use_grad=False,
@@ -333,6 +336,18 @@ def initialize_attack_for_source_class(examples_dirpath, source_class,
     return vars, trigger_mask, masked_source_class_token_locations
 
 
+@torch.no_grad()
+def update_clean_logits(clean_models, temp_examples_dirpath, source_class, initial_trigger_token_ids):
+    vars, _, masked_source_class_token_locations =\
+        initialize_attack_for_source_class(temp_examples_dirpath, source_class, initial_trigger_token_ids)
+    tools.CLEAN_MODEL_LOGITS_WITHOUT_TRIGGER = []
+    mask = masked_source_class_token_locations.split(1, dim=1)
+    for clean_model in clean_models:
+        logits, _ = clean_model(vars['input_ids'], vars['attention_mask'])
+        logits.requires_grad = False
+        tools.CLEAN_MODEL_LOGITS_WITHOUT_TRIGGER.append(logits[0][mask])
+
+
 def trojan_detector(eval_model_filepath, tokenizer_filepath, 
                     result_filepath, scratch_dirpath, examples_dirpath, is_training):
     ''' 1. LOAD MODELS, EMBEDDINGS AND TOKENIZER'''
@@ -352,8 +367,9 @@ def trojan_detector(eval_model_filepath, tokenizer_filepath,
     tools.MAX_INPUT_LENGTH = tools.get_max_input_length(config)
 
     ''' 2. INITIALIZE ATTACK FOR A SOURCE CLASS AND TRIGGER LENGTH '''
-    initial_trigger_token_ids = tools.make_initial_trigger_tokens(is_random=False, initial_trigger_words="ok "*7)    
-    # initial_trigger_token_ids = torch.tensor([28910, 28911, 28912, 28913, 28914, 28915, 28916, 28917, 28918, 28919]).to(tools.DEVICE)
+    # initial_trigger_token_ids = tools.make_initial_trigger_tokens(is_random=False, initial_trigger_words="ok "*7)    
+    initial_trigger_token_ids = torch.tensor([0, 0, 0, 0, 0]).to(tools.DEVICE)
+    # initial_trigger_token_ids = torch.tensor([11920]).to(tools.DEVICE)
     trigger_length = len(initial_trigger_token_ids)
     
     ''' 3. ITERATIVELY ATTACK THE MODEL CONSIDERING NUM CANDIDATES PER TOKEN '''
@@ -362,29 +378,31 @@ def trojan_detector(eval_model_filepath, tokenizer_filepath,
                                'loss', 'testing_loss', 'clean_accuracy', 'decoded_initial_candidate'])
     class_list = tools.get_class_list(examples_dirpath)
     # TODO: Remove this
-    # class_list = [7, 1]
+    # class_list = [5, 7]
 
     TRIGGER_ASR_THRESHOLD, TRIGGER_LOSS_THRESHOLD = 0.95, 0.001
     for source_class, target_class in tqdm(list(itertools.product(class_list, class_list))):
         if source_class == target_class:
             continue
         
-        # temp_class_list = class_list
         temp_class_list = tools.get_class_list(examples_dirpath)
         temp_class_list_clean = [source_class, target_class]
         
         tools.update_logits_masks(temp_class_list, temp_class_list_clean, models['eval_model'])
-        
+
         # TODO: Clean this and make it more elegant
         temp_examples_dirpath = join('/'.join(clean_models_filepath[0].split('/')[:-1]), 'clean_example_data')
+        update_clean_logits(models['clean_models'], temp_examples_dirpath, source_class, initial_trigger_token_ids=torch.tensor([]))
+
         vars, trigger_mask, masked_source_class_token_locations =\
-            initialize_attack_for_source_class(temp_examples_dirpath, source_class, 
-                                        initial_trigger_token_ids)
+            initialize_attack_for_source_class(temp_examples_dirpath, source_class, initial_trigger_token_ids)
         trigger_token_ids, loss, initial_eval_logits, _ = \
             get_trigger(models, vars, masked_source_class_token_locations, temp_class_list_clean, temp_class_list, 
                         source_class, target_class, initial_trigger_token_ids, trigger_mask, trigger_length, embedding_matrices)
+        
         ''' Evaluate the trigger and save results to df'''
         trigger_asr = tools.get_trigger_asr(masked_source_class_token_locations, initial_eval_logits, target_class)
+        update_clean_logits(models['clean_testing_models'], temp_examples_dirpath, source_class, initial_trigger_token_ids=torch.tensor([]))
         vars, trigger_mask, masked_source_class_token_locations =\
             initialize_attack_for_source_class(temp_examples_dirpath, source_class, initial_trigger_token_ids)
         clean_asr_list, clean_accuracy_list, testing_loss = \
@@ -432,7 +450,7 @@ if __name__ == "__main__":
                         default=1)
     parser.add_argument('--model_num', type=int, 
                         help='Model id number', 
-                        default=15)
+                        default=6)
     parser.add_argument('--training_data_path', type=str, 
                         help='Folder that contains the training data', 
                         default=tools.TRAINING_DATA_PATH)
@@ -458,18 +476,18 @@ if __name__ == "__main__":
                         help='File path to the folder of examples which might be useful '\
                              'for determining whether a model is poisoned.', 
                         default='/scratch/data/TrojAI/round7-train-dataset/models/id-00000000/clean_example_data')
+    parser.add_argument('--beta', type=float, 
+                        help='Beta used for the second term of the loss function to weigh the eval accuracy loss', 
+                        default=.05)   
     parser.add_argument('--lmbda', type=float, 
                         help='Lambda used for the second term of the loss function to weigh the clean accuracy loss', 
-                        default=.25)
-    parser.add_argument('--beta', type=float, 
-                        help='Lambda used for the second term of the loss function to weigh the clean accuracy loss', 
-                        default=1.)                        
+                        default=1.)
     parser.add_argument('--num_candidates', type=int, 
                         help='number of candidates per token', 
-                        default=50)   
+                        default=300)   
     parser.add_argument('--beam_size', type=int, 
                     help='number of candidates per token', 
-                    default=5)       
+                    default=1)       
     parser.add_argument('--max_sentences', type=int, 
                     help='number of sentences to use', 
                     default=25)                      

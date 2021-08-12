@@ -17,8 +17,11 @@ EXTRACTED_CLEAN_GRADS = []
 TRAINING_DATA_PATH = '/scratch/data/TrojAI/round7-train-dataset/'
 CLEAN_MODELS_PATH = '/scratch/utrerf/TrojAI/NLP/round7/clean_models_train'
 TESTING_CLEAN_MODELS_PATH = '/scratch/utrerf/TrojAI/NLP/round7/clean_models_test'
+
 LOGITS_CLASS_MASK = None
 LOGITS_CLASS_MASK_CLEAN = None
+CLEAN_MODEL_LOGITS_WITHOUT_TRIGGER = None
+
 # TODO: Change the number of clean models at eval to something that makes more sense
 NUM_CLEAN_MODELS_AT_EVAL = 8
 IS_TARGETTED = True
@@ -34,6 +37,7 @@ BEAM_SIZE = None
 NUM_CANDIDATES = None
 MAX_INPUT_LENGTH = None
 MAX_SENTENCES = None
+CONVERGENGE_THRESHOLD = None
 
 
 ''' TODO: Move add_hooks to a later part in the process'''
@@ -360,6 +364,10 @@ def tokenize_and_align_labels(original_words,
            labels, label_mask
 
 
+def softXEnt(predicted, target):
+    m = torch.nn.Softmax(dim=1)
+    return -(m(target) * torch.log(m(predicted))).sum(dim=1).mean()
+
 def eval_batch_helper(models, all_vars, source_class_token_locations,
                       source_class=0, target_class=0, clean_class_list=[], class_list=[], 
                       num_triggers_in_batch=1, is_testing=False):
@@ -396,12 +404,14 @@ def eval_batch_helper(models, all_vars, source_class_token_locations,
     for eval_logit, clean_logit, target_label, source_label \
         in zip(eval_logits, original_clean_logits.permute(1,0,2,3,4), target_labels, source_labels):
         clean_losses = []
-        for cl in clean_logit:
+        for cl, og_cl in zip(clean_logit, CLEAN_MODEL_LOGITS_WITHOUT_TRIGGER):
             clean_mask = source_class_token_locations.split(1, dim=1)
             cl = cl[clean_mask].permute(1,0,2)
             cl = cl@LOGITS_CLASS_MASK_CLEAN
+            og_cl = og_cl.permute(1,0,2)@LOGITS_CLASS_MASK_CLEAN
             # TODO: THIS NEEDS TO CHANGE
-            clean_losses.append(loss_fct(cl[0], source_label))
+            # clean_losses.append(softXEnt(cl[0], og_cl[0]))
+            clean_losses.append(loss_fct(cl[0], og_cl[0].argmax(-1)))
         avg_clean_loss = torch.stack(clean_losses).mean(0)
         if IS_TARGETTED==True:
             losses_list.append(BETA*loss_fct(eval_logit, target_label) \
@@ -419,18 +429,21 @@ def evaluate_batch(models, all_vars, source_class_token_locations, use_grad=Fals
     if use_grad:
         loss, original_eval_logits, original_clean_logits, mean_sequence_output = \
             eval_batch_helper(models, all_vars, source_class_token_locations, source_class, 
-                              target_class, clean_class_list, class_list, num_triggers_in_batch, is_testing)
+                              target_class, clean_class_list, class_list, num_triggers_in_batch, 
+                              is_testing)
     else:
         with torch.no_grad():
             if USE_AMP:
                 with torch.cuda.amp.autocast():
                     loss, original_eval_logits, original_clean_logits, mean_sequence_output = \
                         eval_batch_helper(models, all_vars, source_class_token_locations, source_class, 
-                                          target_class, clean_class_list, class_list, num_triggers_in_batch, is_testing)
+                                          target_class, clean_class_list, class_list, num_triggers_in_batch, 
+                                          is_testing)
             else:
                 loss, original_eval_logits, original_clean_logits, mean_sequence_output = \
                         eval_batch_helper(models, all_vars, source_class_token_locations, source_class, 
-                                          target_class, clean_class_list, class_list, num_triggers_in_batch, is_testing)
+                                          target_class, clean_class_list, class_list, num_triggers_in_batch, 
+                                          is_testing)
     return loss, original_eval_logits, original_clean_logits, mean_sequence_output
 
 
