@@ -87,11 +87,10 @@ def tokenize_for_qa(tokenizer, dataset, models):
             clean_outputs['end_logits'].append(clean_output['end_logits'])
         
         # initialize lists
-        var_list = ['example_id', 'question_start_and_end', 'context_start_and_end']
+        var_list = ['question_start_and_end', 'context_start_and_end', 
+                    'clean_cls_likelihoods', 'answer_start_and_end']
         for var_name in var_list:
             tokenized_examples[var_name] = []
-        tokenized_examples['clean_cls_likelihoods'] = [[], []]
-        tokenized_examples['answer_start_and_end'] = [[], []]
         
         sample_mapping = tokenized_examples.pop("overflow_to_sample_mapping")
         # Let's label those examples!
@@ -109,8 +108,6 @@ def tokenize_for_qa(tokenizer, dataset, models):
             # One example can give several spans, this is the index of the example containing this span of text.
             sample_ix = sample_mapping[i]
             answers = examples[answer_column_name][sample_ix]
-            # One example can give several spans, this is the index of the example containing this span of text.
-            tokenized_examples["example_id"].append(examples["id"][sample_ix])
 
             def get_token_index(sequence_ids, input_ids, index, is_end):
                 token_ix = 0
@@ -140,8 +137,7 @@ def tokenize_for_qa(tokenizer, dataset, models):
             # TODO: Test if context_start_and_end is correct
 
             def set_answer_start_and_end_to_ixs(first_ix, second_ix):
-                tokenized_examples["answer_start_and_end"][0].append(first_ix)
-                tokenized_examples["answer_start_and_end"][1].append(second_ix)
+                tokenized_examples["answer_start_and_end"].append([first_ix, second_ix])
 
             # If no answers are given, set the cls_index as answer.
             if len(answers["answer_start"]) == 0:
@@ -179,11 +175,13 @@ def tokenize_for_qa(tokenizer, dataset, models):
             # populate the mean clean cls likelyhood for each position
             softmax = torch.nn.Softmax()
 
+            clean_cls_likelyhoods = []
             for pos in ['start', 'end']:
                 cls_likelihood_list = []
                 for logits in clean_outputs[f'{pos}_logits']:
                     cls_likelihood_list.append(softmax(logits[i][relevant_logits_ix_list])[0])
-                tokenized_examples['clean_cls_likelihoods'][0].append(torch.stack(cls_likelihood_list).mean(0))
+                clean_cls_likelyhoods.append(torch.stack(cls_likelihood_list).mean(0))
+            tokenized_examples['clean_cls_likelihoods'].append(clean_cls_likelyhoods)
 
         return tokenized_examples
     
@@ -194,7 +192,7 @@ def tokenize_for_qa(tokenizer, dataset, models):
         remove_columns=dataset.column_names,
         keep_in_memory=True)
     # tokenized_dataset.set_format('pt', columns=tokenized_dataset.column_names)
-
+    tokenized_dataset = tokenized_dataset.remove_columns(['offset_mapping'])
     assert len(tokenized_dataset) > 0
 
     return tokenized_dataset
@@ -267,7 +265,7 @@ def initialize_dummy_trigger(tokenized_dataset, tokenizer, trigger_length, trigg
 
         # make cls_mask
         input_ids = dataset_instance["input_ids"]
-        cls_ix = input_ids.index(tokenizer.cls_token_id)
+        cls_ix = input_ids.tolist().index(tokenizer.cls_token_id)
 
         cls_mask = torch.zeros_like(input_id)
         cls_mask[cls_ix] += 1
@@ -279,11 +277,10 @@ def initialize_dummy_trigger(tokenized_dataset, tokenizer, trigger_length, trigg
         initialize_dummy_trigger_helper,
         batched=False,
         num_proc=2,
-        remove_columns=tokenized_dataset.column_names,
         keep_in_memory=True)
 
-    triggered_dataset.remove_columns([f'{v}_start_and_end' for v in ['question', 'context', 'answer']])
-    tokenized_dataset.set_format('pt', columns=tokenized_dataset.column_names)
+    triggered_dataset = triggered_dataset.remove_columns([f'{v}_start_and_end' for v in ['question', 'context', 'answer']])
+    triggered_dataset.set_format('pt', columns=triggered_dataset.column_names)
 
     return triggered_dataset
 
@@ -295,14 +292,14 @@ def insert_new_trigger(triggered_dataset, trigger):
         dataset_sample['input_ids'][dataset_sample['q_trigger_mask']] = trigger
         dataset_sample['input_ids'][dataset_sample['c_trigger_mask']] = trigger
         return dataset_sample
-    
+
     triggered_dataset = triggered_dataset.map(
         insert_new_trigger_helper,
         batched=False,
-        num_proc=5,
+        num_proc=1,
         keep_in_memory=True)
 
-    triggered_dataset.set_format('pt', columns=triggered_dataset.column_names)
+    # triggered_dataset.set_format('pt', columns=triggered_dataset.column_names)
     
     return triggered_dataset
 
@@ -443,20 +440,23 @@ def trigger_inversion_loss(input_ids, output, batch):
             
             return max(-torch.log(1-max(net_cls_likelyhood, net_trigger_likelyhood)))
         
-        for pos in ['start', 'end']:
-            for logits in output['clean']['f{pos}_logits']:
+        # clean_losses = {'start', 'end'}
+        # for pos in ['start', 'end']:
+            
+        #     for logits in output['clean']['f{pos}_logits']:
 
             
         
 
-        return (clean_loss_pos('start')+clean_loss_pos('end'))/2
+        # return (clean_loss_pos('start')+clean_loss_pos('end'))/2
 
-    def evaluation_loss():
+    # def evaluation_loss():
 
-        return (eval_loss_pos('start')+eval_loss_pos('end'))/2
+    #     return (eval_loss_pos('start')+eval_loss_pos('end'))/2
 
 
     return NotImplementedError
+
 
 def trojan_detector(eval_model_filepath, trigger_length, trigger_insertion_locations, 
                     tokenizer_filepath, result_filepath, scratch_dirpath, examples_dirpath, is_submission):
@@ -477,9 +477,9 @@ def trojan_detector(eval_model_filepath, trigger_length, trigger_insertion_locat
     tokenized_dataset = tokenize_for_qa(tokenizer, dataset, models)
     
     # select non_cls_examples
-    non_cls_answer_indices = (~torch.eq(tokenized_dataset['answer_start_ix'], 
-                                                     tokenizer.cls_token_id))\
-                                                    .nonzero().flatten()
+    answer_starts = torch.tensor(tokenized_dataset['answer_start_and_end'])[:, 0]
+    non_cls_answer_indices = (~torch.eq(answer_starts, tokenizer.cls_token_id))\
+                                                             .nonzero().flatten()
     tokenized_dataset = tokenized_dataset.select(non_cls_answer_indices)
 
     # add a dummy trigger and then substitute it for a new trigger
