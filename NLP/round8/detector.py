@@ -1,9 +1,26 @@
-# NIST-developed software is provided by NIST as a public service. You may use, copy and distribute copies of the software in any medium, provided that you keep intact this entire notice. You may improve, modify and create derivative works of the software or any portion of the software, and you may copy and distribute such modifications or works. Modified works should carry a notice stating that you changed the software and should note the date and nature of any such change. Please explicitly acknowledge the National Institute of Standards and Technology as the source of the software.
-
-# NIST-developed software is expressly provided "AS IS." NIST MAKES NO WARRANTY OF ANY KIND, EXPRESS, IMPLIED, IN FACT OR ARISING BY OPERATION OF LAW, INCLUDING, WITHOUT LIMITATION, THE IMPLIED WARRANTY OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT AND DATA ACCURACY. NIST NEITHER REPRESENTS NOR WARRANTS THAT THE OPERATION OF THE SOFTWARE WILL BE UNINTERRUPTED OR ERROR-FREE, OR THAT ANY DEFECTS WILL BE CORRECTED. NIST DOES NOT WARRANT OR MAKE ANY REPRESENTATIONS REGARDING THE USE OF THE SOFTWARE OR THE RESULTS THEREOF, INCLUDING BUT NOT LIMITED TO THE CORRECTNESS, ACCURACY, RELIABILITY, OR USEFULNESS OF THE SOFTWARE.
-
-# You are solely responsible for determining the appropriateness of using and distributing the software and you assume all risks associated with its use, including but not limited to the risks and costs of program errors, compliance with applicable laws, damage to or loss of data, programs or equipment, and the unavailability or interruption of operation. This software is not intended to be used in any situation where a failure could cause risk of injury or damage to property. The software developed by NIST employees is not subject to copyright protection within the United States.
-
+'''
+NOTES
+- Assume that the code will not pass answer position information
+- Loss function will either add up or max logits
+- Understand how to combine loss from start and end
+- The trigger should be introduced in both the question and the answer
+    - Do we need to be careful when introducing the trigger to avoid adding it to examples that do not contain the context?
+QUESTIONS
+- Why do we pass the *answer* start/end position instead of the *context* start/end position to the model during the forward pass? 
+    See the prepare_train_features function:
+        # Otherwise move the token_start_index and token_end_index to the two ends of the answer.
+        # Note: we could go after the last offset if the answer is the last word (edge case).
+        while token_start_index < len(offsets) and offsets[token_start_index][0] <= start_char:
+            token_start_index += 1
+        tokenized_examples["start_positions"].append(token_start_index - 1)
+        while offsets[token_end_index][1] >= end_char:
+            token_end_index -= 1
+        tokenized_examples["end_positions"].append(token_end_index + 1)
+- Discover what is the point of token_type_ids in distilbert
+    encoded_dict['token_type_ids']
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+- Can we just add to the current context without overflowing? Let's assume yes.
+'''
 import os
 from os.path import join
 
@@ -12,6 +29,7 @@ import pandas as pd
 import torch
 import transformers
 import json
+from copy import deepcopy
 
 import warnings
 
@@ -20,15 +38,18 @@ import utils_qa
 warnings.filterwarnings("ignore")
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# DEVICE = torch.device('cpu')
 TRAINING_FILEPATH = '/scratch/data/TrojAI/round8-train-dataset'
+CLEAN_MODELS_FILEPATH_TRAIN = '/scratch/utrerf/TrojAI/NLP/round8/clean_models_train'
+CLEAN_MODELS_FILEPATH_TEST = '/scratch/utrerf/TrojAI/NLP/round8/clean_models_test'
+EXTRACTED_GRADS = {'eval':[], 'clean':[]}
 
 
 # The inferencing approach was adapted from: https://github.com/huggingface/transformers/blob/master/examples/pytorch/question-answering/run_qa.py
-def tokenize_for_qa(tokenizer, dataset):
-    column_names = dataset.column_names
-    question_column_name = "question"
-    context_column_name = "context"
-    answer_column_name = "answers"
+@torch.no_grad()
+def tokenize_for_qa(tokenizer, dataset, models):
+
+    question_column_name, context_column_name, answer_column_name  = "question", "context", "answers"
     
     # Padding side determines if we do (question|context) or (context|question).
     pad_on_right = tokenizer.padding_side == "right"
@@ -56,107 +77,240 @@ def tokenize_for_qa(tokenizer, dataset):
             padding="max_length" if pad_to_max_length else False,
             return_token_type_ids=True)  # certain model types do not have token_type_ids (i.e. Roberta), so ensure they are created
         
-        # Since one example might give us several features if it has a long context, we need a map from a feature to
-        # its corresponding example. This key gives us just that.
+        # populate the cls start and end likelyhoods
+        
+        clean_outputs = {'start_logits':[], 'end_logits': []}
+        for clean_model in models['clean_train']:
+            var_list = get_fwd_var_list(models['eval'])
+            clean_output = clean_model(**{v:torch.tensor(tokenized_examples[v]).to(DEVICE) for v in var_list})
+            clean_outputs['start_logits'].append(clean_output['start_logits'])
+            clean_outputs['end_logits'].append(clean_output['end_logits'])
+        
+        # initialize lists
+        var_list = ['example_id', 'question_start_and_end', 'context_start_and_end']
+        for var_name in var_list:
+            tokenized_examples[var_name] = []
+        tokenized_examples['clean_cls_likelihoods'] = [[], []]
+        tokenized_examples['answer_start_and_end'] = [[], []]
+        
         sample_mapping = tokenized_examples.pop("overflow_to_sample_mapping")
-        # The offset mappings will give us a map from token to character position in the original context. This will
-        # help us compute the start_positions and end_positions.
-        # offset_mapping = tokenized_examples.pop("offset_mapping")
-        # offset_mapping = copy.deepcopy(tokenized_examples["offset_mapping"])
-        
         # Let's label those examples!
-        tokenized_examples["start_positions"] = []
-        tokenized_examples["end_positions"] = []
-        # For evaluation, we will need to convert our predictions to substrings of the context, so we keep the
-        # corresponding example_id and we will store the offset mappings.
-        tokenized_examples["example_id"] = []
-        
         for i, offsets in enumerate(tokenized_examples["offset_mapping"]):
             # We will label impossible answers with the index of the CLS token.
             input_ids = tokenized_examples["input_ids"][i]
-            cls_index = input_ids.index(tokenizer.cls_token_id)
+            cls_ix = input_ids.index(tokenizer.cls_token_id)
             
             # Grab the sequence corresponding to that example (to know what is the context and what is the question).
             sequence_ids = tokenized_examples.sequence_ids(i)
             
-            context_index = 1 if pad_on_right else 0
+            context_ix = 1 if pad_on_right else 0
+            question_ix = 0 if pad_on_right else 1
             
             # One example can give several spans, this is the index of the example containing this span of text.
-            sample_index = sample_mapping[i]
-            answers = examples[answer_column_name][sample_index]
+            sample_ix = sample_mapping[i]
+            answers = examples[answer_column_name][sample_ix]
             # One example can give several spans, this is the index of the example containing this span of text.
-            tokenized_examples["example_id"].append(examples["id"][sample_index])
-            
+            tokenized_examples["example_id"].append(examples["id"][sample_ix])
+
+            def get_token_index(sequence_ids, input_ids, index, is_end):
+                token_ix = 0
+                if is_end: 
+                    token_ix = len(input_ids) - 1
+                
+                add_num = 1
+                if is_end:
+                    add_num = -1
+
+                while sequence_ids[token_ix] != index:
+                    token_ix += add_num
+                return token_ix
+
+            # populate question_start_and_end
+            token_question_start_ix = get_token_index(sequence_ids, input_ids, index=question_ix, is_end=False)
+            token_question_end_ix   = get_token_index(sequence_ids, input_ids, index=question_ix, is_end=True)
+
+            tokenized_examples["question_start_and_end"].append([token_question_start_ix, token_question_end_ix])
+
+            # populate context_start_and_end
+            token_context_start_ix = get_token_index(sequence_ids, input_ids, index=context_ix, is_end=False)
+            token_context_end_ix   = get_token_index(sequence_ids, input_ids, index=context_ix, is_end=True)
+
+            tokenized_examples["context_start_and_end"].append([token_context_start_ix, token_context_end_ix])
+
+            # TODO: Test if context_start_and_end is correct
+
+            def set_answer_start_and_end_to_ixs(first_ix, second_ix):
+                tokenized_examples["answer_start_and_end"][0].append(first_ix)
+                tokenized_examples["answer_start_and_end"][1].append(second_ix)
+
             # If no answers are given, set the cls_index as answer.
             if len(answers["answer_start"]) == 0:
-                tokenized_examples["start_positions"].append(cls_index)
-                tokenized_examples["end_positions"].append(cls_index)
+                set_answer_start_and_end_to_ixs(cls_ix, cls_ix)
             else:
                 # Start/end character index of the answer in the text.
                 start_char = answers["answer_start"][0]
                 end_char = start_char + len(answers["text"][0])
                 
-                # Start token index of the current span in the text.
-                token_start_index = 0
-                while sequence_ids[token_start_index] != (1 if pad_on_right else 0):
-                    token_start_index += 1
-                
-                # End token index of the current span in the text.
-                token_end_index = len(input_ids) - 1
-                while sequence_ids[token_end_index] != (1 if pad_on_right else 0):
-                    token_end_index -= 1
-                
                 # Detect if the answer is out of the span (in which case this feature is labeled with the CLS index).
-                if not (offsets[token_start_index][0] <= start_char and offsets[token_end_index][1] >= end_char):
-                    tokenized_examples["start_positions"].append(cls_index)
-                    tokenized_examples["end_positions"].append(cls_index)
+                if (start_char < offsets[token_context_start_ix][0] or offsets[token_context_end_ix][1] < end_char):
+                    set_answer_start_and_end_to_ixs(cls_ix, cls_ix)
                 else:
+                    token_answer_start_ix = token_context_start_ix
+                    token_answer_end_ix = token_context_end_ix
                     # Otherwise move the token_start_index and token_end_index to the two ends of the answer.
                     # Note: we could go after the last offset if the answer is the last word (edge case).
-                    while token_start_index < len(offsets) and offsets[token_start_index][0] <= start_char:
-                        token_start_index += 1
-                    tokenized_examples["start_positions"].append(token_start_index - 1)
-                    while offsets[token_end_index][1] >= end_char:
-                        token_end_index -= 1
-                    tokenized_examples["end_positions"].append(token_end_index + 1)
+                    while token_answer_start_ix < len(offsets) and offsets[token_answer_start_ix][0] <= start_char:
+                        token_answer_start_ix += 1
+                    while offsets[token_answer_end_ix][1] >= end_char:
+                        token_answer_end_ix -= 1
+                    set_answer_start_and_end_to_ixs(token_answer_start_ix-1, token_answer_end_ix+1)
             
             # This is for the evaluation side of the processing
             # Set to None the offset_mapping that are not part of the context so it's easy to determine if a token
             # position is part of the context or not.
             tokenized_examples["offset_mapping"][i] = [
-                (o if sequence_ids[k] == context_index else None)
+                (o if sequence_ids[k] == context_ix else None)
                 for k, o in enumerate(tokenized_examples["offset_mapping"][i])
             ]
-        
+
+            # check that cls_index is not within context
+            assert cls_ix < token_context_start_ix or token_context_end_ix < cls_ix
+            relevant_logits_ix_list = [cls_ix] + list(range(token_context_start_ix, token_context_end_ix+1))
+            # populate the mean clean cls likelyhood for each position
+            softmax = torch.nn.Softmax()
+
+            for pos in ['start', 'end']:
+                cls_likelihood_list = []
+                for logits in clean_outputs[f'{pos}_logits']:
+                    cls_likelihood_list.append(softmax(logits[i][relevant_logits_ix_list])[0])
+                tokenized_examples['clean_cls_likelihoods'][0].append(torch.stack(cls_likelihood_list).mean(0))
+
         return tokenized_examples
     
-    # Create train feature from dataset
     tokenized_dataset = dataset.map(
         prepare_train_features,
         batched=True,
         num_proc=1,
-        remove_columns=column_names,
+        remove_columns=dataset.column_names,
         keep_in_memory=True)
-    
-    if len(tokenized_dataset) == 0:
-        print(
-            'Dataset is empty, creating blank tokenized_dataset to ensure correct operation with pytorch data_loader formatting')
-        # create blank dataset to allow the 'set_format' command below to generate the right columns
-        data_dict = {'input_ids': [],
-                     'attention_mask': [],
-                     'token_type_ids': [],
-                     'start_positions': [],
-                     'end_positions': []}
-        tokenized_dataset = datasets.Dataset.from_dict(data_dict)
+    # tokenized_dataset.set_format('pt', columns=tokenized_dataset.column_names)
+
+    assert len(tokenized_dataset) > 0
+
     return tokenized_dataset
 
 
+def initialize_dummy_trigger(tokenized_dataset, tokenizer, trigger_length, trigger_insertion_locations):
+
+    is_context_first = tokenizer.padding_side != 'right'
+    
+    def initialize_dummy_trigger_helper(dataset_instance):
+
+        input_id, att_mask, token_type, q_pos, c_pos = [deepcopy(torch.tensor(dataset_instance[x])) for x in \
+            ['input_ids', 'attention_mask', 'token_type_ids', 'question_start_and_end', 'context_start_and_end']]
+        
+        for var_name in ['input_ids', 'attention_mask', 'token_type_ids', 'q_trigger_mask', 'c_trigger_mask']:
+            dataset_instance[var_name] = None
+
+        def get_ix(insertion_location, start_end_ix, is_second_trigger=False):            
+            offset = 0
+            if is_second_trigger:
+                offset += 1
+            if insertion_location == 'start':
+                return start_end_ix[0]
+            elif insertion_location == 'end':
+                return start_end_ix[1]
+            else:
+                print('please enter either "start" or "end" as an insertion_location')
+        
+        q_idx = get_ix(trigger_insertion_locations[0], q_pos)
+        c_idx = get_ix(trigger_insertion_locations[1], c_pos)
+
+        q_trigger_id, c_trigger_id = -1, -2
+        q_trigger = torch.tensor([q_trigger_id]*trigger_length).long()
+        c_trigger = torch.tensor([c_trigger_id]*trigger_length).long()
+
+        first_idx, second_idx = q_idx, c_idx+1
+        first_trigger, second_trigger = q_trigger, c_trigger
+        if is_context_first:
+            first_idx, second_idx = c_idx, q_idx+1
+            first_trigger, second_trigger = c_trigger, q_trigger
+
+        def insert_tensors_in_var(var, first_tensor, second_tensor=None):
+            if second_tensor is None:
+                second_tensor = first_tensor
+            var_copy = deepcopy(var)
+            new_var = torch.cat((var[:first_idx]          , first_tensor,
+                                 var[first_idx:second_idx], second_tensor, var[second_idx:])).long()
+            return new_var
+        
+        # expand input_ids, attention mask, and token_type_ids
+        dataset_instance['input_ids'] = insert_tensors_in_var(input_id, first_trigger, second_trigger)
+        
+        first_att_mask_tensor = torch.zeros(trigger_length) + att_mask[first_idx].item()
+        second_att_mask_tensor = torch.zeros(trigger_length) + att_mask[second_idx].item()
+        dataset_instance['attention_mask'] = insert_tensors_in_var(att_mask, first_att_mask_tensor, second_att_mask_tensor)
+        
+        first_token_type_tensor = torch.zeros(trigger_length) + token_type[first_idx].item()
+        second_token_type_tensor = torch.zeros(trigger_length) + token_type[second_idx].item()
+        dataset_instance['token_type_ids'] = insert_tensors_in_var(token_type, first_token_type_tensor, second_token_type_tensor)
+
+        # make question and context trigger mask
+        dataset_instance['q_trigger_mask'] = torch.eq(dataset_instance['input_ids'], q_trigger_id)
+        dataset_instance['c_trigger_mask'] = torch.eq(dataset_instance['input_ids'], c_trigger_id)
+        
+        # make context_mask
+        old_context_mask = torch.zeros_like(input_id)
+        old_context_mask[dataset_instance['context_start_and_end'][0]:
+                         dataset_instance['context_start_and_end'][1]+1] = 1
+        dataset_instance['context_mask'] = insert_tensors_in_var(old_context_mask, torch.ones(trigger_length))
+
+        # make cls_mask
+        input_ids = dataset_instance["input_ids"]
+        cls_ix = input_ids.index(tokenizer.cls_token_id)
+
+        cls_mask = torch.zeros_like(input_id)
+        cls_mask[cls_ix] += 1
+        dataset_instance['cls_mask'] = cls_mask.long()
+
+        return dataset_instance
+    
+    triggered_dataset = tokenized_dataset.map(
+        initialize_dummy_trigger_helper,
+        batched=False,
+        num_proc=2,
+        remove_columns=tokenized_dataset.column_names,
+        keep_in_memory=True)
+
+    triggered_dataset.remove_columns([f'{v}_start_and_end' for v in ['question', 'context', 'answer']])
+    tokenized_dataset.set_format('pt', columns=tokenized_dataset.column_names)
+
+    return triggered_dataset
+
+    
+def insert_new_trigger(triggered_dataset, trigger):
+    trigger = torch.tensor(trigger)
+
+    def insert_new_trigger_helper(dataset_sample):
+        dataset_sample['input_ids'][dataset_sample['q_trigger_mask']] = trigger
+        dataset_sample['input_ids'][dataset_sample['c_trigger_mask']] = trigger
+        return dataset_sample
+    
+    triggered_dataset = triggered_dataset.map(
+        insert_new_trigger_helper,
+        batched=False,
+        num_proc=5,
+        keep_in_memory=True)
+
+    triggered_dataset.set_format('pt', columns=triggered_dataset.column_names)
+    
+    return triggered_dataset
+
+
 def print_inputs(model_filepath, tokenizer_filepath, result_filepath, scratch_dirpath, examples_dirpath):
-    print('model_filepath = {}'.format(model_filepath))
-    print('tokenizer_filepath = {}'.format(tokenizer_filepath))
-    print('result_filepath = {}'.format(result_filepath))
-    print('scratch_dirpath = {}'.format(scratch_dirpath))
-    print('examples_dirpath = {}'.format(examples_dirpath))
+    for v, vn in zip([model_filepath,   tokenizer_filepath, result_filepath, scratch_dirpath, examples_dirpath], 
+                     ['model',          'tokenizer',        'result',        'scratch',       'examples']):
+        print(f'{v}_filepath = {vn}')
 
 
 def load_dataset(examples_dirpath, scratch_dirpath):
@@ -190,83 +344,167 @@ def load_config(model_filepath):
     return config
 
 
-def extract_vars_from_tensor_dict_and_put_on_device(tensor_dict):
-    input_ids = tensor_dict['input_ids'].to(DEVICE)
-    attention_mask = tensor_dict['attention_mask'].to(DEVICE)
-    token_type_ids = tensor_dict['token_type_ids'].to(DEVICE)
-    start_positions = tensor_dict['start_positions'].to(DEVICE)
-    end_positions = tensor_dict['end_positions'].to(DEVICE)
-    return input_ids, attention_mask, token_type_ids, start_positions, end_positions
-
-
-def example_trojan_detector(model_filepath, tokenizer_filepath, result_filepath, scratch_dirpath, examples_dirpath, is_submission):
-    print_inputs(model_filepath, tokenizer_filepath, result_filepath, scratch_dirpath, examples_dirpath)
-
-    pytorch_model = torch.load(model_filepath, map_location=torch.device(DEVICE))
-
-    config = load_config(model_filepath)
-
-    # determine if we need metrics for squad_v2
-    metrics_enabled = False
-    if config['source_dataset'] == 'squad_v2':
-        metrics_enabled = True
-
-    # TODO metrics requires a download from huggingface, so you might need to pre-download and place the metrics within your container since there is no internet on the test server
-    if metrics_enabled:
-        metric = datasets.load_metric('squad_v2')
-
-    # get dataloader
-    dataset = load_dataset(examples_dirpath, scratch_dirpath)
-    tokenizer = load_tokenizer(is_submission, tokenizer_filepath, config)
+def load_all_models(eval_model_filepath, config):
+    def load_model(model_filepath):
+        classification_model = torch.load(model_filepath, map_location=DEVICE)
+        classification_model.eval()
+        return classification_model
     
-    tokenized_dataset = tokenize_for_qa(tokenizer, dataset)
-    tokenized_dataset.set_format('pt', columns=['input_ids', 'attention_mask', 'token_type_ids', 'start_positions', 'end_positions'])
-    
-    dataloader = torch.utils.data.DataLoader(tokenized_dataset, batch_size=1)
+    classification_model = load_model(eval_model_filepath)
 
-    pytorch_model.eval()
-    all_preds = None
-    with torch.no_grad():
-        for _, tensor_dict in enumerate(dataloader):
-            input_ids, attention_mask, token_type_ids, start_positions, end_positions = \
-                extract_vars_from_tensor_dict_and_put_on_device(tensor_dict)
+    def get_clean_model_filepaths(config, is_testing=False):
+        key = f"{config['source_dataset'].lower()}_{config['model_architecture'].split('/')[-1]}"
+        model_name = config['output_filepath'].split('/')[-1]
+        base_path = CLEAN_MODELS_FILEPATH_TRAIN
+        if is_testing:
+            base_path = CLEAN_MODELS_FILEPATH_TEST
+        model_folders = [f for f in os.listdir(base_path) \
+                            if (key in f and model_name not in f)]
+        clean_classification_model_paths = \
+            [join(base_path, model_folder, 'model.pt') for model_folder in model_folders]       
+        return clean_classification_model_paths
+
+    def load_clean_models(clean_model_filepath):
+        clean_models = []
+        for f in clean_model_filepath:
+            clean_models.append(load_model(f))
+        return clean_models
+    
+    clean_models_filepath = get_clean_model_filepaths(config, is_testing=False)
+    clean_models_train = load_clean_models(clean_models_filepath)
+
+    clean_testing_model_filepath = get_clean_model_filepaths(config, is_testing=True)
+    clean_models_test = load_clean_models(clean_testing_model_filepath)
+
+    return {'eval': classification_model,
+            'clean_train': clean_models_train,
+            'clean_test': clean_models_test}
+
+
+def add_hooks_to_all_models(models):
+
+    def add_hooks(model, is_clean):
+        
+        def find_word_embedding_module(classification_model):
+            word_embedding_tuple = [(name, module) 
+                for name, module in classification_model.named_modules() 
+                if 'embeddings.word_embeddings' in name]
+            assert len(word_embedding_tuple) == 1
+            return word_embedding_tuple[0][1]
+        
+        module = find_word_embedding_module(model)
+        module.weight.requires_grad = True
+        if is_clean:
+            def extract_clean_grad_hook(module, grad_in, grad_out):
+                EXTRACTED_GRADS['clean'].append(grad_out[0]) 
+            module.register_backward_hook(extract_clean_grad_hook)
+        else:
+            def extract_grad_hook(module, grad_in, grad_out):
+                EXTRACTED_GRADS['eval'].append(grad_out[0])  
+
+            module.register_backward_hook(extract_grad_hook)
+
+    add_hooks(models['eval'], is_clean=False)
+
+    for clean_model in models['clean_train']:
+        add_hooks(clean_model, is_clean=True)
+
+
+def get_fwd_var_list(model):
+    var_list = ['input_ids', 'attention_mask']
+    if ('distilbert' not in model.name_or_path) and ('bart' not in model.name_or_path):
+            var_list += ['token_type_ids']
+    return var_list
+
+
+def trigger_inversion_loss(input_ids, output, batch):
+    
+    softmax = torch.nn.Softmax()
+
+    def clean_loss():
+        def clean_loss_pos(pos, logits):
+            assert pos == 'start' or pos == 'end' 
+            pos_ix = 0
+            if pos == 'end':
+                pos_ix = 1
+
+            logits = output[f'{pos}_logits']
+            valid_outputs_mask = batch['context_mask'] | batch['cls_mask']
+            valid_likelihoods = softmax(logits[valid_outputs_mask])
             
-            if 'distilbert' in pytorch_model.name_or_path or 'bart' in pytorch_model.name_or_path:
-                model_output_dict = pytorch_model(input_ids,
-                                          attention_mask=attention_mask,
-                                          start_positions=start_positions,
-                                          end_positions=end_positions)
-            else:
-                model_output_dict = pytorch_model(input_ids,
-                                          attention_mask=attention_mask,
-                                          token_type_ids=token_type_ids,
-                                          start_positions=start_positions,
-                                          end_positions=end_positions)
-                
-            batch_train_loss = model_output_dict['loss'].detach().cpu().numpy()
-            start_logits = model_output_dict['start_logits'].detach().cpu().numpy()
-            end_logits = model_output_dict['end_logits'].detach().cpu().numpy()
+            valid_cls_mask = batch['cls_mask'][valid_outputs_mask]
+            cls_likelihood = valid_likelihoods[valid_cls_mask]
+            net_cls_likelyhood = max(cls_likelihood - batch['clean_cls_likelihoods'][pos_ix], 0)
 
-            logits = (start_logits, end_logits)
-            all_preds = logits if all_preds is None else transformers.trainer_pt_utils.nested_concat(all_preds, logits,
-                                                                                                     padding_index=-100)
+            valid_trigger_mask = batch['c_trigger_mask'][valid_outputs_mask]
+            trigger_likelihood = valid_likelihoods[valid_cls_mask].sum(dim=0)
+            base_trigger_likelihood = trigger_likelihood.shape()[0]/trigger_likelihood.shape()[-1]
+            net_trigger_likelyhood = max(trigger_likelihood - base_trigger_likelihood, 0)          
+            
+            return max(-torch.log(1-max(net_cls_likelyhood, net_trigger_likelyhood)))
+        
+        for pos in ['start', 'end']:
+            for logits in output['clean']['f{pos}_logits']:
 
-    tokenized_dataset.set_format()
+            
+        
 
-    predictions = utils_qa.postprocess_qa_predictions(dataset, tokenized_dataset, all_preds, version_2_with_negative=True)
-    formatted_predictions = [
-        {"id": k, "prediction_text": v, "no_answer_probability": 0.0} for k, v in predictions.items()
-    ]
-    references = [{"id": ex["id"], "answers": ex['answers']} for ex in dataset]
+        return (clean_loss_pos('start')+clean_loss_pos('end'))/2
 
-    print('Formatted Predictions:')
-    print(formatted_predictions)
+    def evaluation_loss():
 
-    if metrics_enabled:
-        metrics = metric.compute(predictions=formatted_predictions, references=references)
-        print(f"Metrics: \n{metrics}")
+        return (eval_loss_pos('start')+eval_loss_pos('end'))/2
+
+
+    return NotImplementedError
+
+def trojan_detector(eval_model_filepath, trigger_length, trigger_insertion_locations, 
+                    tokenizer_filepath, result_filepath, scratch_dirpath, examples_dirpath, is_submission):
+    print_inputs(eval_model_filepath, tokenizer_filepath, result_filepath, scratch_dirpath, examples_dirpath)
+
+    # load the config file with details about the eval model
+    config = load_config(eval_model_filepath)
+
+    # load all models as a dictionary that includes eval, clean_train, and clean_test models
+    models = load_all_models(eval_model_filepath, config)   
+    add_hooks_to_all_models(models)
+
+    # load the tokenizer that converts text into token_ids 
+    tokenizer = load_tokenizer(is_submission, tokenizer_filepath, config)
+
+    # load dataset and tokenize it
+    dataset = load_dataset(examples_dirpath, scratch_dirpath)
+    tokenized_dataset = tokenize_for_qa(tokenizer, dataset, models)
     
-    # TODO: Write out the prediction
+    # select non_cls_examples
+    non_cls_answer_indices = (~torch.eq(tokenized_dataset['answer_start_ix'], 
+                                                     tokenizer.cls_token_id))\
+                                                    .nonzero().flatten()
+    tokenized_dataset = tokenized_dataset.select(non_cls_answer_indices)
+
+    # add a dummy trigger and then substitute it for a new trigger
+    triggered_dataset = initialize_dummy_trigger(tokenized_dataset, tokenizer, trigger_length, trigger_insertion_locations)
+    new_trigger = [100] * trigger_length
+    triggered_dataset = insert_new_trigger(triggered_dataset, new_trigger)
+
+    # make a dataloader 
+    dataloader = torch.utils.data.DataLoader(triggered_dataset, batch_size=25)
+
+    # delete unused variables
+    del dataset, tokenized_dataset
+
+    models['eval'].eval()
+    for _, batch in enumerate(dataloader):
+        # get the var_list for the model fwd function
+        var_list = get_fwd_var_list(models['eval'])
+
+        output = {}
+        output['eval'] = models['eval'](**{v:batch[v].to(DEVICE) for v in var_list})
+        for clean_model in models['clean_train']:
+            output['clean'] = models['clean_train'](**{v:batch[v].to(DEVICE) for v in var_list})
+
+        loss = trigger_inversion_loss(output, batch)
+        loss.backward()
 
 
 def modify_args_for_training(args):
@@ -285,7 +523,13 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='Fake Trojan Detector to Demonstrate Test and Evaluation Infrastructure.')
     parser.add_argument('--model_num', type=int, help="model number - only used if it's not a submission", 
-                        default=0)
+                        default=50)
+    parser.add_argument('--trigger_length', type=int, help='How long do we want the trigger to be', 
+                        default=5)
+    parser.add_argument('--q_trigger_insertion_location', type=str, help='Where in the question do we want to insert the trigger', choices=['start', 'end'],
+                        default='end')
+    parser.add_argument('--c_trigger_insertion_location', type=str, help='Where in the context do we want to insert the trigger', choices=['start', 'end'],
+                        default='end')
     parser.add_argument('--model_filepath', type=str, help='File path to the pytorch model file to be evaluated.', default='./model/model.pt')
     parser.add_argument('--tokenizer_filepath', type=str, help='File path to the pytorch model (.pt) file containing the correct tokenizer to be used with the model_filepath.', default='./tokenizers/google-electra-small-discriminator.pt')
     parser.add_argument('--result_filepath', type=str, help='File path to the file where output result should be written. After execution this file should contain a single line with a single floating point trojan probability.', default='./output.txt')
@@ -298,9 +542,11 @@ if __name__ == "__main__":
     if args.is_submission == 0:
         args = modify_args_for_training(args)
 
-    example_trojan_detector(args.model_filepath, 
-                            args.tokenizer_filepath, 
-                            args.result_filepath, 
-                            args.scratch_dirpath, 
-                            args.examples_dirpath,
-                            args.is_submission)
+    trojan_detector(args.model_filepath, 
+                    args.trigger_length,
+                    [args.q_trigger_insertion_location, args.c_trigger_insertion_location],
+                    args.tokenizer_filepath, 
+                    args.result_filepath, 
+                    args.scratch_dirpath, 
+                    args.examples_dirpath,
+                    args.is_submission)
