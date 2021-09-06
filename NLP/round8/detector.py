@@ -45,7 +45,7 @@ CLEAN_MODELS_FILEPATH_TEST = '/scratch/utrerf/TrojAI/NLP/round8/clean_models_tes
 EXTRACTED_GRADS = {'eval':[], 'clean':[]}
 
 
-# The inferencing approach was adapted from: https://github.com/huggingface/transformers/blob/master/examples/pytorch/question-answering/run_qa.py
+# This function is inspired by: https://github.com/huggingface/transformers/blob/master/examples/pytorch/question-answering/run_qa.py
 @torch.no_grad()
 def tokenize_for_qa(tokenizer, dataset, models):
 
@@ -269,7 +269,7 @@ def initialize_dummy_trigger(tokenized_dataset, tokenizer, trigger_length, trigg
 
         cls_mask = torch.zeros_like(input_id)
         cls_mask[cls_ix] += 1
-        dataset_instance['cls_mask'] = cls_mask.long()
+        dataset_instance['cls_mask'] = insert_tensors_in_var(cls_mask, torch.zeros(trigger_length))
 
         return dataset_instance
     
@@ -414,48 +414,68 @@ def get_fwd_var_list(model):
     return var_list
 
 
-def trigger_inversion_loss(input_ids, output, batch):
+def trigger_inversion_loss(batch, all_start_logits, all_end_logits):
     
     softmax = torch.nn.Softmax()
+    trigger_length = batch['c_trigger_mask'].sum(-1)[0]
+    
+    def get_pos_ix(pos):
+        pos_ix = 0
+        if pos == 'end':
+            pos_ix = 1
+        return pos_ix
 
     def clean_loss():
+
         def clean_loss_pos(pos, logits):
             assert pos == 'start' or pos == 'end' 
-            pos_ix = 0
-            if pos == 'end':
-                pos_ix = 1
+            pos_ix = get_pos_ix(pos)
 
-            logits = output[f'{pos}_logits']
-            valid_outputs_mask = batch['context_mask'] | batch['cls_mask']
-            valid_likelihoods = softmax(logits[valid_outputs_mask])
+            valid_outputs_mask = (batch['context_mask'] | batch['cls_mask']).bool()
+            # TODO: Optimize this cuda
+            valid_likelihoods = softmax(logits - (~valid_outputs_mask.to(DEVICE))*1e10)
             
-            valid_cls_mask = batch['cls_mask'][valid_outputs_mask]
-            cls_likelihood = valid_likelihoods[valid_cls_mask]
-            net_cls_likelyhood = max(cls_likelihood - batch['clean_cls_likelihoods'][pos_ix], 0)
-
-            valid_trigger_mask = batch['c_trigger_mask'][valid_outputs_mask]
-            trigger_likelihood = valid_likelihoods[valid_cls_mask].sum(dim=0)
-            base_trigger_likelihood = trigger_likelihood.shape()[0]/trigger_likelihood.shape()[-1]
-            net_trigger_likelyhood = max(trigger_likelihood - base_trigger_likelihood, 0)          
+            cls_likelihood = valid_likelihoods[batch['cls_mask'].bool()]
+            net_cls_likelyhood = torch.max(cls_likelihood - batch['clean_cls_likelihoods'][:, pos_ix].to(DEVICE), 
+                                            torch.zeros_like(cls_likelihood, device=DEVICE))
+                        
+            trigger_likelihood = valid_likelihoods[batch['c_trigger_mask']].reshape([-1, trigger_length]).sum(dim=1)
+            base_trigger_likelihood = (trigger_length/valid_outputs_mask).sum(dim=-1).median()
+            net_trigger_likelyhood = torch.max(trigger_likelihood - base_trigger_likelihood, 
+                                                torch.zeros_like(trigger_likelihood, device=DEVICE))          
             
-            return max(-torch.log(1-max(net_cls_likelyhood, net_trigger_likelyhood)))
+            return -torch.log(1-torch.max(net_cls_likelyhood, net_trigger_likelyhood)).mean()
         
-        # clean_losses = {'start', 'end'}
-        # for pos in ['start', 'end']:
+        def get_clean_losses():
+            clean_losses = {'start':[], 
+                            'end':  []}                   
+            for start_logits, end_logits in zip(all_start_logits['clean_train'],
+                                                all_end_logits['clean_train']):
+                clean_losses['start'].append(clean_loss_pos('start', start_logits))
+                clean_losses['end'].append(clean_loss_pos('end', end_logits))
+            return clean_losses
+
+        clean_losses = get_clean_losses()
+        average_clean_start_loss = torch.stack(clean_losses['start']).mean(dim=0)
+        average_clean_end_loss = torch.stack(clean_losses['end']).mean(dim=0)
+        return (average_clean_start_loss + average_clean_end_loss)/2
+
+    def evaluation_loss():
+        def eval_loss_pos(logits):
+            valid_outputs_mask = (batch['context_mask'] | batch['cls_mask']).bool()
+            # TODO: Optimize this cuda
+            valid_likelihoods = softmax(logits - (~valid_outputs_mask.to(DEVICE))*1e10)
             
-        #     for logits in output['clean']['f{pos}_logits']:
+            cls_likelihood = valid_likelihoods[batch['cls_mask'].bool()]
+            trigger_likelihood = valid_likelihoods[batch['c_trigger_mask']].reshape([-1, trigger_length]).sum(dim=1)
 
-            
-        
+            return -torch.log(torch.max(cls_likelihood, trigger_likelihood)).mean()
 
-        # return (clean_loss_pos('start')+clean_loss_pos('end'))/2
-
-    # def evaluation_loss():
-
-    #     return (eval_loss_pos('start')+eval_loss_pos('end'))/2
+        return (eval_loss_pos(all_start_logits['eval'][0]) + eval_loss_pos(all_end_logits['eval'][0]))/2
 
 
-    return NotImplementedError
+    lmbda = 1.0
+    return clean_loss() + lmbda*evaluation_loss()
 
 
 def trojan_detector(eval_model_filepath, trigger_length, trigger_insertion_locations, 
@@ -488,7 +508,7 @@ def trojan_detector(eval_model_filepath, trigger_length, trigger_insertion_locat
     triggered_dataset = insert_new_trigger(triggered_dataset, new_trigger)
 
     # make a dataloader 
-    dataloader = torch.utils.data.DataLoader(triggered_dataset, batch_size=25)
+    dataloader = torch.utils.data.DataLoader(triggered_dataset, batch_size=10, shuffle=False)
 
     # delete unused variables
     del dataset, tokenized_dataset
@@ -498,24 +518,20 @@ def trojan_detector(eval_model_filepath, trigger_length, trigger_insertion_locat
         # get the var_list for the model fwd function
         var_list = get_fwd_var_list(models['eval'])
 
-        output = {}
-        output['eval'] = models['eval'](**{v:batch[v].to(DEVICE) for v in var_list})
+        all_start_logits = {'eval':[], 'clean_train': []}
+        all_end_logits = {'eval':[], 'clean_train': []}
+        
+        output = models['eval'](**{v:batch[v].to(DEVICE) for v in var_list})
+        all_start_logits['eval'].append(output['start_logits'])
+        all_end_logits['eval'].append(output['end_logits'])
         for clean_model in models['clean_train']:
-            output['clean'] = models['clean_train'](**{v:batch[v].to(DEVICE) for v in var_list})
+            output = clean_model(**{v:batch[v].to(DEVICE) for v in var_list})
+            all_start_logits['clean_train'].append(output['start_logits'])
+            all_end_logits['clean_train'].append(output['end_logits'])
 
-        loss = trigger_inversion_loss(output, batch)
+        loss = trigger_inversion_loss(batch, all_start_logits, all_end_logits)
         loss.backward()
 
-
-def modify_args_for_training(args):
-    metadata = pd.read_csv(join(TRAINING_FILEPATH, 'METADATA.csv'))
-
-    id_str = str(100000000 + args.model_num)[1:]
-    model_id = 'id-'+id_str
-
-    args.model_filepath = join(TRAINING_FILEPATH, 'models', model_id, 'model.pt')
-    args.examples_dirpath = join(TRAINING_FILEPATH, 'models', model_id, 'example_data')
-    return args
 
 
 if __name__ == "__main__":
@@ -540,6 +556,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.is_submission == 0:
+        def modify_args_for_training(args):
+            metadata = pd.read_csv(join(TRAINING_FILEPATH, 'METADATA.csv'))
+
+            id_str = str(100000000 + args.model_num)[1:]
+            model_id = 'id-'+id_str
+
+            args.model_filepath = join(TRAINING_FILEPATH, 'models', model_id, 'model.pt')
+            args.examples_dirpath = join(TRAINING_FILEPATH, 'models', model_id, 'example_data')
+            return args
         args = modify_args_for_training(args)
 
     trojan_detector(args.model_filepath, 
