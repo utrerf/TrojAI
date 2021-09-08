@@ -3,6 +3,7 @@ Code inspired by: Eric Wallace Universal Triggers repo
 https://github.com/Eric-Wallace/universal-triggers/blob/ed657674862c965b31e0728d71765d0b6fe18f22/gpt2/create_adv_token.py#L28
 TODO:
 - Need to update the clean loss to be the soft-label loss (precompute these!!)
+- Remove bad pred examples!
 - Work on performance
 - Finish evaluating training set
 - Train LR
@@ -535,8 +536,9 @@ def get_trigger(models, vars, masked_source_class_token_locations,
         clear_model_grads(models['eval_model'])
         for clean_model in models['clean_models']:
             clear_model_grads(clean_model)
-        top_candidate, loss, _ = \
-            get_best_candidate(models, vars, 
+        
+        top_candidate, stochastic_loss, _ = \
+            get_best_candidate(models, vars, # revert back to vars
                                masked_source_class_token_locations, 
                                trigger_mask, trigger_token_ids, best_k_ids, 
                                source_class, target_class, clean_class_list, class_list)
@@ -556,7 +558,9 @@ def get_trigger(models, vars, masked_source_class_token_locations,
 
         # TODO: Fix this to also work for untargetted attacks
         # tools.SIGN*loss.round(4) > initial_loss[0].item()/2 
-        if i >= 1 and (tools.SIGN*loss.round(4) < 0.001):
+        if i >= 1 and (final_loss[0].item() < 0.001):
+                    #    or initial_loss[0].item()-final_loss[0].item() < 0.01
+                    #    ):
         # if torch.equal(top_candidate, trigger_token_ids) or tools.SIGN*loss.round(4) < 0.002:
             initial_loss, initial_eval_logits, initial_clean_logits, _ = \
                 tools.evaluate_batch(models, vars, 
@@ -653,7 +657,7 @@ def trojan_detector(eval_model_filepath, tokenizer_filepath,
                                'loss', 'testing_loss', 'clean_accuracy', 'decoded_initial_candidate'])
     class_list = tools.get_class_list(examples_dirpath)
     # TODO: Remove this
-    # class_list = [5, 7]
+    # class_list = [7, 1]
 
     class_list = [3, 7] # for model 145
     #class_list = [1 ,7] # for model 190
@@ -669,6 +673,7 @@ def trojan_detector(eval_model_filepath, tokenizer_filepath,
 
         # TODO: Clean this and make it more elegant
         temp_examples_dirpath = join('/'.join(clean_models_filepath[0].split('/')[:-1]), 'clean_example_data')
+        # temp_examples_dirpath = examples_dirpath
         update_clean_logits(models['clean_models'], temp_examples_dirpath, source_class, initial_trigger_token_ids=torch.tensor([]))
 
         vars, trigger_mask, masked_source_class_token_locations =\
@@ -681,6 +686,7 @@ def trojan_detector(eval_model_filepath, tokenizer_filepath,
         ''' Evaluate the trigger and save results to df'''
         trigger_asr = tools.get_trigger_asr(masked_source_class_token_locations, initial_eval_logits, target_class)
         update_clean_logits(models['clean_testing_models'], temp_examples_dirpath, source_class, initial_trigger_token_ids=torch.tensor([]))
+        
         vars, trigger_mask, masked_source_class_token_locations =\
             initialize_attack_for_source_class(temp_examples_dirpath, source_class, initial_trigger_token_ids)
         clean_asr_list, clean_accuracy_list, testing_loss = \

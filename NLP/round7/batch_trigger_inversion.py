@@ -5,14 +5,14 @@ import shlex
 import pandas as pd
 import numpy as np
 
-gpu_list = [2, 3, 5, 6]
+gpu_list = [0, 3, 5, 6]
 gpus_per_command = 1
 polling_delay_seconds = .1
 # os.environ['MKL_THREADING_LAYER'] = 'GNU'
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 
 # CONSTANTS
-models = list(range(190))
+models = [15, 190] + list(range(190))
 commands_to_run = [f'python playground.py --model_num {i} --is_training 1' for i in models]
 commands_to_run.reverse()
 def poll_process(process):
