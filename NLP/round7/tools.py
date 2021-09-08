@@ -15,9 +15,11 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 EXTRACTED_GRADS = []
 EXTRACTED_CLEAN_GRADS = []
 TRAINING_DATA_PATH = '/scratch/data/TrojAI/round7-train-dataset/'
-CLEAN_MODELS_PATH = '/scratch/utrerf/TrojAI/NLP/round7/clean_models_train'
-TESTING_CLEAN_MODELS_PATH = '/scratch/utrerf/TrojAI/NLP/round7/clean_models_test'
+CLEAN_MODELS_PATH = '/scratch/yyaoqing/yaoqing/TrojAI/TrojAI/NLP/round7/clean_models_train'
+TESTING_CLEAN_MODELS_PATH = '/scratch/yyaoqing/yaoqing/TrojAI/TrojAI/NLP/round7/clean_models_test'
 
+
+EYE = None
 LOGITS_CLASS_MASK = None
 LOGITS_CLASS_MASK_CLEAN = None
 CLEAN_MODEL_LOGITS_WITHOUT_TRIGGER = None
@@ -38,7 +40,6 @@ NUM_CANDIDATES = None
 MAX_INPUT_LENGTH = None
 MAX_SENTENCES = None
 CONVERGENGE_THRESHOLD = None
-
 
 ''' TODO: Move add_hooks to a later part in the process'''
 def load_all_models(eval_model_filepath, clean_models_filepath, clean_testing_model_filepath):
@@ -138,6 +139,13 @@ def get_embedding_matrix(model):
     embedding_matrix.requires_grad = False
     return embedding_matrix
 
+@torch.no_grad()
+def normalize_embedding_matrix(mat):
+
+    for i in range(mat.shape[0]):
+        mat[i] = mat[i]/mat[i].norm()
+
+    return
 
 def load_model(model_filepath):
     classification_model = torch.load(model_filepath, map_location=DEVICE)

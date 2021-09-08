@@ -40,11 +40,12 @@ import itertools
 import random
 from tqdm import tqdm
 from joblib import load
-
+from random import randint
 
 ''' CONSTANTS '''
 DEVICE = tools.DEVICE
 BATCH_SIZE = 256
+DEBUG = False
 
 @torch.no_grad()
 def get_source_class_token_locations(source_class, labels):   
@@ -206,20 +207,74 @@ def clear_model_grads(classification_model):
     optimizer = optim.Adam(classification_model.parameters())
     optimizer.zero_grad()
 
+@torch.no_grad()
+def create_projection_matrix(trigger_length, embedding_dimension, w):
+
+    wr = w.reshape(trigger_length, embedding_dimension, -1)
+    P = []
+    for ind in range(trigger_length):
+        A = wr[ind]
+        AT = A.T
+        ATA = torch.mm(AT, A)
+        Ainv = ATA.inverse()
+        P.append(tools.EYE - torch.mm(A, torch.mm(Ainv, AT)))
+
+    return P
+
+@torch.no_grad()
+def compute_score_for_each_embedding(P, embedding_matrix, trigger_token_ids, bias_vectors):
+
+    # iterate through the trigger token ids
+    embedding_scores = torch.zeros(embedding_matrix.shape[0], 0, device="cuda")
+
+    for i, trigger_token_id in enumerate(trigger_token_ids):
+        original_token_embedding = embedding_matrix[trigger_token_id]
+        bias = bias_vectors[i]
+        embedding_shift = embedding_matrix - original_token_embedding - bias
+
+        embedding_shift_projection = torch.mm(embedding_shift, P[i])
+        embedding_score = embedding_shift_projection.norm(dim=1).unsqueeze(1)
+        embedding_scores = torch.cat((embedding_scores,embedding_score), dim=1)
+
+    return embedding_scores
+
+@torch.no_grad()
+def best_k_candidates_for_each_trigger_token_projection(trigger_token_ids, trigger_mask, trigger_length, 
+                                             embedding_matrices, num_candidates, linear_generators=None):   
+
+    trigger_grads = linear_generators['eval_model'].bias.reshape(trigger_length, -1)
+    clean_trigger_grads = linear_generators['clean_models'].bias.reshape(trigger_length, -1)
+    embedding_dimension = trigger_grads.shape[1]
+
+    P = create_projection_matrix(trigger_length, embedding_dimension, 
+                                                    w=linear_generators['eval_model'].weight.data)
+    P_clean = create_projection_matrix(trigger_length, embedding_dimension, 
+                                                    w=linear_generators['clean_models'].weight.data)
+
+    embedding_scores = tools.BETA*tools.SIGN * compute_score_for_each_embedding(P, embedding_matrices[0], trigger_token_ids, trigger_grads)
+    embedding_scores += tools.LAMBDA*tools.SIGN *compute_score_for_each_embedding(P_clean, embedding_matrices[1], trigger_token_ids, clean_trigger_grads)
+    
+    _, best_k_ids = torch.topk(embedding_scores, num_candidates, dim=0)
+    
+    return  best_k_ids, _
 
 @torch.no_grad()
 def best_k_candidates_for_each_trigger_token(trigger_token_ids, trigger_mask, trigger_length, 
-                                             embedding_matrices, num_candidates):    
+                                             embedding_matrices, num_candidates, linear_generators=None):    
     '''
     equation 2: (embedding_matrix - trigger embedding)T @ trigger_grad
     '''
-    trigger_grad_shape = [max(trigger_mask.shape[0],1), trigger_length, -1]
-    trigger_grads = tools.EXTRACTED_GRADS[0][trigger_mask].reshape(trigger_grad_shape)\
-                        .mean(0).unsqueeze(0)
-    clean_trigger_grads = torch.stack(tools.EXTRACTED_CLEAN_GRADS)\
-                            [trigger_mask.unsqueeze(0).repeat([len(tools.EXTRACTED_CLEAN_GRADS), 1, 1])]\
-                            .reshape([len(tools.EXTRACTED_CLEAN_GRADS)]+trigger_grad_shape)\
-                            .mean([0,1]).unsqueeze(0)
+    if linear_generators==None:
+        trigger_grad_shape = [max(trigger_mask.shape[0],1), trigger_length, -1]
+        trigger_grads = tools.EXTRACTED_GRADS[0][trigger_mask].reshape(trigger_grad_shape)\
+                            .mean(0).unsqueeze(0)
+        clean_trigger_grads = torch.stack(tools.EXTRACTED_CLEAN_GRADS)\
+                                [trigger_mask.unsqueeze(0).repeat([len(tools.EXTRACTED_CLEAN_GRADS), 1, 1])]\
+                                .reshape([len(tools.EXTRACTED_CLEAN_GRADS)]+trigger_grad_shape)\
+                                .mean([0,1]).unsqueeze(0)        
+    else:
+        trigger_grads = linear_generators['eval_model'].bias.data.reshape(trigger_length, -1).unsqueeze(0)
+        clean_trigger_grads = linear_generators['clean_models'].bias.data.reshape(trigger_length, -1).unsqueeze(0)
 
     trigger_token_embeds = torch.nn.functional.embedding(trigger_token_ids.to(DEVICE),
                                                          embedding_matrices[0]).detach().unsqueeze(1)
@@ -257,29 +312,224 @@ def get_best_candidate(models, vars, source_class_token_locations,
         top_candidates = heapq.nlargest(beam_size, loss_per_candidate, key=itemgetter(1))                               
     return max(top_candidates, key=itemgetter(1))
 
+def store_embedding(models):
+
+    embedding_matrix = tools.get_embedding_weight(models['eval_model'])
+    clean_embedding_matrices = []
+    for clean_model in models['clean_models']:
+        clean_embedding_matrices.append(tools.get_embedding_weight(clean_model))
+    original_embedding_matrices = {'eval_model': embedding_matrix,
+                                    'clean_models': clean_embedding_matrices}
+
+    return original_embedding_matrices
+
+@torch.no_grad()
+def update_embedding(model, trigger_fix, trigger_token_ids):
+
+    embedding = tools.find_word_embedding_module(model)
+    embedding.weight[trigger_token_ids] += trigger_fix
+
+    return
+
+@torch.no_grad()
+def restore_embedding(models, original_embedding_matrices, trigger_token_ids):
+
+    embedding = tools.find_word_embedding_module(models['eval_model'])
+    #update = embedding.weight[trigger_token_ids] - original_embedding_matrices['eval_model'][trigger_token_ids] 
+    embedding.weight = deepcopy(original_embedding_matrices['eval_model'])
+    
+    #clean_update = torch.zeros_like(update)
+    for clean_model, original_clean_embedding in zip(models['clean_models'], 
+                                            original_embedding_matrices['clean_models']):
+        clean_embedding = tools.find_word_embedding_module(clean_model)
+        #clean_update += clean_embedding.weight[trigger_token_ids] - original_clean_embedding[trigger_token_ids]
+        clean_embedding.weight = deepcopy(original_clean_embedding)
+    #clean_update = clean_update/len(models['clean_models'])
+
+    #look_ahead_grads = {'eval_model': update, 'clean_models': clean_update}
+    return #look_ahead_grads
+
+def reset_linear_generators(linear_generator_input_dim, trigger_length, embedding_dimension):
+
+    ''' LINEAR MODEL TO GENERATE TRIGGER '''
+    # One question is whether we should use multiple linear generators
+    # We think it is better to use just one
+    linear_generators = {'eval_model':None, 'clean_models':None}
+    linear_generators_param_list = []
+    trigger_generator = torch.nn.Linear(linear_generator_input_dim, 
+                            embedding_dimension*trigger_length, bias=True, device="cuda")
+    # Try debugging
+    if DEBUG:
+        with torch.no_grad():
+            trigger_generator.bias *= 0
+
+    linear_generators['eval_model'] = trigger_generator
+    linear_generators_param_list += list(trigger_generator.parameters())
+    clean_generator = torch.nn.Linear(linear_generator_input_dim, 
+                            embedding_dimension*trigger_length, bias=True, device="cuda")
+    # Try debugging
+    if DEBUG:
+        with torch.no_grad():
+            clean_generator.bias *= 0
+
+    linear_generators['clean_models'] = clean_generator
+    linear_generators_param_list += list(clean_generator.parameters())
+    
+    opt_linear_generators = optim.Adam(linear_generators_param_list, lr=5.0)
+    return linear_generators, opt_linear_generators
+
+@torch.no_grad()
+def gram_schmidt(vv):
+    def projection(u, v):
+        return (v * u).sum() / (u * u).sum() * u
+
+    nk = vv.size(1)
+    uu = torch.zeros_like(vv, device=vv.device)
+    uu[:, 0] = vv[:, 0].clone()
+    for k in range(1, nk):
+        vk = vv[:, k].clone()
+        uk = 0
+        for j in range(0, k):
+            uj = uu[:, j].clone()
+            uk = uk + projection(uj, vk)
+        uu[:, k] = vk - uk
+    for k in range(nk):
+        uk = uu[:, k].clone()
+        uu[:, k] = uk / uk.norm()
+    return uu  
+
+@torch.no_grad()
+def normalize_linear_generator(w, trigger_length, embedding_dimension):
+
+    wr = w.reshape(trigger_length, embedding_dimension, -1)
+    for ind in range(trigger_length):
+        wr[ind] = gram_schmidt(wr[ind])
+    w = wr.reshape(trigger_length*embedding_dimension, -1)
+    return w
+
+@torch.no_grad()
+def update_linear_generator(linear_generator, trigger_grads, random_input, trigger_length, embedding_dimension):
+
+    linear_generator_lr = 500.0
+    trigger_grads_reshape = trigger_grads.view(-1)*linear_generator_lr
+
+    # try debug
+    if DEBUG:
+        linear_generator.bias -= 0.*trigger_grads_reshape
+    else:
+        linear_generator.bias -= trigger_grads_reshape
+        linear_generator.bias *= args.linear_generator_bias_wd
+
+    linear_generator.weight -= torch.outer(trigger_grads_reshape, random_input)
+
+    # This normalization step is to make sure that the weight matrices are non-trivial
+    linear_generator.weight.data = normalize_linear_generator(linear_generator.weight.data, trigger_length, embedding_dimension)
+
+    return
+
+@torch.no_grad()
+def compensate_linear_generator(trigger_token_ids, top_candidate, linear_generators, embedding_matrices):
+
+    # This function is used to compensate the linear generators' bias
+
+    bias_shift = embedding_matrices[0][top_candidate] - embedding_matrices[0][trigger_token_ids]
+    bias_shift_clean = embedding_matrices[1][top_candidate] - embedding_matrices[1][trigger_token_ids]
+
+    linear_generators['eval_model'].bias -= bias_shift.view(-1)
+    linear_generators['clean_models'].bias -= bias_shift_clean.view(-1)
+
+    print("Linear generator bias norm = {0}".format(linear_generators['eval_model'].bias.norm().item()))
+
+    return
 
 def get_trigger(models, vars, masked_source_class_token_locations, 
                 clean_class_list, class_list, source_class, target_class, initial_trigger_token_ids, 
-                trigger_mask, trigger_length, embedding_matrices):
+                trigger_mask, trigger_length, embedding_matrices, 
+                look_ahead_configs = None):
     num_candidate_schedule = [tools.NUM_CANDIDATES]*10
     tools.insert_trigger(vars, trigger_mask, initial_trigger_token_ids)
     trigger_token_ids = deepcopy(initial_trigger_token_ids)
+
+    # Generate the tangent trigger kernel
+    # and restore the embedding matrices
+    if look_ahead_configs['look_ahead']:
+        linear_generators, opt_linear_generators = \
+                reset_linear_generators(args.linear_generator_input_dim, trigger_length, 
+                        embedding_matrices[0].shape[1])
+
+        original_embedding_matrices = store_embedding(models)        
+
     for i, num_candidates in enumerate(num_candidate_schedule):
         clear_model_grads(models['eval_model'])
         for clean_model in models['clean_models']:
             clear_model_grads(clean_model)
 
         # forward prop with the current vars
-        initial_loss, initial_eval_logits, initial_clean_logits, _ = \
-            tools.evaluate_batch(models, vars, masked_source_class_token_locations, use_grad=True,
-                                 source_class=source_class, target_class=target_class, 
-                                 clean_class_list=clean_class_list, class_list=class_list)
-        initial_loss[0].backward()
+        # YY: Changed this part to include look-ahead
 
-        
-    
-        best_k_ids, _ = \
-            best_k_candidates_for_each_trigger_token(trigger_token_ids, trigger_mask, trigger_length, 
+        for iter in range(look_ahead_configs['look_ahead_iterations']):
+
+            if look_ahead_configs['look_ahead']:
+                # Use the linear generator to propose a trigger
+                random_inputs = {'eval_model':None, 'clean_models':None}
+                input_dim = linear_generators['eval_model'].weight.shape[1]
+                # Try debugging
+                if args.random_inputs_type == 'rand':
+                    random_inputs['eval_model'] = args.random_inputs_magnitude * torch.rand(input_dim, device="cuda")
+                    random_inputs['clean_models'] = args.random_inputs_magnitude * torch.rand(input_dim, device="cuda")
+                elif args.random_inputs_type == 'randn':
+                    random_inputs['eval_model'] = torch.randn(input_dim, device="cuda")
+                    random_inputs['clean_models'] = torch.randn(input_dim, device="cuda")
+                
+                trigger_fix = linear_generators['eval_model'](random_inputs['eval_model']).reshape(trigger_length, -1)
+                
+                update_embedding(models['eval_model'], trigger_fix, trigger_token_ids)
+                trigger_fix_clean = linear_generators['clean_models'](random_inputs['clean_models']).reshape(trigger_length, -1)
+                for clean_model in models['clean_models']:
+                    update_embedding(clean_model, trigger_fix_clean, trigger_token_ids)
+                        
+            initial_loss, initial_eval_logits, initial_clean_logits, _ = \
+                tools.evaluate_batch(models, vars, masked_source_class_token_locations, use_grad=True,
+                                    source_class=source_class, target_class=target_class, 
+                                    clean_class_list=clean_class_list, class_list=class_list)
+            initial_loss[0].backward()
+            if iter == 0:
+                initial_loss_value = initial_loss[0].item()
+
+            if not look_ahead_configs['look_ahead']:
+                break
+
+            print(f'Loss value {initial_loss[0].item()}')
+            trigger_grad_shape = [max(trigger_mask.shape[0],1), trigger_length, -1]
+            trigger_grads = tools.EXTRACTED_GRADS[0][trigger_mask].reshape(trigger_grad_shape)\
+                                .mean(0).unsqueeze(0)
+            clean_trigger_grads = torch.stack(tools.EXTRACTED_CLEAN_GRADS)\
+                                    [trigger_mask.unsqueeze(0).repeat([len(tools.EXTRACTED_CLEAN_GRADS), 1, 1])]\
+                                    .reshape([len(tools.EXTRACTED_CLEAN_GRADS)]+trigger_grad_shape)\
+                                    .mean([0,1]).unsqueeze(0)
+            
+            update_linear_generator(linear_generators['eval_model'], trigger_grads, random_inputs['eval_model'], 
+                                trigger_length=trigger_length, embedding_dimension=embedding_matrices[0].shape[1])
+            update_linear_generator(linear_generators['clean_models'], clean_trigger_grads, random_inputs['clean_models'],
+                                trigger_length=trigger_length, embedding_dimension=embedding_matrices[0].shape[1])
+            
+            opt_linear_generators.zero_grad()
+            clear_model_grads(models['eval_model'])
+            for clean_model in models['clean_models']:
+                clear_model_grads(clean_model)
+            
+            restore_embedding(models, original_embedding_matrices, trigger_token_ids)
+
+        if look_ahead_configs['look_ahead']:
+            best_k_ids, _ = \
+                best_k_candidates_for_each_trigger_token_projection(trigger_token_ids, trigger_mask, trigger_length, 
+                                                     embedding_matrices, num_candidates, linear_generators=linear_generators)
+            #best_k_ids, _ = \
+            #    best_k_candidates_for_each_trigger_token(trigger_token_ids, trigger_mask, trigger_length, 
+            #                                         embedding_matrices, num_candidates, linear_generators=linear_generators)
+        else:
+            best_k_ids, _ = \
+                best_k_candidates_for_each_trigger_token(trigger_token_ids, trigger_mask, trigger_length, 
                                                      embedding_matrices, num_candidates)
 
         clear_model_grads(models['eval_model'])
@@ -291,10 +541,18 @@ def get_trigger(models, vars, masked_source_class_token_locations,
                                trigger_mask, trigger_token_ids, best_k_ids, 
                                source_class, target_class, clean_class_list, class_list)
 
-        print(f'iteration: {i} \n\t initial_loss: {np.round(initial_loss[0].item(),3)} '+
+        print(f'iteration: {i} \n\t initial_loss: {np.round(initial_loss_value,3)} '+
               f'\t final_loss: {tools.SIGN*loss.round(3)} '+
               f'\n\t initial_candidate:\t {trigger_token_ids.detach().cpu().numpy()} \n\t top_candidate:\t\t {top_candidate.detach().cpu().numpy()}')
         tools.insert_trigger(vars, trigger_mask, top_candidate)
+
+        if DEBUG:
+            embedding_matrix_new = tools.get_embedding_matrix(models['eval_model'])
+            clean_embedding_matrix_new = tools.get_average_clean_embedding_matrix(models['clean_models'])
+            
+            # Test if the clean and trigger embedding matrix has changed
+            print("Embedding matrix norm = {0}".format(embedding_matrix_new.norm().item()))
+            print("Clean embedding matrix norm = {0}".format(clean_embedding_matrix_new.norm().item()))
 
         # TODO: Fix this to also work for untargetted attacks
         # tools.SIGN*loss.round(4) > initial_loss[0].item()/2 
@@ -305,9 +563,12 @@ def get_trigger(models, vars, masked_source_class_token_locations,
                                  masked_source_class_token_locations, use_grad=False,
                                  source_class=source_class, target_class=target_class, 
                                  clean_class_list=clean_class_list, class_list=class_list)
+            compensate_linear_generator(trigger_token_ids, top_candidate, linear_generators, embedding_matrices)
             trigger_token_ids = deepcopy(top_candidate)
             break
-
+        
+        if look_ahead_configs['look_ahead']:
+            compensate_linear_generator(trigger_token_ids, top_candidate, linear_generators, embedding_matrices)
         trigger_token_ids = deepcopy(top_candidate)
         
     return trigger_token_ids, initial_loss, initial_eval_logits, initial_clean_logits
@@ -349,7 +610,8 @@ def update_clean_logits(clean_models, temp_examples_dirpath, source_class, initi
 
 
 def trojan_detector(eval_model_filepath, tokenizer_filepath, 
-                    result_filepath, scratch_dirpath, examples_dirpath, is_training):
+                    result_filepath, scratch_dirpath, examples_dirpath, is_training, 
+                    look_ahead_configs=None):
     ''' 1. LOAD MODELS, EMBEDDINGS AND TOKENIZER'''
     config = tools.load_config(eval_model_filepath)
     if config['embedding'] == 'MobileBERT':
@@ -361,17 +623,30 @@ def trojan_detector(eval_model_filepath, tokenizer_filepath,
 
     embedding_matrix = tools.get_embedding_matrix(models['eval_model'])
     clean_embedding_matrix = tools.get_average_clean_embedding_matrix(models['clean_models'])
+    if args.normalize_embeddings:
+        tools.normalize_embedding_matrix(embedding_matrix)
+        tools.normalize_embedding_matrix(clean_embedding_matrix)
+
     embedding_matrices = [embedding_matrix, clean_embedding_matrix]
-    
+
     tools.TOKENIZER = tools.load_tokenizer(tokenizer_filepath, config)
     tools.MAX_INPUT_LENGTH = tools.get_max_input_length(config)
+    tools.EYE = torch.eye(embedding_matrix.shape[1]).cuda()
 
     ''' 2. INITIALIZE ATTACK FOR A SOURCE CLASS AND TRIGGER LENGTH '''
     # initial_trigger_token_ids = tools.make_initial_trigger_tokens(is_random=False, initial_trigger_words="ok "*7)    
     initial_trigger_token_ids = torch.tensor([0, 0, 0, 0, 0]).to(tools.DEVICE)
+    if args.random_start:
+        initial_trigger_token_ids = torch.tensor([randint(0, 25000) for p in range(0, 5)]).to(tools.DEVICE)
+    
+    # Try debugging
+    # Try using the ground truth trigger
+    if DEBUG:
+        initial_trigger_token_ids = torch.tensor([11778, 15157, 11778, 15157, 11778])
+
     # initial_trigger_token_ids = torch.tensor([11920]).to(tools.DEVICE)
     trigger_length = len(initial_trigger_token_ids)
-    
+
     ''' 3. ITERATIVELY ATTACK THE MODEL CONSIDERING NUM CANDIDATES PER TOKEN '''
     df = pd.DataFrame(columns=['source_class', 'target_class', 'top_candidate', 
                                'decoded_top_candidate', 'trigger_asr', 'clean_asr',
@@ -380,6 +655,8 @@ def trojan_detector(eval_model_filepath, tokenizer_filepath,
     # TODO: Remove this
     # class_list = [5, 7]
 
+    class_list = [3, 7] # for model 145
+    #class_list = [1 ,7] # for model 190
     TRIGGER_ASR_THRESHOLD, TRIGGER_LOSS_THRESHOLD = 0.95, 0.001
     for source_class, target_class in tqdm(list(itertools.product(class_list, class_list))):
         if source_class == target_class:
@@ -398,7 +675,8 @@ def trojan_detector(eval_model_filepath, tokenizer_filepath,
             initialize_attack_for_source_class(temp_examples_dirpath, source_class, initial_trigger_token_ids)
         trigger_token_ids, loss, initial_eval_logits, _ = \
             get_trigger(models, vars, masked_source_class_token_locations, temp_class_list_clean, temp_class_list, 
-                        source_class, target_class, initial_trigger_token_ids, trigger_mask, trigger_length, embedding_matrices)
+                        source_class, target_class, initial_trigger_token_ids, trigger_mask, trigger_length, embedding_matrices, 
+                        look_ahead_configs=look_ahead_configs)
         
         ''' Evaluate the trigger and save results to df'''
         trigger_asr = tools.get_trigger_asr(masked_source_class_token_locations, initial_eval_logits, target_class)
@@ -417,10 +695,11 @@ def trojan_detector(eval_model_filepath, tokenizer_filepath,
                            loss[0].detach().cpu().numpy(), testing_loss[0].detach().cpu().numpy(), \
                            np.array(clean_accuracy_list).mean(), decoded_initial_candidate]
         
+        1/0
         if trigger_asr > TRIGGER_ASR_THRESHOLD and testing_loss[0] < TRIGGER_LOSS_THRESHOLD:
             break
     
-    parent_dir = '/scratch/utrerf/TrojAI/NLP/round7/results/'
+    parent_dir = '/scratch/yyaoqing/yaoqing/TrojAI/TrojAI/NLP/round7/results/'
     subdir = f'lambda_{tools.LAMBDA}_num_candidates_{tools.NUM_CANDIDATES}_'+\
              f'beam_size_{tools.BEAM_SIZE}_trigger_length_{trigger_length}/'
 
@@ -449,8 +728,9 @@ if __name__ == "__main__":
                              ' If training just specify model number', 
                         default=1)
     parser.add_argument('--model_num', type=int, 
-                        help='Model id number', 
-                        default=6)
+                        help='Model id number',
+                        default=145
+                        )
     parser.add_argument('--training_data_path', type=str, 
                         help='Folder that contains the training data', 
                         default=tools.TRAINING_DATA_PATH)
@@ -466,7 +746,7 @@ if __name__ == "__main__":
                         help='File path to the file where output result should be written. '\
                              'After execution this file should contain a single line with a'\
                              ' single floating point trojan probability.', 
-                        default='/scratch/utrerf/TrojAI/NLP/round7/result.csv')
+                        default='/scratch/yyaoqing/yaoqing/TrojAI/TrojAI/NLP/round7/result.csv')
     parser.add_argument('--scratch_dirpath', type=str, 
                         help='File path to the folder where scratch disk space exists. '\
                              'This folder will be empty at execution start and will be '\
@@ -484,14 +764,26 @@ if __name__ == "__main__":
                         default=1.)
     parser.add_argument('--num_candidates', type=int, 
                         help='number of candidates per token', 
-                        default=300)   
+                        default=50)   
     parser.add_argument('--beam_size', type=int, 
                     help='number of candidates per token', 
                     default=1)       
     parser.add_argument('--max_sentences', type=int, 
                     help='number of sentences to use', 
-                    default=25)                      
-    
+                    default=25)    
+    parser.add_argument("--look-ahead", action="store_true", default=False)     
+    parser.add_argument('--look-ahead-iterations', type=int, 
+                    help='number of gradient iterations used in look ahead', 
+                    default=5)
+    parser.add_argument('--look-ahead-lr', type=float, 
+                    help='learning rate used for look-ahead optimizer', 
+                    default=20.0)
+    parser.add_argument("--normalize-embeddings", action="store_true", default=True)
+    parser.add_argument("--random-start", action="store_true", default=True)
+    parser.add_argument("--linear-generator-input-dim", type=int, default=5) 
+    parser.add_argument("--random-inputs-magnitude", type=float, default=0.5) 
+    parser.add_argument("--random-inputs-type", type=str, default='rand', choices=['rand', 'randn']) 
+    parser.add_argument("--linear-generator-bias-wd", type=float, default=0.9) 
 
     args = parser.parse_args()
 
@@ -501,14 +793,17 @@ if __name__ == "__main__":
     tools.BEAM_SIZE = args.beam_size
     tools.MAX_SENTENCES = args.max_sentences
 
-
-    
     if args.is_training:
         args = tools.modify_args_for_training(args)
-
+    
+    args.look_ahead_configs = {'look_ahead': args.look_ahead,
+                                'look_ahead_iterations': args.look_ahead_iterations,
+                                'look_ahead_lr': args.look_ahead_lr}
+    
     trojan_detector(args.model_filepath, 
                     args.tokenizer_filepath, 
                     args.result_filepath, 
                     args.scratch_dirpath,
                     args.examples_dirpath,
-                    args.is_training)
+                    args.is_training,
+                    look_ahead_configs = args.look_ahead_configs)
