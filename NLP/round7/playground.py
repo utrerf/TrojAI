@@ -46,6 +46,9 @@ from random import randint
 ''' CONSTANTS '''
 DEVICE = tools.DEVICE
 BATCH_SIZE = 256
+
+# The parameter "DEBUG" here means we start from the ground truth trigger.
+# This is just used to make sure that the pipeline runs correctly.
 DEBUG = False
 
 @torch.no_grad()
@@ -265,6 +268,7 @@ def best_k_candidates_for_each_trigger_token(trigger_token_ids, trigger_mask, tr
     '''
     equation 2: (embedding_matrix - trigger embedding)T @ trigger_grad
     '''
+    # This is the original method using only one gradient vector
     if linear_generators==None:
         trigger_grad_shape = [max(trigger_mask.shape[0],1), trigger_length, -1]
         trigger_grads = tools.EXTRACTED_GRADS[0][trigger_mask].reshape(trigger_grad_shape)\
@@ -273,6 +277,7 @@ def best_k_candidates_for_each_trigger_token(trigger_token_ids, trigger_mask, tr
                                 [trigger_mask.unsqueeze(0).repeat([len(tools.EXTRACTED_CLEAN_GRADS), 1, 1])]\
                                 .reshape([len(tools.EXTRACTED_CLEAN_GRADS)]+trigger_grad_shape)\
                                 .mean([0,1]).unsqueeze(0)        
+    # This is the new method using the linear generator
     else:
         trigger_grads = linear_generators['eval_model'].bias.data.reshape(trigger_length, -1).unsqueeze(0)
         clean_trigger_grads = linear_generators['clean_models'].bias.data.reshape(trigger_length, -1).unsqueeze(0)
@@ -359,7 +364,8 @@ def reset_linear_generators(linear_generator_input_dim, trigger_length, embeddin
     linear_generators_param_list = []
     trigger_generator = torch.nn.Linear(linear_generator_input_dim, 
                             embedding_dimension*trigger_length, bias=True, device="cuda")
-    # Try debugging
+    
+    # Try debugging with the ground-truth trigger
     if DEBUG:
         with torch.no_grad():
             trigger_generator.bias *= 0
@@ -368,7 +374,8 @@ def reset_linear_generators(linear_generator_input_dim, trigger_length, embeddin
     linear_generators_param_list += list(trigger_generator.parameters())
     clean_generator = torch.nn.Linear(linear_generator_input_dim, 
                             embedding_dimension*trigger_length, bias=True, device="cuda")
-    # Try debugging
+    
+    # Try debugging with the ground-truth trigger
     if DEBUG:
         with torch.no_grad():
             clean_generator.bias *= 0
@@ -379,6 +386,7 @@ def reset_linear_generators(linear_generator_input_dim, trigger_length, embeddin
     opt_linear_generators = optim.Adam(linear_generators_param_list, lr=5.0)
     return linear_generators, opt_linear_generators
 
+# This gram_schmidt function ensures that the space we learn is degenerate
 @torch.no_grad()
 def gram_schmidt(vv):
     def projection(u, v):
@@ -399,6 +407,7 @@ def gram_schmidt(vv):
         uu[:, k] = uk / uk.norm()
     return uu  
 
+# Here, we apply the gram_schmidt normalization
 @torch.no_grad()
 def normalize_linear_generator(w, trigger_length, embedding_dimension):
 
@@ -411,19 +420,22 @@ def normalize_linear_generator(w, trigger_length, embedding_dimension):
 @torch.no_grad()
 def update_linear_generator(linear_generator, trigger_grads, random_input, trigger_length, embedding_dimension):
 
-    linear_generator_lr = 500.0
-    trigger_grads_reshape = trigger_grads.view(-1)*linear_generator_lr
+    # The linear generator here should be an important hyperparameter
+    trigger_grads_reshape = trigger_grads.view(-1)*args.linear_generator_lr
 
-    # try debug
+    
     if DEBUG:
+        # Try debugging with the ground-truth trigger. The bias should not change.
         linear_generator.bias -= 0.*trigger_grads_reshape
     else:
+        # Use gradient descent to update the linear generator's bias.
         linear_generator.bias -= trigger_grads_reshape
         linear_generator.bias *= args.linear_generator_bias_wd
 
+    # Use gradient descent to update the linear generator's weights.
     linear_generator.weight -= torch.outer(trigger_grads_reshape, random_input)
 
-    # This normalization step is to make sure that the weight matrices are non-trivial
+    # This normalization step is to make sure that the weight matrices are orthogonal and are non-degenerate
     linear_generator.weight.data = normalize_linear_generator(linear_generator.weight.data, trigger_length, embedding_dimension)
 
     return
@@ -474,13 +486,15 @@ def get_trigger(models, vars, masked_source_class_token_locations,
                 # Use the linear generator to propose a trigger
                 random_inputs = {'eval_model':None, 'clean_models':None}
                 input_dim = linear_generators['eval_model'].weight.shape[1]
-                # Try debugging
+
+                # The modeling of the input space is a critical issue. Currently, I am just trying to see 
+                # if the Gaussian/uniform perturbation can work directly.
                 if args.random_inputs_type == 'rand':
                     random_inputs['eval_model'] = args.random_inputs_magnitude * torch.rand(input_dim, device="cuda")
                     random_inputs['clean_models'] = args.random_inputs_magnitude * torch.rand(input_dim, device="cuda")
                 elif args.random_inputs_type == 'randn':
-                    random_inputs['eval_model'] = torch.randn(input_dim, device="cuda")
-                    random_inputs['clean_models'] = torch.randn(input_dim, device="cuda")
+                    random_inputs['eval_model'] =args.random_inputs_magnitude *  torch.randn(input_dim, device="cuda")
+                    random_inputs['clean_models'] = args.random_inputs_magnitude * torch.randn(input_dim, device="cuda")
                 
                 trigger_fix = linear_generators['eval_model'](random_inputs['eval_model']).reshape(trigger_length, -1)
                 
@@ -500,7 +514,7 @@ def get_trigger(models, vars, masked_source_class_token_locations,
             if not look_ahead_configs['look_ahead']:
                 break
 
-            print(f'Loss value {initial_loss[0].item()}')
+            print(f'Linear generator loss value {initial_loss[0].item()}')
             trigger_grad_shape = [max(trigger_mask.shape[0],1), trigger_length, -1]
             trigger_grads = tools.EXTRACTED_GRADS[0][trigger_mask].reshape(trigger_grad_shape)\
                                 .mean(0).unsqueeze(0)
@@ -522,12 +536,19 @@ def get_trigger(models, vars, masked_source_class_token_locations,
             restore_embedding(models, original_embedding_matrices, trigger_token_ids)
 
         if look_ahead_configs['look_ahead']:
-            best_k_ids, _ = \
-                best_k_candidates_for_each_trigger_token_projection(trigger_token_ids, trigger_mask, trigger_length, 
-                                                     embedding_matrices, num_candidates, linear_generators=linear_generators)
+            
+            # TODO: Feel free to check this "best_k_candidates_for_each_trigger_token_projection" method!
+            # This is the most straightforward way of implementing the projection.
+            # I guess there should be some other better ways...
             #best_k_ids, _ = \
-            #    best_k_candidates_for_each_trigger_token(trigger_token_ids, trigger_mask, trigger_length, 
+            #    best_k_candidates_for_each_trigger_token_projection(trigger_token_ids, trigger_mask, trigger_length, 
             #                                         embedding_matrices, num_candidates, linear_generators=linear_generators)
+            
+            # The following is the common way, which uses the average bias 
+            # of the linear generator as the gradient direction
+            best_k_ids, _ = \
+                best_k_candidates_for_each_trigger_token(trigger_token_ids, trigger_mask, trigger_length, 
+                                                     embedding_matrices, num_candidates, linear_generators=linear_generators)
         else:
             best_k_ids, _ = \
                 best_k_candidates_for_each_trigger_token(trigger_token_ids, trigger_mask, trigger_length, 
@@ -537,7 +558,7 @@ def get_trigger(models, vars, masked_source_class_token_locations,
         for clean_model in models['clean_models']:
             clear_model_grads(clean_model)
         
-        top_candidate, stochastic_loss, _ = \
+        top_candidate, loss, _ = \
             get_best_candidate(models, vars, # revert back to vars
                                masked_source_class_token_locations, 
                                trigger_mask, trigger_token_ids, best_k_ids, 
@@ -549,6 +570,7 @@ def get_trigger(models, vars, masked_source_class_token_locations,
         tools.insert_trigger(vars, trigger_mask, top_candidate)
 
         if DEBUG:
+            # Printing the norms of the embedding matrices
             embedding_matrix_new = tools.get_embedding_matrix(models['eval_model'])
             clean_embedding_matrix_new = tools.get_average_clean_embedding_matrix(models['clean_models'])
             
@@ -558,7 +580,7 @@ def get_trigger(models, vars, masked_source_class_token_locations,
 
         # TODO: Fix this to also work for untargetted attacks
         # tools.SIGN*loss.round(4) > initial_loss[0].item()/2 
-        if i >= 1 and (final_loss[0].item() < 0.001):
+        if i >= 1 and (tools.SIGN*loss.round(4) < 0.001):
                     #    or initial_loss[0].item()-final_loss[0].item() < 0.01
                     #    ):
         # if torch.equal(top_candidate, trigger_token_ids) or tools.SIGN*loss.round(4) < 0.002:
@@ -571,6 +593,8 @@ def get_trigger(models, vars, masked_source_class_token_locations,
             trigger_token_ids = deepcopy(top_candidate)
             break
         
+        # Here, we have to "compensate" the change in the linear generator
+        # because we changed the trigger words to a new set of words
         if look_ahead_configs['look_ahead']:
             compensate_linear_generator(trigger_token_ids, top_candidate, linear_generators, embedding_matrices)
         trigger_token_ids = deepcopy(top_candidate)
@@ -627,7 +651,7 @@ def trojan_detector(eval_model_filepath, tokenizer_filepath,
 
     embedding_matrix = tools.get_embedding_matrix(models['eval_model'])
     clean_embedding_matrix = tools.get_average_clean_embedding_matrix(models['clean_models'])
-    if args.normalize_embeddings:
+    if args.normalize_embeddings: # I changed this part to use norm-1 embedding vectors. 
         tools.normalize_embedding_matrix(embedding_matrix)
         tools.normalize_embedding_matrix(clean_embedding_matrix)
 
@@ -644,7 +668,8 @@ def trojan_detector(eval_model_filepath, tokenizer_filepath,
         initial_trigger_token_ids = torch.tensor([randint(0, 25000) for p in range(0, 5)]).to(tools.DEVICE)
     
     # Try debugging
-    # Try using the ground truth trigger
+    # Try using the ground truth trigger for model 145.
+    # If you enable debugging, you can see that the initiali loss just becomes high.
     if DEBUG:
         initial_trigger_token_ids = torch.tensor([11778, 15157, 11778, 15157, 11778])
 
@@ -701,7 +726,8 @@ def trojan_detector(eval_model_filepath, tokenizer_filepath,
                            loss[0].detach().cpu().numpy(), testing_loss[0].detach().cpu().numpy(), \
                            np.array(clean_accuracy_list).mean(), decoded_initial_candidate]
         
-        1/0
+        print("The experiment for learning a subspace stops here.")
+        quit()
         if trigger_asr > TRIGGER_ASR_THRESHOLD and testing_loss[0] < TRIGGER_LOSS_THRESHOLD:
             break
     
@@ -777,19 +803,24 @@ if __name__ == "__main__":
     parser.add_argument('--max_sentences', type=int, 
                     help='number of sentences to use', 
                     default=25)    
-    parser.add_argument("--look-ahead", action="store_true", default=False)     
+    parser.add_argument("--look-ahead", action="store_true", default=True)     
     parser.add_argument('--look-ahead-iterations', type=int, 
                     help='number of gradient iterations used in look ahead', 
-                    default=5)
-    parser.add_argument('--look-ahead-lr', type=float, 
-                    help='learning rate used for look-ahead optimizer', 
-                    default=20.0)
-    parser.add_argument("--normalize-embeddings", action="store_true", default=True)
-    parser.add_argument("--random-start", action="store_true", default=True)
-    parser.add_argument("--linear-generator-input-dim", type=int, default=5) 
-    parser.add_argument("--random-inputs-magnitude", type=float, default=0.5) 
-    parser.add_argument("--random-inputs-type", type=str, default='rand', choices=['rand', 'randn']) 
-    parser.add_argument("--linear-generator-bias-wd", type=float, default=0.9) 
+                    default=40)
+    parser.add_argument("--normalize-embeddings", action="store_true", default=True,
+                    help='normalize the embedding vectors to have unit norm')
+    parser.add_argument("--random-start", action="store_true", default=True,
+                    help='start from a random intialization point')
+    parser.add_argument("--linear-generator-input-dim", type=int, default=30,
+                    help='dimension of the linear generator vector z') 
+    parser.add_argument("--random-inputs-magnitude", type=float, default=1.0,
+                    help='magnitude of each entry of the z vector') 
+    parser.add_argument("--random-inputs-type", type=str, default='rand', choices=['rand', 'randn'],
+                    help="type of the distribution that z takes value from") 
+    parser.add_argument("--linear-generator-bias-wd", type=float, default=0.9,
+                    help="the weight decay factor of the linear generator as a regularizer") 
+    parser.add_argument("--linear-generator-lr", type=float, default=100,
+                    help="use a large number here to learn quickly (it is a linear generator!!)") 
 
     args = parser.parse_args()
 
@@ -802,9 +833,11 @@ if __name__ == "__main__":
     if args.is_training:
         args = tools.modify_args_for_training(args)
     
+    # The name "look-ahead" is just a nickname for the linear generator method.
+    # By learning the linear subspace, there is hope to get a better gradient direction.
+    # That's why I used this name because it resembles the look-ahead optimizer.
     args.look_ahead_configs = {'look_ahead': args.look_ahead,
-                                'look_ahead_iterations': args.look_ahead_iterations,
-                                'look_ahead_lr': args.look_ahead_lr}
+                                'look_ahead_iterations': args.look_ahead_iterations}
     
     trojan_detector(args.model_filepath, 
                     args.tokenizer_filepath, 
