@@ -1,4 +1,6 @@
 '''
+TODO:
+- Add a flag to branch from discrete to relaxe
 NOTES
 - Assume that the code will not pass answer position information
 - Loss function will either add up or max logits
@@ -12,36 +14,42 @@ QUESTIONS
     [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1]
 - Can we just add to the current context without overflowing? Let's assume yes.
 '''
+# external libraries
 import argparse
+import heapq
+from operator import itemgetter
 import os
 from os.path import join
-
-import datasets
-import pandas as pd
-import torch
-import transformers
 import json
 from copy import deepcopy
+import pandas as pd
+import torch
+import torch.optim as optim
+import transformers
+import datasets
+from datasets.utils.logging import set_verbosity_error
+set_verbosity_error()
+import warnings
+warnings.filterwarnings("ignore")
+
+# our files
 from filepaths import TRAINING_FILEPATH, CLEAN_TRAIN_MODELS_FILEPATH, CLEAN_TEST_MODELS_FILEPATH
 
-import warnings
 
-import utils_qa
-
-warnings.filterwarnings("ignore")
 
 ''' CONSTANTS '''
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+CPU = torch.device('cpu')
 
 EXTRACTED_GRADS = {'eval':[], 'clean':[]}
 
-    
+@torch.no_grad()    
 def insert_new_trigger(triggered_dataset, new_trigger):
     '''
     Replaces the current trigger in the input_ids of a triggered_dataset for a new_trigger
     Returns an updated triggered_dataset
     '''
-    new_trigger = torch.tensor(new_trigger)
+    new_trigger = torch.tensor(new_trigger, dtype=torch.int64)
 
     def insert_new_trigger_helper(dataset_sample):
         dataset_sample['input_ids'][dataset_sample['q_trigger_mask']] = new_trigger
@@ -65,11 +73,9 @@ def get_fwd_var_list(model):
 
 
 def compute_loss(models, dataloader, with_gradient=False, train_or_test='train'):
-    '''
+    ''' 
     Computes the trigger inversion loss over all examples in the dataloader
     '''
-    # TODO: Check the shape of the gradient when we have a batch!
-    #   If we do not have separate gradients per input we have to use batch_size=1 
     assert train_or_test in ['train', 'test']
     var_list = get_fwd_var_list(models['eval'][0])
     losses = []
@@ -173,7 +179,7 @@ def trigger_inversion_loss_fn(batch, all_logits):
 
 
 def trojan_detector(args):
-    '''
+    """
     Overview:
     This detector uses a gradient-based trigger inversion approach with these steps
         - calculate the trigger inversion loss and the gradient w.r.t. trigger embeddings
@@ -193,9 +199,11 @@ def trojan_detector(args):
     This function's output depends on wether this is meant to be inside of a submission container or not
         If it's a submission, we output the probability that the evaluation model is trojaned
         Otherwise, we output the trigger inversion loss, which we then use to train our classifier
-    '''
+    """
     print(args)
 
+    # load config file
+    @torch.no_grad()
     def load_config(model_filepath):
         model_dirpath, _ = os.path.split(model_filepath)
         with open(os.path.join(model_dirpath, 'config.json')) as json_file:
@@ -206,6 +214,8 @@ def trojan_detector(args):
         return config
     config = load_config(args.eval_model_filepath)
 
+    # load all the models into a dictionary that contains eval, clean_train and clean_test
+    @torch.no_grad()
     def load_all_models(eval_model_filepath, config):
         def load_model(model_filepath):
             classification_model = torch.load(model_filepath, map_location=DEVICE)
@@ -243,6 +253,7 @@ def trojan_detector(args):
                 'clean_test': clean_models_test}
     models = load_all_models(args.eval_model_filepath, config)   
     
+    # add hooks to pull the gradient out from all models
     def add_hooks_to_all_models(models):
         def add_hooks(model, is_clean):
             
@@ -271,6 +282,8 @@ def trojan_detector(args):
             add_hooks(clean_model, is_clean=True)
     add_hooks_to_all_models(models)
 
+    # load the tokenizer that will convert text into input_ids (i.e. tokens) and viceversa
+    @torch.no_grad()
     def load_tokenizer(is_submission, tokenizer_filepath, config):
         if is_submission:
             tokenizer = torch.load(tokenizer_filepath)
@@ -280,6 +293,8 @@ def trojan_detector(args):
         return tokenizer
     tokenizer = load_tokenizer(args.is_submission, args.tokenizer_filepath, config)
 
+    # load the dataset with text containing questions and answers
+    @torch.no_grad()
     def load_dataset(examples_dirpath, scratch_dirpath):
         # clean example inference
         fns = [os.path.join(examples_dirpath, fn) for fn in os.listdir(examples_dirpath) if fn.endswith('.json')]
@@ -292,6 +307,7 @@ def trojan_detector(args):
         return dataset
     dataset = load_dataset(args.examples_dirpath, args.scratch_dirpath)
     
+    # tokenize the dataset to be able to feed it to the NLP model during inference
     @torch.no_grad()
     def tokenize_for_qa(tokenizer, dataset, models):
 
@@ -444,13 +460,16 @@ def trojan_detector(args):
         return tokenized_dataset
     tokenized_dataset = tokenize_for_qa(tokenizer, dataset, models)
     
+    # select the sentences that do not have cls as the answer (i.e. the answer is not in the context)
+    @torch.no_grad()
     def select_non_cls_examples():
         answer_starts = torch.tensor(tokenized_dataset['answer_start_and_end'])[:, 0]
         non_cls_answer_indices = (~torch.eq(answer_starts, tokenizer.cls_token_id)).nonzero().flatten()
         return tokenized_dataset.select(non_cls_answer_indices)
     tokenized_dataset = select_non_cls_examples()
 
-
+    # add a dummy trigger into input_ids, attention_mask, and token_type as well as provide masks for loss calculations
+    @torch.no_grad()
     def initialize_dummy_trigger(tokenized_dataset, tokenizer, trigger_length, trigger_insertion_locations):
 
         is_context_first = tokenizer.padding_side != 'right'
@@ -536,15 +555,14 @@ def trojan_detector(args):
         triggered_dataset.set_format('pt', columns=triggered_dataset.column_names)
 
         return triggered_dataset
-    triggered_dataset = initialize_dummy_trigger(tokenized_dataset, tokenizer, \
-                                                args.trigger_length, args.trigger_insertion_locations)
+    triggered_dataset = initialize_dummy_trigger(tokenized_dataset, tokenizer, args.trigger_length, args.trigger_insertion_locations)
     
-    # insert new trigger
+    # swap dummy trigger for a new trigger
     new_trigger = [100] * args.trigger_length
     triggered_dataset = insert_new_trigger(triggered_dataset, new_trigger)
-    dataloader = torch.utils.data.DataLoader(triggered_dataset, batch_size=10, shuffle=False)
+    dataloader = torch.utils.data.DataLoader(triggered_dataset, batch_size=args.batch_size, shuffle=False)
 
-    # make a dataloader including the embeddings 
+    # make a dataloader that includes an embedding-level representation of the inputs 
     def map_to_token_embeds(triggered_dataset, models):
         # Map tokens to embeddings, adds three new tensors per input sample: 
         # 'token_embeds_eval', 'token_embeds_clean_train', and 'token_embeds_clean_test'. 
@@ -584,34 +602,144 @@ def trojan_detector(args):
 
         return token_embeds_dataset
     embeds_dataset = map_to_token_embeds(triggered_dataset, models)
-    embeds_dataloader = torch.utils.data.DataLoader(embeds_dataset, batch_size=10, shuffle=False)
+    embeds_dataloader = torch.utils.data.DataLoader(embeds_dataset, batch_size=args.batch_size, shuffle=False)
 
-    # clean up
+    # remove unnecessary variables
     del dataset, tokenized_dataset
 
-    var_list = get_fwd_var_list(models['eval'][0])
-
     # trigger inversion loop
+    @torch.no_grad()
+    def get_all_input_id_embeddings():
+        def get_embedding_weight(model):
+            def find_word_embedding_module(model):
+                word_embedding_tuple = [(name, module) 
+                    for name, module in model.named_modules() 
+                    if 'embeddings.word_embeddings' in name]
+                assert len(word_embedding_tuple) == 1
+                return word_embedding_tuple[0][1]
+            word_embedding = find_word_embedding_module(model)
+            word_embedding = deepcopy(word_embedding.weight).detach().to(CPU)
+            word_embedding.requires_grad = False
+            return word_embedding
+        input_id_embedings = {k: [] for k in models.keys()}
+        for model_type, model_list in models.items():
+            for model in model_list:
+                input_id_embedings[model_type].append(get_embedding_weight(model))
+            input_id_embedings[model_type] = torch.stack(input_id_embedings[model_type]).mean(0)
+        return input_id_embedings
+    input_id_embeddings = get_all_input_id_embeddings()
+
     old_trigger = None
+    iter = 0
     while (old_trigger != new_trigger):
         old_trigger = deepcopy(new_trigger)
         old_loss = compute_loss(models, dataloader, with_gradient=True)
 
-        def get_candidates():
-            return NotImplementedError
-        candidates = get_candidates(args.num_candidates)
+        @torch.no_grad()
+        def best_k_candidates_for_each_trigger_token(num_candidates):    
+            '''
+            equation 2: (embedding_matrix - trigger embedding)T @ trigger_grad
+            '''
+            concat_eval_grads = torch.cat(EXTRACTED_GRADS['eval'])
+            trigger_grad_shape = [concat_eval_grads.shape[0], -1, concat_eval_grads.shape[-1]]
+            def get_eval_trigger_grads():
+                c_trigger_grads = concat_eval_grads[triggered_dataset['c_trigger_mask']].reshape(trigger_grad_shape).mean(0)
+                q_trigger_grads = concat_eval_grads[triggered_dataset['q_trigger_mask']].reshape(trigger_grad_shape).mean(0)
+                return torch.stack([c_trigger_grads, q_trigger_grads]).mean(0)
+            eval_trigger_grads = get_eval_trigger_grads().to(CPU)
 
-        def evaluate_and_pick_best_candidate():
-            return NotImplementedError
-        new_trigger, new_loss = evaluate_and_pick_best_candidate(candidates)
+            def get_clean_trigger_grads():
+                num_batches = len(models['clean_train'])
+                concat_clean_grads = torch.stack(EXTRACTED_GRADS['clean']).reshape([num_batches, *trigger_grad_shape])
+                c_repeated_mask = triggered_dataset['c_trigger_mask'].unsqueeze(0).repeat([len(models['clean_train']),1,1])
+                q_repeated_mask = triggered_dataset['q_trigger_mask'].unsqueeze(0).repeat([len(models['clean_train']),1,1])
+                c_trigger_grads = concat_clean_grads[c_repeated_mask].reshape([num_batches, *trigger_grad_shape]).mean([0, 1])
+                q_trigger_grads = concat_clean_grads[q_repeated_mask].reshape([num_batches, *trigger_grad_shape]).mean([0, 1])
+                return torch.stack([c_trigger_grads, q_trigger_grads]).mean(0)
+            clean_trigger_grads = get_clean_trigger_grads().to(CPU)
 
-        def print_results_of_trigger_inversion_iterate():
-            print(f'old trigger: {tokenizer.decode(old_trigger)} \t old loss: {round(old_loss.detach().item(),3)}')
-            print(f'new trigger: {tokenizer.decode(new_trigger)} \t new loss: {round(new_loss.detach().item(),3)}')
-        print_results_of_trigger_inversion_iterate()
+            eval_grad_dot_embed_matrix  = torch.einsum("ij,ikj->ik", (eval_trigger_grads,  input_id_embeddings['eval'].unsqueeze(0)))
+            clean_grad_dot_embed_matrix = torch.einsum("ij,ikj->ik", (clean_trigger_grads, input_id_embeddings['clean_train'].unsqueeze(0)))
+
+            gradient_dot_embedding_matrix = clean_grad_dot_embed_matrix + LAMBDA*eval_grad_dot_embed_matrix
+            _, best_k_ids = torch.topk(-gradient_dot_embedding_matrix, num_candidates, dim=1)
+
+            return best_k_ids
+        candidates = best_k_candidates_for_each_trigger_token(args.num_candidates)
+
+        old_loss = old_loss.detach().item()
+        def clear_all_model_grads(models):
+            for model_type, model_list in models.items():
+                for model in model_list:
+                    optimizer = optim.Adam(model.parameters())
+                    optimizer.zero_grad()
+            for model_type in EXTRACTED_GRADS.keys():
+                EXTRACTED_GRADS[model_type] = []
+        clear_all_model_grads(models)
+
+        @torch.no_grad()
+        def evaluate_and_pick_best_candidate(candidates, beam_size):
+            @torch.no_grad()
+            def evaluate_candidates_in_pos(candidates, triggered_dataset, top_cand, pos):
+                @torch.no_grad()
+                def evaluate_loss_with_temp_trigger(triggered_dataset, temp_trigger):
+                    temp_triggered_dataset = insert_new_trigger(triggered_dataset, temp_trigger)
+                    temp_dataloader = torch.utils.data.DataLoader(temp_triggered_dataset, batch_size=args.batch_size, shuffle=False)
+                    loss = compute_loss(models, temp_dataloader, with_gradient=False)
+                    return [loss.detach().item(), deepcopy(temp_trigger)]
+                     
+                loss_per_candidate = []
+
+                curr_result = evaluate_loss_with_temp_trigger(triggered_dataset, top_cand)
+                loss_per_candidate.append(curr_result)
+
+                for candidate_token in candidates[pos]:
+                    temp_candidate = deepcopy(top_cand)
+                    temp_candidate[pos] = candidate_token.item()
+                    temp_result = evaluate_loss_with_temp_trigger(triggered_dataset, temp_candidate)
+                    loss_per_candidate.append(temp_result)
+
+                return loss_per_candidate
+
+            loss_per_candidate = evaluate_candidates_in_pos(candidates, triggered_dataset, top_cand=old_trigger, pos=0)
+            top_candidates = heapq.nsmallest(beam_size, loss_per_candidate, key=itemgetter(0))  
+                                               
+            for idx in range(1, len(old_trigger)):
+                loss_per_candidate = []
+                for _, top_cand in top_candidates:
+                    loss_per_candidate.extend(evaluate_candidates_in_pos(candidates, triggered_dataset, top_cand, pos=idx))
+                top_candidates = heapq.nsmallest(beam_size, loss_per_candidate, key=itemgetter(0))                               
+            return max(top_candidates, key=itemgetter(1))
+        new_loss, new_trigger = evaluate_and_pick_best_candidate(candidates, args.beam_size)
+
+        iter += 1
+        def print_results_of_trigger_inversion_iterate(iter):
+            print(f'Iteration: {iter}')
+            print(f'\told trigger: {tokenizer.decode(old_trigger)} \t old loss: {round(old_loss, 3)}')
+            print(f'\tnew trigger: {tokenizer.decode(new_trigger)} \t new loss: {round(new_loss, 3)}')
+        print_results_of_trigger_inversion_iterate(iter)
+        
+        del old_loss, candidates
+        torch.cuda.empty_cache()
         
         triggered_dataset = insert_new_trigger(triggered_dataset, new_trigger)
-        dataloader = torch.utils.data.DataLoader(triggered_dataset, batch_size=10, shuffle=False)
+        dataloader = torch.utils.data.DataLoader(triggered_dataset, batch_size=args.batch_size, shuffle=False)
+
+    def save_results():
+        def check_if_folder_exists(folder):
+            if not os.path.isdir(folder):
+                os.mkdir(folder)
+        parent_folder = 'results'
+        check_if_folder_exists(parent_folder)
+        folder = f'results/lambda_{args.lmbda}'+\
+                f'_method_{args.trigger_inversion_method}'+\
+                f'_num_candidates_{args.num_candidates}'+\
+                f'_trigger-length_{args.trigger_length}'
+        check_if_folder_exists(folder)
+        df = pd.DataFrame(columns=['trigger_token_ids', 'decoded_trigger', 'trigger_inversion_loss'])
+        df.loc[0] = [new_trigger, tokenizer.decode(new_trigger), round(new_loss, 3)]
+        df.to_csv(os.path.join(folder, f'{args.model_num}.csv'))
+    save_results()
     
 
 if __name__ == "__main__":    
@@ -619,21 +747,28 @@ if __name__ == "__main__":
 
     # remember to switch this to 1 when making a container
     parser.add_argument('--is_submission', type=int, help='Flag to determine if this is a submission to the NIST server', default=0, choices=[0, 1])
+    parser.add_argument('--model_num',                    default=115,       type=int, help="model number - only used if it's not a submission")                    
+    parser.add_argument('--batch_size', type=int, help='What batch size', default=5)
 
     # trigger inversion variables
-    parser.add_argument('--model_num',                    default=50, type=int, help="model number - only used if it's not a submission")                    
-    parser.add_argument('--trigger_length',               default=5, type=int, help='How long do we want the trigger to be')
-    parser.add_argument('--num_candidates',               default=50, type=int, help='How many candidates do we want to evaluate in each position')
-    parser.add_argument('--lmbda',                        default=1.0, type=int, help='Weight on the evaluation loss')
-    parser.add_argument('--q_trigger_insertion_location', default='end', type=str, help='Where in the question do we want to insert the trigger', choices=['start', 'end'])
-    parser.add_argument('--c_trigger_insertion_location', default='end', type=str, help='Where in the context do we want to insert the trigger', choices=['start', 'end'])
+    parser.add_argument('--trigger_length',               default=5,        type=int, help='How long do we want the trigger to be')
+    parser.add_argument('--trigger_inversion_method',     default='discrete', type=str, help='Which trigger inversion method do we use', choices=['discrete', 'relaxed'])
+    parser.add_argument('--lmbda',                        default=1.0,      type=int, help='Weight on the evaluation loss')
+    parser.add_argument('--q_trigger_insertion_location', default='end',    type=str, help='Where in the question do we want to insert the trigger', choices=['start', 'end'])
+    parser.add_argument('--c_trigger_insertion_location', default='end',    type=str, help='Where in the context do we want to insert the trigger', choices=['start', 'end'])
     
+    # discrete trigger inversion specific variables
+    parser.add_argument('--num_candidates', default=50, type=int, help='How many candidates do we want to evaluate in each position during the discrete trigger inversion')
+    parser.add_argument('--beam_size',      default=1,  type=int, help='How big do we want the beam size during the discrete trigger inversion')
+    
+    
+
     # do not change these ones
-    parser.add_argument('--model_filepath', type=str, help='File path to the pytorch model file to be evaluated.', default='./model/model.pt')
-    parser.add_argument('--tokenizer_filepath', type=str, help='File path to the pytorch model (.pt) file containing the correct tokenizer to be used with the model_filepath.', default='./tokenizers/google-electra-small-discriminator.pt')
-    parser.add_argument('--result_filepath', type=str, help='File path to the file where output result should be written. After execution this file should contain a single line with a single floating point trojan probability.', default='./output.txt')
-    parser.add_argument('--scratch_dirpath', type=str, help='File path to the folder where scratch disk space exists. This folder will be empty at execution start and will be deleted at completion of execution.', default='./scratch')
-    parser.add_argument('--examples_dirpath', type=str, help='File path to the directory containing json file(s) that contains the examples which might be useful for determining whether a model is poisoned.', default='./model/example_data')
+    parser.add_argument('--model_filepath',     type=str, help='Filepath to the pytorch model file to be evaluated.', default='./model/model.pt')
+    parser.add_argument('--tokenizer_filepath', type=str, help='Filepath to the pytorch model (.pt) file containing the correct tokenizer to be used with the model_filepath.', default='./tokenizers/google-electra-small-discriminator.pt')
+    parser.add_argument('--result_filepath',    type=str, help='Filepath to the file where output result should be written. After execution this file should contain a single line with a single floating point trojan probability.', default='./output.txt')
+    parser.add_argument('--scratch_dirpath',    type=str, help='Filepath to the folder where scratch disk space exists. This folder will be empty at execution start and will be deleted at completion of execution.', default='./scratch')
+    parser.add_argument('--examples_dirpath',   type=str, help='Filepath to the directory containing json file(s) that contains the examples which might be useful for determining whether a model is poisoned.', default='./model/example_data')
   
     args = parser.parse_args()
     

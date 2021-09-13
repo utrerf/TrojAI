@@ -38,8 +38,7 @@ def postprocess_qa_predictions(
     null_score_diff_threshold: float = 0.0,
     output_dir: Optional[str] = None,
     prefix: Optional[str] = None,
-    is_world_process_zero: bool = True,
-):
+    is_world_process_zero: bool = True):
     """
     Post-processes the predictions of a question-answering model to convert them to answers that are substrings of the
     original contexts. This is the base postprocessing functions for models that only return start and end logits.
@@ -127,8 +126,9 @@ def postprocess_qa_predictions(
             end_indexes = np.argsort(end_logits)[-1 : -n_best_size - 1 : -1].tolist()
             for start_index in start_indexes:
                 for end_index in end_indexes:
-                    # Don't consider out-of-scope answers, either because the indices are out of bounds or correspond
+                    # 1. Don't consider out-of-scope answers, either because the indices are out of bounds or correspond
                     # to part of the input_ids that are not in the context.
+                    ''' We can do this with a mask '''
                     if (
                         start_index >= len(offset_mapping)
                         or end_index >= len(offset_mapping)
@@ -136,10 +136,11 @@ def postprocess_qa_predictions(
                         or offset_mapping[end_index] is None
                     ):
                         continue
-                    # Don't consider answers with a length that is either < 0 or > max_answer_length.
+                    # 2. Don't consider answers with a length that is either < 0 or > max_answer_length.
+                    ''' This is a lot harder because the mask is dinamyc and it interacts with a totally different variable '''
                     if end_index < start_index or end_index - start_index + 1 > max_answer_length:
                         continue
-                    # Don't consider answer that don't have the maximum context available (if such information is
+                    # 3. Don't consider answer that don't have the maximum context available (if such information is
                     # provided).
                     if token_is_max_context is not None and not token_is_max_context.get(str(start_index), False):
                         continue
