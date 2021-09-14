@@ -270,9 +270,11 @@ def trojan_detector(args):
                 [join(base_path, model_folder, 'model.pt') for model_folder in model_folders]       
             return clean_classification_model_paths
 
-        def load_clean_models(clean_model_filepath):
+        def load_clean_models(clean_model_filepath, max_models=10):
             clean_models = []
-            for f in clean_model_filepath:
+            for i, f in enumerate(clean_model_filepath):
+                if i >= max_models:
+                    break
                 clean_models.append(load_model(f))
             return clean_models
         
@@ -280,7 +282,7 @@ def trojan_detector(args):
         clean_train_models = load_clean_models(clean_train_models_filepath)
 
         clean_testing_model_filepath = get_clean_model_filepaths(config, is_testing=True)
-        clean_test_models = load_clean_models(clean_testing_model_filepath)
+        clean_test_models = load_clean_models(clean_testing_model_filepath, max_models=1)
 
         return {'eval': [classification_model],
                 'clean_train': clean_train_models,
@@ -797,10 +799,10 @@ if __name__ == "__main__":
     # remember to switch this to 1 when making a container
     parser.add_argument('--is_submission', default=0, choices=[0, 1], type=int, help='Flag to determine if this is a submission to the NIST server',  )
     parser.add_argument('--model_num',     default=115,               type=int, help="model number - only used if it's not a submission")                    
-    parser.add_argument('--batch_size',    default=2,                 type=int, help='What batch size', )
+    parser.add_argument('--batch_size',    default=10,                 type=int, help='What batch size', )
 
     # trigger inversion variables
-    parser.add_argument('--num_random_tries',             default=50,        type=int, help='How many random starts do we try')
+    parser.add_argument('--num_random_tries',             default=5,        type=int, help='How many random starts do we try')
     parser.add_argument('--trigger_length',               default=5,        type=int, help='How long do we want the trigger to be')
     parser.add_argument('--trigger_inversion_method',     default='discrete', type=str, help='Which trigger inversion method do we use', choices=['discrete', 'relaxed'])
     parser.add_argument('--lmbda',                        default=1.0,      type=int, help='Weight on the evaluation loss')
@@ -808,7 +810,7 @@ if __name__ == "__main__":
     parser.add_argument('--c_trigger_insertion_location', default='end',    type=str, help='Where in the context do we want to insert the trigger', choices=['start', 'end'])
     
     # discrete trigger inversion specific variables
-    parser.add_argument('--num_candidates', default=2, type=int, help='How many candidates do we want to evaluate in each position during the discrete trigger inversion')
+    parser.add_argument('--num_candidates', default=50, type=int, help='How many candidates do we want to evaluate in each position during the discrete trigger inversion')
     parser.add_argument('--beam_size',      default=1,  type=int, help='How big do we want the beam size during the discrete trigger inversion')
     
     
