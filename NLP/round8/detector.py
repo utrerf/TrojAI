@@ -802,8 +802,12 @@ def trojan_detector(args):
 
         # initialize w's randomly
         ws = torch.randn([args.trigger_length, input_id_embeddings['eval'].shape[-1]]).to(DEVICE)
+        # TODO(utrerf): change to randint in range(vocabsize)
         new_ws = torch.randn([args.trigger_length, input_id_embeddings['eval'].shape[-1]]).to(DEVICE)
-        
+        # TODO: define constraint using an embedding matrix
+        # constraint = chop.constraints.Polytope(vertices=input_embeddings)
+        # TODO: define loss using chop.utils.closure, with only 1 argument: the embedding we're optimizing over
+        # TODO(utrerf): remove while loop, and replace with chop.optim.minimize_pairwise_frank_wolfe
         while torch.allclose(ws, new_ws, rtol=args.rtol):
             ws = new_ws
             # calculate the resulting embeddings
