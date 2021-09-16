@@ -81,19 +81,19 @@ def insert_new_trigger(triggered_dataset, new_trigger, where_to_insert='input_id
     return triggered_dataset
 
 
-def get_fwd_var_list(model):
-    var_list = ['input_ids', 'attention_mask']
+def get_fwd_var_list(model, input_field='input_ids'):
+    var_list = [input_field, 'attention_mask']
     if ('distilbert' not in model.name_or_path) and ('bart' not in model.name_or_path):
             var_list += ['token_type_ids']
     return var_list
 
 
-def compute_loss(models, dataset, batch_size, with_gradient=False, train_or_test='train'):
+def compute_loss(models, dataset, batch_size, with_gradient=False, train_or_test='train', input_field='input_ids'):
     ''' 
     Computes the trigger inversion loss over all examples in the dataloader
     '''
     assert train_or_test in ['train', 'test']
-    var_list = get_fwd_var_list(models['eval'][0])
+    var_list = get_fwd_var_list(models['eval'][0], input_field=input_field)
     losses = {'clean_loss':[],
               'eval_loss': [],
               'trigger_inversion_loss': []}
@@ -798,48 +798,45 @@ def trojan_detector(args):
 
             return token_embeds_dataset
         embeds_dataset = map_to_token_embeds(triggered_dataset, models)
-        embeds_dataloader = torch.utils.data.DataLoader(embeds_dataset, batch_size=args.batch_size, shuffle=False)
+        embeds_dataset = {k: v.to(DEVICE) for k,v in embeds_dataset.column_names}
+        # embeds_dataloader = torch.utils.data.DataLoader(embeds_dataset, batch_size=args.batch_size, shuffle=False)
 
-        # initialize w's randomly
-        ws = torch.randn([args.trigger_length, input_id_embeddings['eval'].shape[-1]]).to(DEVICE)
-        # TODO(utrerf): change to randint in range(vocabsize)
-        new_ws = torch.randn([args.trigger_length, input_id_embeddings['eval'].shape[-1]]).to(DEVICE)
-        # TODO: define constraint using an embedding matrix
-        # constraint = chop.constraints.Polytope(vertices=input_embeddings)
+        def condensed_input_embeds(input_id_embeddings):
+            return torch.stack(input_id_embeddings['eval'], input_id_embeddings['clean_train']).mean()
+        condensed_input_embeds = condensed_input_embeds(input_id_embeddings)
+        
+        import chop
+        constraint = chop.constraints.Polytope(vertices=condensed_input_embeds)
+
+        rand_adv_token_id = torch.randint(0, len(condensed_input_embeds))
+
+        # minimize_pairwise_frank_wolfe
+        #     give the index of the starting token
+        #     returns the soluton as an object
+        #         x is the embedding
+        #         active_set is the lambda dictionary = {token_index : weight}
+
         # TODO: define loss using chop.utils.closure, with only 1 argument: the embedding we're optimizing over
-        # TODO(utrerf): remove while loop, and replace with chop.optim.minimize_pairwise_frank_wolfe
-        while torch.allclose(ws, new_ws, rtol=args.rtol):
-            ws = new_ws
-            # calculate the resulting embeddings
-            def get_es_from_ws(ws):
-                es_clean = ws @ input_id_embeddings['clean_train']
-                es_eval = ws @ input_id_embeddings['eval']
-                es = es_clean + LAMBDA*es_eval
-                return es
-            es = get_es_from_ws(ws)
+        @chop.utils.closure
+        def relaxed_loss_fn(adv_embedding):
+            # adv_embedding should be (768 vector)        
+            # TODO(trusty_patches): insert adv_embedding in the input as embeds within embeds_dataset
+            # Assume we only have a single-token trigger
+            # TODO(trusty_patches): 
+            #   compute_loss(models, embeds_dataset, args.batch_size, with_gradient=True, train_or_test='train', input_field='inputs_embeds')
+            # TODO: Might need/want to remove hooks from the model? Maybe consider branching if errors with CUDA?
+            return NotImplementedError
 
-            # insert embeddings into dataset
-            def insert_es_into_embeds_dataset(embeds_dataset, es):
-                embeds_dataset = insert_new_trigger(embeds_dataset, es, where_to_insert='token_embeds_eval')
-                embeds_dataset = insert_new_trigger(embeds_dataset, es, where_to_insert='token_embeds_clean_train')
-                embeds_dataloader = torch.utils.data.DataLoader(embeds_dataset, batch_size=args.batch_size, shuffle=False)
-                return embeds_dataset, embeds_dataloader
-            embeds_dataset, embeds_dataloader = insert_es_into_embeds_dataset(embeds_dataset, es)
-
-            # Define trigger inversion loss w.r.t. w's
-            def relaxed_loss_fn(models, embeds_dataloader, with_gradient=True, train_or_test='train'):
-                discrete_trigger_inversion_loss = compute_loss(models, dataloader, args.batch_size, with_gradient=with_gradient, train_or_test=train_or_test)
-                total_loss = discrete_trigger_inversion_loss + args.beta*ws.count_nonzero()
-                return total_loss
-            trigger_inversion_loss = relaxed_loss_fn(models, embeds_dataloader, with_gradient=False, train_or_test='train')
-            
-            # Minimize trigger_inversion_loss w.r.t. ws (Geoff's magic) for one iteration
-            def minimization_fn():
-                return NotImplementedError
-            new_ws = minimization_fn()
-
-        # check what we got :D
-
+        result = chop.optim.minimize_pairwise_frank_wolfe(
+                            relaxed_loss_fn,
+                            rand_adv_token_id,
+                            constraint,
+                            step='backtracking',
+                            lipschitz=None,
+                            max_iter=200,
+                            tol=1e-6,
+                            callback=None
+                            )
 
 
 
