@@ -1,0 +1,11 @@
+# run these comands sequentially
+
+conda create --name trojai-round8 python=3.8 -y
+
+conda activate trojai-round8
+
+conda install -name trojai-round8 pytorch torchvision torchtext cudatoolkit=11.1 -c pytorch-lts -c nvidia
+
+conda install --name trojai-round8 --file spec-file.txt
+
+pip install jsonpickle transformers datasets texttable
