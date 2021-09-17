@@ -25,7 +25,6 @@ import os
 from os.path import join
 import json
 from copy import deepcopy
-from numpy.core.fromnumeric import nonzero
 import pandas as pd
 from random import randint
 import torch
@@ -98,7 +97,7 @@ def compute_loss(models, dataset, batch_size, with_gradient=False, train_or_test
               'eval_loss': [],
               'trigger_inversion_loss': []}
     def batch_dataset(dataset):
-        n = len(dataset['input_ids'])//batch_size
+        n = (len(dataset['input_ids'])-1)//batch_size
         return [{k:v[i*batch_size:(i+1)*batch_size] for k,v in dataset.items()} for i in range(n+1)]
     batched_dataset = batch_dataset(dataset)
     for _, batch in enumerate(batched_dataset):  
@@ -267,7 +266,23 @@ def trojan_detector(args):
 
     # load all the models into a dictionary that contains eval, clean_train and clean_test
     @torch.no_grad()
-    def load_all_models(eval_model_filepath, config):
+    def get_clean_model_filepaths(config, is_testing=False, max_test_models=1):
+        key = f"{config['source_dataset'].lower()}_{config['model_architecture'].split('/')[-1]}"
+        model_name = config['output_filepath'].split('/')[-1]
+        base_path = CLEAN_TRAIN_MODELS_FILEPATH
+        max_models = None
+        if is_testing:
+            base_path = CLEAN_TEST_MODELS_FILEPATH
+            max_models = max_test_models
+        model_folders = [f for f in os.listdir(base_path) \
+                            if (key in f and model_name not in f)][:max_test_models]
+        clean_classification_model_paths = \
+            [join(base_path, model_folder, 'model.pt') for model_folder in model_folders]       
+        return clean_classification_model_paths
+    clean_model_filepaths = {'train':get_clean_model_filepaths(config, is_testing=False),
+                             'test': get_clean_model_filepaths(config, is_testing=True)}
+    @torch.no_grad()
+    def load_all_models(eval_model_filepath, clean_model_filepaths):
         def load_model(model_filepath):
             classification_model = torch.load(model_filepath, map_location=DEVICE)
             classification_model.eval()
@@ -275,36 +290,16 @@ def trojan_detector(args):
         
         classification_model = load_model(eval_model_filepath)
 
-        def get_clean_model_filepaths(config, is_testing=False):
-            key = f"{config['source_dataset'].lower()}_{config['model_architecture'].split('/')[-1]}"
-            model_name = config['output_filepath'].split('/')[-1]
-            base_path = CLEAN_TRAIN_MODELS_FILEPATH
-            if is_testing:
-                base_path = CLEAN_TEST_MODELS_FILEPATH
-            model_folders = [f for f in os.listdir(base_path) \
-                                if (key in f and model_name not in f)]
-            clean_classification_model_paths = \
-                [join(base_path, model_folder, 'model.pt') for model_folder in model_folders]       
-            return clean_classification_model_paths
-
-        def load_clean_models(clean_model_filepath, max_models=10):
+        def load_clean_models(clean_model_filepath):
             clean_models = []
-            for i, f in enumerate(clean_model_filepath):
-                if i >= max_models:
-                    break
+            for f in clean_model_filepath:
                 clean_models.append(load_model(f))
             return clean_models
-        
-        clean_train_models_filepath = get_clean_model_filepaths(config, is_testing=False)
-        clean_train_models = load_clean_models(clean_train_models_filepath)
-
-        clean_testing_model_filepath = get_clean_model_filepaths(config, is_testing=True)
-        clean_test_models = load_clean_models(clean_testing_model_filepath, max_models=1)
 
         return {'eval': [classification_model],
-                'clean_train': clean_train_models,
-                'clean_test': clean_test_models}
-    models = load_all_models(args.eval_model_filepath, config)   
+                'clean_train': load_clean_models(clean_model_filepaths['train']),
+                'clean_test': load_clean_models(clean_model_filepaths['test'])}
+    models = load_all_models(args.eval_model_filepath, clean_model_filepaths)   
     
     # add hooks to pull the gradient out from all models
     def add_hooks_to_all_models(models):
@@ -348,17 +343,27 @@ def trojan_detector(args):
 
     # load the dataset with text containing questions and answers
     @torch.no_grad()
-    def load_dataset(examples_dirpath, scratch_dirpath):
-        # clean example inference
-        fns = [os.path.join(examples_dirpath, fn) for fn in os.listdir(examples_dirpath) if fn.endswith('.json')]
-        fns.sort()
-        examples_filepath = fns[0]
+    def load_dataset(examples_dirpath, scratch_dirpath, clean_model_filepaths=None, more_clean_data=False):
+        clean_fns = []
+        if more_clean_data:
+            for model_type_paths in clean_model_filepaths.values():
+                clean_examples_dirpath_list = ['/'.join(v.split('/')[:-1]+['example_data']) for v in model_type_paths]
+                for dirpath in clean_examples_dirpath_list:
+                    clean_fns += [os.path.join(dirpath, fn) for fn in os.listdir(dirpath) if (fn.endswith('.json') and 'clean'in fn)]
 
-        # Load the examples
-        # TODO The cache_dir is required for the test server since /home/trojai is not writable and the default cache locations is ~/.cache
-        dataset = datasets.load_dataset('json', data_files=[examples_filepath], field='data', keep_in_memory=True, split='train', cache_dir=os.path.join(scratch_dirpath, '.cache'))
-        return dataset
-    dataset = load_dataset(args.examples_dirpath, args.scratch_dirpath)
+        fns = [os.path.join(examples_dirpath, fn) for fn in os.listdir(examples_dirpath) if (fn.endswith('.json') and 'clean'in fn)]
+        fns.sort()
+        
+        examples_filepath_list = fns + clean_fns
+
+        dataset_list = []
+        for examples_filepath in examples_filepath_list:
+            # Load the examples
+            # TODO The cache_dir is required for the test server since /home/trojai is not writable and the default cache locations is ~/.cache
+            dataset_list.append(datasets.load_dataset('json', data_files=[examples_filepath], field='data', keep_in_memory=True, split='train', cache_dir=os.path.join(scratch_dirpath, '.cache')))
+        
+        return datasets.concatenate_datasets(dataset_list)
+    dataset = load_dataset(args.examples_dirpath, args.scratch_dirpath, clean_model_filepaths, more_clean_data=args.more_clean_data)
     
     # tokenize the dataset to be able to feed it to the NLP model during inference
     @torch.no_grad()
@@ -679,6 +684,8 @@ def trojan_detector(args):
                     eval_grad_dot_embed_matrix  = torch.einsum("ij,kj->ik", (eval_trigger_grads,  input_id_embeddings['eval']))
                     clean_grad_dot_embed_matrix = torch.einsum("ij,kj->ik", (clean_trigger_grads, input_id_embeddings['clean_train']))
 
+                    # consider normalizing the embeds
+
                     gradient_dot_embedding_matrix = clean_grad_dot_embed_matrix + LAMBDA*eval_grad_dot_embed_matrix
                     _, best_k_ids = torch.topk(-gradient_dot_embedding_matrix, num_candidates, dim=1)
 
@@ -854,7 +861,8 @@ def trojan_detector(args):
                  f'_num_random_tries_{args.num_random_tries}'+\
                  f'_batch_size_{args.batch_size}'+\
                  f'_triger_locs_{args.q_trigger_insertion_location}_{args.c_trigger_insertion_location}'+\
-                 f'_beam_size_{args.beam_size}'
+                 f'_beam_size_{args.beam_size}'+\
+                 f'_more_clean_data_{args.beam_size}'
         check_if_folder_exists(folder)
         df = pd.DataFrame(columns=['trigger_token_ids', 'decoded_trigger', 'train_trigger_inversion_loss', 'test_trigger_inversion_loss'])
         df.loc[0] = [new_trigger, tokenizer.decode(best_trigger), round(best_train_loss['trigger_inversion_loss'], 3), round(best_test_loss['trigger_inversion_loss'], 3)]
@@ -866,16 +874,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Trojan Detector for Question & Answering Tasks.')
 
     # remember to switch this to 1 when making a container
-    parser.add_argument('--is_submission', default=0, choices=[0, 1], type=int, help='Flag to determine if this is a submission to the NIST server',  )
-    parser.add_argument('--model_num',     default=117,               type=int, help="model number - only used if it's not a submission")                    
-    parser.add_argument('--batch_size',    default=15,                 type=int, help='What batch size', )
+    parser.add_argument('--is_submission', dest='is_submission', action='store_true', help='Flag to determine if this is a submission to the NIST server',  )
+    parser.add_argument('--model_num',     default=116,               type=int, help="model number - only used if it's not a submission")                    
+    parser.add_argument('--batch_size',    default=10,                 type=int, help='What batch size', )
+    parser.add_argument('--more_clean_data', dest='more_clean_data', action='store_true', help='Flag to determine if we want to grab clean examples from the clean models',  )
 
     # trigger inversion variables
     parser.add_argument('--num_random_tries',             default=2,            type=int,   help='How many random starts do we try')
     parser.add_argument('--trigger_length',               default=5,            type=int,   help='How long do we want the trigger to be')
     parser.add_argument('--trigger_inversion_method',     default='discrete',   type=str,   help='Which trigger inversion method do we use', choices=['discrete', 'relaxed'])
     parser.add_argument('--lmbda',                        default=1.0,          type=float, help='Weight on the evaluation loss')
-    parser.add_argument('--q_trigger_insertion_location', default='end',        type=str,   help='Where in the question do we want to insert the trigger', choices=['start', 'end'])
+    parser.add_argument('--q_trigger_insertion_location', default='start',      type=str,   help='Where in the question do we want to insert the trigger', choices=['start', 'end'])
     parser.add_argument('--c_trigger_insertion_location', default='end',        type=str,   help='Where in the context do we want to insert the trigger', choices=['start', 'end'])
     
     # discrete trigger inversion specific variables
@@ -892,7 +901,8 @@ if __name__ == "__main__":
     parser.add_argument('--result_filepath',    type=str, help='Filepath to the file where output result should be written. After execution this file should contain a single line with a single floating point trojan probability.', default='./output.txt')
     parser.add_argument('--scratch_dirpath',    type=str, help='Filepath to the folder where scratch disk space exists. This folder will be empty at execution start and will be deleted at completion of execution.', default='./scratch')
     parser.add_argument('--examples_dirpath',   type=str, help='Filepath to the directory containing json file(s) that contains the examples which might be useful for determining whether a model is poisoned.', default='./model/example_data')
-  
+    
+    parser.set_defaults(is_submission=False, more_clean_data=True)
     args = parser.parse_args()
     
     def modify_args_for_training(args):
