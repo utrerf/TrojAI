@@ -2,18 +2,28 @@ import os
 import time
 import subprocess
 import shlex
-import pandas as pd
-import numpy as np
 
-gpu_list = [0, 5, 6, 7]
+import argparse
+
+parser = argparse.ArgumentParser(description='Trojan Detector for Question & Answering Tasks.')
+
+parser.add_argument('--gpu',    '--list', nargs='+', required=True,          type=int, help='Which GPU', )
+parser.add_argument('--q_trigger_insertion_location', default='start',      type=str,   help='Where in the question do we want to insert the trigger', choices=['start', 'end'])
+parser.add_argument('--c_trigger_insertion_location', default='end',        type=str,   help='Where in the context do we want to insert the trigger', choices=['start', 'end'])
+
+args = parser.parse_args()
+
+gpu_list = args.gpu
 gpus_per_command = 1
 polling_delay_seconds = .1
-# os.environ['MKL_THREADING_LAYER'] = 'GNU'
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 
 # CONSTANTS
-models = list(range(190))
-commands_to_run = [f'python detector.py --model_num {i}' for i in models]
+# models = list(range(125))
+models = [100, 81, 113, 107, 99, 75, 41, 112, 40, 54, 31]
+commands_to_run = [f'python detector.py --model_num {i} --more_clean_data '+\
+                   f'--q_trigger_insertion_location {args.q_trigger_insertion_location} '+\
+                   f'--c_trigger_insertion_location {args.c_trigger_insertion_location} ' for i in models]
 commands_to_run.reverse()
 def poll_process(process):
     time.sleep(polling_delay_seconds)

@@ -111,6 +111,23 @@ def compute_loss(models, dataset, batch_size, with_gradient=False, train_or_test
             for clean_model in models[f'clean_{train_or_test}']:
                 add_logits('clean', clean_model(**{v:batch[v] for v in var_list}))
             
+            input_length = batch['input_ids'].shape[-1]
+            def new_loss_fn(batch, all_logits):
+                def get_trigger_probs(batch, all_logits, model_type='clean'):
+                    logit_matrix = all_logits[f'{model_type}_start'][0].unsqueeze(1).expand(-1,input_length,-1) + all_logits[f'{model_type}_end'][0].unsqueeze(-1).expand(-1,-1, input_length)
+                    scores = torch.exp(logit_matrix - torch.amax(logit_matrix, dim=[1,2]).view(-1, 1, 1).expand(-1, input_length, input_length))
+                    masked_scores = scores * batch['valid_mask']
+                    probs = masked_scores/torch.sum(masked_scores, dim=[1,2]).view(-1,1,1).expand(-1, input_length, input_length)
+                    trigger_probs = probs[batch['trigger_matrix_mask'].bool()].reshape(batch['input_ids'].shape[0], -1).sum(-1)
+                    return trigger_probs
+
+                c = -torch.log(1 - get_trigger_probs(batch, all_logits, model_type='clean')).mean()
+                e = -torch.log(    get_trigger_probs(batch, all_logits, model_type='eval' )).mean()
+                return {'clean_loss': c.detach(),
+                        'eval_loss': e.detach(),
+                        'trigger_inversion_loss': c + LAMBDA*e}
+                        
+
             def trigger_inversion_loss_fn(batch, all_logits):
                 '''
                 Returns the trigger inversion loss, which is:
@@ -203,7 +220,8 @@ def compute_loss(models, dataset, batch_size, with_gradient=False, train_or_test
                 return {'clean_loss': c.detach(),
                         'eval_loss': e.detach(),
                         'trigger_inversion_loss': c + LAMBDA*e}
-            loss = trigger_inversion_loss_fn(batch, all_logits) 
+            # loss = trigger_inversion_loss_fn(batch, all_logits) 
+            loss = new_loss_fn(batch, all_logits) 
             for k, v in loss.items():
                 loss[k] = v*len(batch['input_ids'])
             return loss
@@ -330,6 +348,28 @@ def trojan_detector(args):
             add_hooks(clean_model, is_clean=True)
     add_hooks_to_all_models(models)
 
+    @torch.no_grad()
+    def get_all_input_id_embeddings():
+        def get_embedding_weight(model):
+            def find_word_embedding_module(model):
+                word_embedding_tuple = [(name, module) 
+                    for name, module in model.named_modules() 
+                    if 'embeddings.word_embeddings' in name]
+                assert len(word_embedding_tuple) == 1
+                return word_embedding_tuple[0][1]
+            word_embedding = find_word_embedding_module(model)
+            word_embedding = deepcopy(word_embedding.weight).detach().to(CPU)
+            word_embedding.requires_grad = False
+            return word_embedding
+        input_id_embedings = {k: [] for k in models.keys()}
+        for model_type, model_list in models.items():
+            for model in model_list:
+                input_id_embedings[model_type].append(get_embedding_weight(model))
+            input_id_embedings[model_type] = torch.stack(input_id_embedings[model_type]).mean(0)
+        return input_id_embedings
+    input_id_embeddings = get_all_input_id_embeddings()
+    embed_length = input_id_embeddings['eval'].shape[-1]
+
     # load the tokenizer that will convert text into input_ids (i.e. tokens) and viceversa
     @torch.no_grad()
     def load_tokenizer(is_submission, tokenizer_filepath, config):
@@ -361,8 +401,9 @@ def trojan_detector(args):
             # Load the examples
             # TODO The cache_dir is required for the test server since /home/trojai is not writable and the default cache locations is ~/.cache
             dataset_list.append(datasets.load_dataset('json', data_files=[examples_filepath], field='data', keep_in_memory=True, split='train', cache_dir=os.path.join(scratch_dirpath, '.cache')))
-        
+
         return datasets.concatenate_datasets(dataset_list)
+        
     dataset = load_dataset(args.examples_dirpath, args.scratch_dirpath, clean_model_filepaths, more_clean_data=args.more_clean_data)
     
     # tokenize the dataset to be able to feed it to the NLP model during inference
@@ -531,13 +572,13 @@ def trojan_detector(args):
 
         is_context_first = tokenizer.padding_side != 'right'
         
-        def initialize_dummy_trigger_helper(dataset_instance):
+        def initialize_dummy_trigger_helper(dataset_instance_source):
 
-            input_id, att_mask, token_type, q_pos, c_pos = [deepcopy(torch.tensor(dataset_instance[x])) for x in \
+            input_id, att_mask, token_type, q_pos, c_pos = [deepcopy(torch.tensor(dataset_instance_source[x])) for x in \
                 ['input_ids', 'attention_mask', 'token_type_ids', 'question_start_and_end', 'context_start_and_end']]
             
-            for var_name in ['input_ids', 'attention_mask', 'token_type_ids', 'q_trigger_mask', 'c_trigger_mask']:
-                dataset_instance[var_name] = None
+            var_list = ['input_ids', 'attention_mask', 'token_type_ids', 'q_trigger_mask', 'c_trigger_mask', 'cls_mask', 'trigger_matrix_mask']
+            dataset_instance = {var_name:None for var_name in var_list}
 
             def get_ix(insertion_location, start_end_ix, is_second_trigger=False):            
                 offset = 0
@@ -588,8 +629,7 @@ def trojan_detector(args):
             
             # make context_mask
             old_context_mask = torch.zeros_like(input_id)
-            old_context_mask[dataset_instance['context_start_and_end'][0]:
-                            dataset_instance['context_start_and_end'][1]+1] = 1
+            old_context_mask[c_pos[0]: c_pos[1]+1] = 1
             dataset_instance['context_mask'] = insert_tensors_in_var(old_context_mask, torch.ones(trigger_length))
 
             # make cls_mask
@@ -599,45 +639,48 @@ def trojan_detector(args):
             cls_mask = torch.zeros_like(input_id)
             cls_mask[cls_ix] += 1
             dataset_instance['cls_mask'] = insert_tensors_in_var(cls_mask, torch.zeros(trigger_length))
+            
+            
+            input_length = dataset_instance['c_trigger_mask'].shape[-1]
+            matrix_mask = torch.zeros([input_length, input_length]).long()
+            # matrix_mask[cls_ix, cls_ix] += 1
+            trigger_ixs = dataset_instance['c_trigger_mask'].nonzero().flatten()
+            for curr_ix, i in enumerate(trigger_ixs):
+                for j in trigger_ixs[curr_ix:]:
+                    matrix_mask[i, j] += 1
+
+            dataset_instance['trigger_matrix_mask'] = matrix_mask
+
 
             return dataset_instance
         
         triggered_dataset = tokenized_dataset.map(
             initialize_dummy_trigger_helper,
             batched=False,
-            num_proc=2,
+            num_proc=1,
             keep_in_memory=True)
 
+        # triggered_dataset.set_format(type='numpy', columns=list(triggered_dataset.column_names), output_all_columns=True)
         triggered_dataset = triggered_dataset.remove_columns([f'{v}_start_and_end' for v in ['question', 'context', 'answer']])
-        triggered_dataset.set_format('pt', columns=triggered_dataset.column_names)
+        # triggered_dataset.set_format('pt', columns=triggered_dataset.column_names)
+        # triggered_dataset.set_format(type='torch', columns=list(triggered_dataset.column_names), output_all_columns=True)
 
         return triggered_dataset
     triggered_dataset = initialize_dummy_trigger(tokenized_dataset, tokenizer, args.trigger_length, args.trigger_insertion_locations)
-    triggered_dataset = {k: triggered_dataset[k].to(DEVICE) for k in triggered_dataset.column_names}
-
+    triggered_dataset = {k: torch.tensor(triggered_dataset[k], device=DEVICE) for k in triggered_dataset.column_names}
+    def insert_valid_mask(triggered_dataset):
+        input_length = triggered_dataset['input_ids'].shape[-1]
+        with torch.no_grad():
+            valid_mask = torch.zeros([input_length, input_length], device=DEVICE)
+            for i in range(input_length):
+                for j in range(i, input_length):
+                    valid_mask[i, j] = 1
+            valid_mask = valid_mask.bool()
+            triggered_dataset['valid_mask'] = valid_mask.unsqueeze(0).expand(triggered_dataset['input_ids'].shape[0], -1, -1)
+    insert_valid_mask(triggered_dataset)
+    # triggered_dataset['trigger_matrix_mask'] = torch.tensor(torch.stack([torch.array(i, device=DEVICE) for i in triggered_dataset['trigger_matrix_mask']]))
     # remove unnecessary variables
     del dataset, tokenized_dataset
-
-    @torch.no_grad()
-    def get_all_input_id_embeddings():
-        def get_embedding_weight(model):
-            def find_word_embedding_module(model):
-                word_embedding_tuple = [(name, module) 
-                    for name, module in model.named_modules() 
-                    if 'embeddings.word_embeddings' in name]
-                assert len(word_embedding_tuple) == 1
-                return word_embedding_tuple[0][1]
-            word_embedding = find_word_embedding_module(model)
-            word_embedding = deepcopy(word_embedding.weight).detach().to(CPU)
-            word_embedding.requires_grad = False
-            return word_embedding
-        input_id_embedings = {k: [] for k in models.keys()}
-        for model_type, model_list in models.items():
-            for model in model_list:
-                input_id_embedings[model_type].append(get_embedding_weight(model))
-            input_id_embedings[model_type] = torch.stack(input_id_embedings[model_type]).mean(0)
-        return input_id_embedings
-    input_id_embeddings = get_all_input_id_embeddings()
 
     
 
@@ -862,7 +905,8 @@ def trojan_detector(args):
                  f'_batch_size_{args.batch_size}'+\
                  f'_triger_locs_{args.q_trigger_insertion_location}_{args.c_trigger_insertion_location}'+\
                  f'_beam_size_{args.beam_size}'+\
-                 f'_more_clean_data_{args.beam_size}'
+                 f'_more_clean_data_{args.more_clean_data}'+\
+                 f'_special_context_trigger_experiment'
         check_if_folder_exists(folder)
         df = pd.DataFrame(columns=['trigger_token_ids', 'decoded_trigger', 'train_trigger_inversion_loss', 'test_trigger_inversion_loss'])
         df.loc[0] = [new_trigger, tokenizer.decode(best_trigger), round(best_train_loss['trigger_inversion_loss'], 3), round(best_test_loss['trigger_inversion_loss'], 3)]
@@ -875,7 +919,7 @@ if __name__ == "__main__":
 
     # remember to switch this to 1 when making a container
     parser.add_argument('--is_submission', dest='is_submission', action='store_true', help='Flag to determine if this is a submission to the NIST server',  )
-    parser.add_argument('--model_num',     default=116,               type=int, help="model number - only used if it's not a submission")                    
+    parser.add_argument('--model_num',     default=113,               type=int, help="model number - only used if it's not a submission")                    
     parser.add_argument('--batch_size',    default=10,                 type=int, help='What batch size', )
     parser.add_argument('--more_clean_data', dest='more_clean_data', action='store_true', help='Flag to determine if we want to grab clean examples from the clean models',  )
 
