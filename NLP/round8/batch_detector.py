@@ -8,8 +8,8 @@ import argparse
 parser = argparse.ArgumentParser(description='Trojan Detector for Question & Answering Tasks.')
 
 parser.add_argument('--gpu',    '--list', nargs='+', required=True,          type=int, help='Which GPU', )
-parser.add_argument('--q_trigger_insertion_location', default='start',      type=str,   help='Where in the question do we want to insert the trigger', choices=['start', 'end'])
-parser.add_argument('--c_trigger_insertion_location', default='end',        type=str,   help='Where in the context do we want to insert the trigger', choices=['start', 'end'])
+parser.add_argument('--q_trigger_insertion_location', default='end',         type=str,   help='Where in the question do we want to insert the trigger', choices=['start', 'end'])
+parser.add_argument('--c_trigger_insertion_location', default='end',         type=str,   help='Where in the context do we want to insert the trigger', choices=['start', 'end'])
 
 args = parser.parse_args()
 
