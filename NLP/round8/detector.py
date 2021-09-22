@@ -123,7 +123,7 @@ def compute_loss(models, dataset, batch_size, with_gradient=False, train_or_test
                     trigger_probs = probs[batch['trigger_matrix_mask'].bool()].reshape(batch['input_ids'].shape[0], -1).sum(-1)
                     return trigger_probs
 
-                c = -torch.log(1 - get_trigger_probs(batch, all_logits, model_type='clean')).mean()
+                c = -torch.log(1 - torch.max(get_trigger_probs(batch, all_logits, model_type='clean')-batch['clean_cls_likelihoods'].mean(1), torch.zeros(len(batch['input_ids']), device=DEVICE))).mean()
                 e = -torch.log(    get_trigger_probs(batch, all_logits, model_type='eval' )).mean()
                 return {'clean_loss': c.detach(),
                         'eval_loss': e.detach(),
