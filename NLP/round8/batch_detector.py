@@ -10,6 +10,8 @@ parser = argparse.ArgumentParser(description='Trojan Detector for Question & Ans
 parser.add_argument('--gpu',    '--list', nargs='+', required=True,          type=int, help='Which GPU', )
 parser.add_argument('--q_trigger_insertion_location', default='end',         type=str,   help='Where in the question do we want to insert the trigger', choices=['start', 'end'])
 parser.add_argument('--c_trigger_insertion_location', default='end',         type=str,   help='Where in the context do we want to insert the trigger', choices=['start', 'end'])
+parser.add_argument('--trigger_behavior',             default='self',       type=str,   help='Where does the trigger point to?', choices=['self', 'cls'])
+parser.add_argument('--trigger_insertion_type',       default='context',    type=str,   help='Where is the trigger inserted', choices=['context', 'question', 'both'])
 
 args = parser.parse_args()
 
@@ -19,10 +21,12 @@ polling_delay_seconds = .1
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 
 # CONSTANTS
-# models = list(range(125))
-models = [100, 81, 113, 107, 99, 75, 41, 112, 40, 54, 31]
+models = list(range(125))
+# models = [100, 81, 113, 107, 99, 75, 41, 112, 40, 54, 31]
 commands_to_run = [f'python detector.py --model_num {i} --more_clean_data '+\
                    f'--q_trigger_insertion_location {args.q_trigger_insertion_location} '+\
+                   f'--trigger_behavior {args.trigger_behavior} '+\
+                   f'--trigger_insertion_type {args.trigger_insertion_type} '+\
                    f'--c_trigger_insertion_location {args.c_trigger_insertion_location} ' for i in models]
 commands_to_run.reverse()
 def poll_process(process):
