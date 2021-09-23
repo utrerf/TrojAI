@@ -12,6 +12,8 @@ parser.add_argument('--q_trigger_insertion_location', default='end',         typ
 parser.add_argument('--c_trigger_insertion_location', default='end',         type=str,   help='Where in the context do we want to insert the trigger', choices=['start', 'end'])
 parser.add_argument('--trigger_behavior',             default='self',       type=str,   help='Where does the trigger point to?', choices=['self', 'cls'])
 parser.add_argument('--trigger_insertion_type',       default='context',    type=str,   help='Where is the trigger inserted', choices=['context', 'question', 'both'])
+parser.add_argument('--lmbda',                        default=1.0,          type=float, help='Weight on the clean loss')
+parser.add_argument('--temperature',                  default=1,             type=float, help='Temperature parameter to divide logits by')
 
 args = parser.parse_args()
 
@@ -25,6 +27,8 @@ models = list(range(125))
 # models = [100, 81, 113, 107, 99, 75, 41, 112, 40, 54, 31]
 commands_to_run = [f'python detector.py --model_num {i} --more_clean_data '+\
                    f'--q_trigger_insertion_location {args.q_trigger_insertion_location} '+\
+                   f'--lmbda {args.lmbda} '+\
+                   f'--temperature {args.temperature} '+\
                    f'--trigger_behavior {args.trigger_behavior} '+\
                    f'--trigger_insertion_type {args.trigger_insertion_type} '+\
                    f'--c_trigger_insertion_location {args.c_trigger_insertion_location} ' for i in models]

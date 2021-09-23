@@ -95,11 +95,14 @@ def compute_loss(models, dataset, batch_size, with_gradient=False, train_or_test
                 add_logits('clean', clean_model(**{v:batch[v] for v in var_list}))
             
             def loss_fn(batch, all_logits):
-                def get_trigger_probs(batch, all_logits, model_type='clean'):
+                def get_trigger_probs(batch, all_logits, loss_type='clean'):
                     input_length = batch['input_ids'].shape[-1]
-                    logit_matrix = all_logits[f'{model_type}_start'][0].unsqueeze(1).expand(-1,input_length,-1) + all_logits[f'{model_type}_end'][0].unsqueeze(-1).expand(-1,-1, input_length)
+                    logit_matrix = all_logits[f'{loss_type}_start'][0].unsqueeze(1).expand(-1,input_length,-1) + all_logits[f'{loss_type}_end'][0].unsqueeze(-1).expand(-1,-1, input_length)
                     # scores = torch.exp(logit_matrix - torch.amax(logit_matrix, dim=[1,2]).view(-1, 1, 1).expand(-1, input_length, input_length))
-                    scores = torch.exp(logit_matrix) * batch['valid_mask']
+                    temperature = args.temperature
+                    if (train_or_test == 'test') or (loss_type == 'clean'):
+                        temperature = 1
+                    scores = torch.exp(logit_matrix/temperature) * batch['valid_mask']
                     probs = scores/torch.sum(scores, dim=[1,2]).view(-1,1,1).expand(-1, input_length, input_length)
                     trigger_probs = probs[batch['trigger_matrix_mask'].bool()].reshape(batch['input_ids'].shape[0], -1).sum(-1)
                     return trigger_probs
@@ -108,13 +111,15 @@ def compute_loss(models, dataset, batch_size, with_gradient=False, train_or_test
                 baseline = torch.zeros(len(batch['input_ids']), device=DEVICE)
                 if args.trigger_behavior == 'cls':
                     baseline = batch['clean_cls_likelihoods']
-                c = -torch.log(1 - torch.max(get_trigger_probs(batch, all_logits, model_type='clean')-baseline, torch.zeros(len(batch['input_ids']), device=DEVICE))).mean()
-                e = -torch.log(    get_trigger_probs(batch, all_logits, model_type='eval' )).mean()
+                # if args.trigger_behavior == 'cls' and train_or_test == 'train':
+                #     baseline = batch['clean_cls_likelihoods_temp']
+                c = -torch.log(1 - torch.max(get_trigger_probs(batch, all_logits, loss_type='clean')-baseline, torch.zeros(len(batch['input_ids']), device=DEVICE))).mean()
+                e = -torch.log(    get_trigger_probs(batch, all_logits, loss_type='eval' )).mean()
                 # scale the loss
                 m = len(batch['input_ids'])
-                return {'clean_loss': m*c.detach(),
+                return {'clean_loss': LAMBDA*m*c.detach(),
                         'eval_loss': m*e.detach(),
-                        'trigger_inversion_loss': m*(c + LAMBDA*e)}                        
+                        'trigger_inversion_loss': m*(LAMBDA*c + e)}                        
             return loss_fn(batch, all_logits) 
         
         if with_gradient == False:
@@ -339,7 +344,8 @@ def trojan_detector(args):
             
             # initialize lists
             var_list = ['question_start_and_end', 'context_start_and_end', 
-                        'clean_cls_likelihoods', 'answer_start_and_end']
+                        'clean_cls_likelihoods', 'clean_cls_likelihoods_temp', 
+                        'answer_start_and_end']
             for var_name in var_list:
                 tokenized_examples[var_name] = []
             
@@ -434,10 +440,16 @@ def trojan_detector(args):
                 for i in range(len(valid_answer_mask)):
                     for j in range(i, len(valid_answer_mask)):
                         valid_answer_mask[i, j] = 1
+                
+                scores_temp = torch.exp(logit_matrix/args.temperature) * valid_answer_mask.bool()
+                probs_temp = scores_temp/torch.sum(scores_temp, dim=[0,1])
+                cls_probs_temp = probs_temp[0,0]
+                
                 scores = torch.exp(logit_matrix) * valid_answer_mask.bool()
                 probs = scores/torch.sum(scores, dim=[0,1])
                 cls_probs = probs[0,0]
 
+                tokenized_examples['clean_cls_likelihoods_temp'].append(cls_probs_temp)
                 tokenized_examples['clean_cls_likelihoods'].append(cls_probs)
 
             return tokenized_examples
@@ -647,7 +659,7 @@ def trojan_detector(args):
 
                     # consider normalizing the embeds
 
-                    gradient_dot_embedding_matrix = clean_grad_dot_embed_matrix + LAMBDA*eval_grad_dot_embed_matrix
+                    gradient_dot_embedding_matrix = LAMBDA*clean_grad_dot_embed_matrix + eval_grad_dot_embed_matrix
                     _, best_k_ids = torch.topk(-gradient_dot_embedding_matrix, num_candidates, dim=1)
 
                     return best_k_ids
@@ -831,8 +843,16 @@ def trojan_detector(args):
                  f'_trigger_insertion_{args.trigger_insertion_type}'+\
                  f'_trigger_behavior_{args.trigger_behavior}'
         check_if_folder_exists(folder)
-        df = pd.DataFrame(columns=['trigger_token_ids', 'decoded_trigger', 'train_trigger_inversion_loss', 'test_trigger_inversion_loss'])
-        df.loc[0] = [new_trigger, tokenizer.decode(best_trigger), round(best_train_loss['trigger_inversion_loss'], 3), round(best_test_loss['trigger_inversion_loss'], 3)]
+        df = pd.DataFrame(columns=['trigger_token_ids', 
+                                   'decoded_trigger', 
+                                   'train_trigger_inversion_loss', 
+                                   'test_trigger_inversion_loss'])
+        df.loc[0] = [new_trigger, 
+                     tokenizer.decode(best_trigger), 
+                     round(best_train_loss['trigger_inversion_loss'], 3), 
+                     round(best_test_loss['eval_loss'], 3),
+                     round(best_test_loss['clean_loss'], 3),
+                     round(best_test_loss['trigger_inversion_loss'], 3)]
         df.to_csv(os.path.join(folder, f'{args.model_num}.csv'))
     save_results()
 
@@ -847,12 +867,13 @@ if __name__ == "__main__":
     parser.add_argument('--more_clean_data', dest='more_clean_data', action='store_true', help='Flag to determine if we want to grab clean examples from the clean models',  )
 
     # trigger inversion variables
-    parser.add_argument('--trigger_behavior',             default='cls',       type=str,   help='Where does the trigger point to?', choices=['self', 'cls'])
-    parser.add_argument('--trigger_insertion_type',       default='both',    type=str,   help='Where is the trigger inserted', choices=['context', 'question', 'both'])
-    parser.add_argument('--num_random_tries',             default=3,           type=int,   help='How many random starts do we try')
-    parser.add_argument('--trigger_length',               default=20,           type=int,   help='How long do we want the trigger to be')
-    parser.add_argument('--trigger_inversion_method',     default='discrete',   type=str,   help='Which trigger inversion method do we use', choices=['discrete', 'relaxed'])
-    parser.add_argument('--lmbda',                        default=1.0,          type=float, help='Weight on the evaluation loss')
+    parser.add_argument('--trigger_behavior',             default='cls',          type=str,   help='Where does the trigger point to?', choices=['self', 'cls'])
+    parser.add_argument('--trigger_insertion_type',       default='both',         type=str,   help='Where is the trigger inserted', choices=['context', 'question', 'both'])
+    parser.add_argument('--num_random_tries',             default=1,              type=int,   help='How many random starts do we try')
+    parser.add_argument('--trigger_length',               default=20,             type=int,   help='How long do we want the trigger to be')
+    parser.add_argument('--trigger_inversion_method',     default='discrete',     type=str,   help='Which trigger inversion method do we use', choices=['discrete', 'relaxed'])
+    parser.add_argument('--lmbda',                        default=.1,           type=float, help='Weight on the clean loss')
+    parser.add_argument('--temperature',                  default=10,             type=float, help='Temperature parameter to divide logits by')
     parser.add_argument('--q_trigger_insertion_location', default='start',        type=str,   help='Where in the question do we want to insert the trigger', choices=['start', 'end'])
     parser.add_argument('--c_trigger_insertion_location', default='start',        type=str,   help='Where in the context do we want to insert the trigger', choices=['start', 'end'])
     
