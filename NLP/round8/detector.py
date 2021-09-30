@@ -110,6 +110,7 @@ def compute_loss(models, dataset, batch_size, with_gradient=False, train_or_test
                     if train_or_test == 'test':
                         best_ans_ixs = torch.arange(len(probs)), probs.view(len(probs), -1).argmax(-1)
                         num_triggered = batch['trigger_matrix_mask'].bool().view(len(probs), -1)[best_ans_ixs].sum()
+                    
                     input_trigger_probs = (probs*batch['trigger_matrix_mask'].expand(probs.shape)).sum(dim=[-1,-2])
                     if populate_baselines:
                         batch[f'{train_or_test}_{loss_type}_baseline_likelihoods'] = input_trigger_probs.detach()
@@ -492,135 +493,144 @@ def trojan_detector(args):
         tokenized_dataset = select_examples_with_answer_in_context()
 
     # add a dummy trigger into input_ids, attention_mask, and token_type as well as provide masks for loss calculations
-    @torch.no_grad()
-    def initialize_dummy_trigger(tokenized_dataset, tokenizer, trigger_length, trigger_insertion_locations):
+    trigger_insertion_locations_list = [['start', 'start'], ['start', 'end'], ['end', 'start'], ['end', 'end']]
+    trigger_dataset_list = []
+    for trigger_insertion_locations in trigger_insertion_locations_list:
+        @torch.no_grad()
+        def initialize_dummy_trigger(tokenized_dataset, tokenizer, trigger_length, trigger_insertion_locations):
 
-        is_context_first = tokenizer.padding_side != 'right'
-        c_trigger_length, q_trigger_length = 0, 0
-        if args.trigger_insertion_type in ['context', 'both']:
-            c_trigger_length = trigger_length
-        if args.trigger_insertion_type in ['question', 'both']:
-            q_trigger_length = trigger_length
-        
-        def initialize_dummy_trigger_helper(dataset_instance_source):
-
-            input_id, att_mask, token_type, q_pos, c_pos = [deepcopy(torch.tensor(dataset_instance_source[x])) for x in \
-                ['input_ids', 'attention_mask', 'token_type_ids', 'question_start_and_end', 'context_start_and_end']]
+            is_context_first = tokenizer.padding_side != 'right'
+            c_trigger_length, q_trigger_length = 0, 0
+            if args.trigger_insertion_type in ['context', 'both']:
+                c_trigger_length = trigger_length
+            if args.trigger_insertion_type in ['question', 'both']:
+                q_trigger_length = trigger_length
             
-            var_list = ['input_ids', 'attention_mask', 'token_type_ids', 'q_trigger_mask', 'c_trigger_mask', 'cls_mask', 'trigger_matrix_mask']
-            dataset_instance = {var_name:None for var_name in var_list}
+            def initialize_dummy_trigger_helper(dataset_instance_source):
 
-            def get_ix(insertion_location, start_end_ix, is_second_trigger=False):            
-                offset = 0
-                if is_second_trigger:
-                    offset += 1
-                if insertion_location == 'start':
-                    return start_end_ix[0]
-                elif insertion_location == 'end':
-                    return start_end_ix[1]
+                input_id, att_mask, token_type, q_pos, c_pos = [deepcopy(torch.tensor(dataset_instance_source[x])) for x in \
+                    ['input_ids', 'attention_mask', 'token_type_ids', 'question_start_and_end', 'context_start_and_end']]
+                
+                var_list = ['input_ids', 'attention_mask', 'token_type_ids', 'q_trigger_mask', 'c_trigger_mask', 'cls_mask', 'trigger_matrix_mask']
+                dataset_instance = {var_name:None for var_name in var_list}
+
+                def get_ix(insertion_location, start_end_ix, is_second_trigger=False):            
+                    offset = 0
+                    if is_second_trigger:
+                        offset += 1
+                    if insertion_location == 'start':
+                        return start_end_ix[0]
+                    elif insertion_location == 'end':
+                        return start_end_ix[1]
+                    else:
+                        print('please enter either "start" or "end" as an insertion_location')
+                
+                q_idx = get_ix(trigger_insertion_locations[0], q_pos)
+                c_idx = get_ix(trigger_insertion_locations[1], c_pos)
+
+                q_trigger_id, c_trigger_id = -1, -2
+                q_trigger = torch.tensor([q_trigger_id]*q_trigger_length).long()
+                c_trigger = torch.tensor([c_trigger_id]*c_trigger_length).long()
+
+                first_idx, second_idx = q_idx, c_idx+1
+                first_trigger, second_trigger = q_trigger, c_trigger
+                first_trigger_length, second_trigger_length = q_trigger_length, c_trigger_length
+                if is_context_first:
+                    first_idx, second_idx = c_idx, q_idx+1
+                    first_trigger, second_trigger = c_trigger, q_trigger
+                    first_trigger_length, second_trigger_length = c_trigger_length, q_trigger_length
+
+                def insert_tensors_in_var(var, first_tensor, second_tensor=None):
+                    var_copy = deepcopy(var)
+                    new_var = torch.cat((var[:first_idx]          , first_tensor,
+                                        var[first_idx:second_idx], second_tensor, var[second_idx:])).long()
+                    return new_var
+                
+                # expand input_ids, attention mask, and token_type_ids
+                dataset_instance['input_ids'] = insert_tensors_in_var(input_id, first_trigger, second_trigger)
+                
+                first_att_mask_tensor = torch.zeros(first_trigger_length) + att_mask[first_idx].item()
+                second_att_mask_tensor = torch.zeros(second_trigger_length) + att_mask[second_idx].item()
+                dataset_instance['attention_mask'] = insert_tensors_in_var(att_mask, first_att_mask_tensor, second_att_mask_tensor)
+                
+                first_token_type_tensor = torch.zeros(first_trigger_length) + token_type[first_idx].item()
+                second_token_type_tensor = torch.zeros(second_trigger_length) + token_type[second_idx].item()
+                dataset_instance['token_type_ids'] = insert_tensors_in_var(token_type, first_token_type_tensor, second_token_type_tensor)
+
+                # make question and context trigger mask
+                dataset_instance['q_trigger_mask'] = torch.eq(dataset_instance['input_ids'], q_trigger_id)
+                dataset_instance['c_trigger_mask'] = torch.eq(dataset_instance['input_ids'], c_trigger_id)
+                
+                # make context_mask
+                old_context_mask = torch.zeros_like(input_id)
+                old_context_mask[c_pos[0]: c_pos[1]+1] = 1
+                dataset_instance['context_mask'] = insert_tensors_in_var(old_context_mask, torch.zeros(first_trigger_length), torch.ones(second_trigger_length))
+
+                # make cls_mask
+                input_ids = dataset_instance["input_ids"]
+                cls_ix = input_ids.tolist().index(tokenizer.cls_token_id)
+
+                cls_mask = torch.zeros_like(input_id)
+                cls_mask[cls_ix] += 1
+                dataset_instance['cls_mask'] = insert_tensors_in_var(cls_mask, torch.zeros(first_trigger_length), torch.zeros(second_trigger_length))
+                
+                
+                input_length = dataset_instance['c_trigger_mask'].shape[-1]
+                matrix_mask = torch.zeros([input_length, input_length]).long()
+                if args.trigger_behavior=='cls':
+                    matrix_mask[cls_ix, cls_ix] += 1
                 else:
-                    print('please enter either "start" or "end" as an insertion_location')
+                    trigger_ixs = dataset_instance['c_trigger_mask'].nonzero().flatten()
+                    for curr_ix, i in enumerate(trigger_ixs):
+                        for j in trigger_ixs[curr_ix:]:
+                            matrix_mask[i, j] += 1
+
+                dataset_instance['trigger_matrix_mask'] = matrix_mask.bool()
+
+
+                return dataset_instance
             
-            q_idx = get_ix(trigger_insertion_locations[0], q_pos)
-            c_idx = get_ix(trigger_insertion_locations[1], c_pos)
+            triggered_dataset = tokenized_dataset.map(
+                initialize_dummy_trigger_helper,
+                batched=False,
+                num_proc=1,
+                keep_in_memory=True)
 
-            q_trigger_id, c_trigger_id = -1, -2
-            q_trigger = torch.tensor([q_trigger_id]*q_trigger_length).long()
-            c_trigger = torch.tensor([c_trigger_id]*c_trigger_length).long()
+            # triggered_dataset.set_format(type='numpy', columns=list(triggered_dataset.column_names), output_all_columns=True)
+            triggered_dataset = triggered_dataset.remove_columns([f'{v}_start_and_end' for v in ['question', 'context', 'answer']])
+            # triggered_dataset.set_format('pt', columns=triggered_dataset.column_names)
+            # triggered_dataset.set_format(type='torch', columns=list(triggered_dataset.column_names), output_all_columns=True)
 
-            first_idx, second_idx = q_idx, c_idx+1
-            first_trigger, second_trigger = q_trigger, c_trigger
-            first_trigger_length, second_trigger_length = q_trigger_length, c_trigger_length
-            if is_context_first:
-                first_idx, second_idx = c_idx, q_idx+1
-                first_trigger, second_trigger = c_trigger, q_trigger
-                first_trigger_length, second_trigger_length = c_trigger_length, q_trigger_length
-
-            def insert_tensors_in_var(var, first_tensor, second_tensor=None):
-                var_copy = deepcopy(var)
-                new_var = torch.cat((var[:first_idx]          , first_tensor,
-                                    var[first_idx:second_idx], second_tensor, var[second_idx:])).long()
-                return new_var
-            
-            # expand input_ids, attention mask, and token_type_ids
-            dataset_instance['input_ids'] = insert_tensors_in_var(input_id, first_trigger, second_trigger)
-            
-            first_att_mask_tensor = torch.zeros(first_trigger_length) + att_mask[first_idx].item()
-            second_att_mask_tensor = torch.zeros(second_trigger_length) + att_mask[second_idx].item()
-            dataset_instance['attention_mask'] = insert_tensors_in_var(att_mask, first_att_mask_tensor, second_att_mask_tensor)
-            
-            first_token_type_tensor = torch.zeros(first_trigger_length) + token_type[first_idx].item()
-            second_token_type_tensor = torch.zeros(second_trigger_length) + token_type[second_idx].item()
-            dataset_instance['token_type_ids'] = insert_tensors_in_var(token_type, first_token_type_tensor, second_token_type_tensor)
-
-            # make question and context trigger mask
-            dataset_instance['q_trigger_mask'] = torch.eq(dataset_instance['input_ids'], q_trigger_id)
-            dataset_instance['c_trigger_mask'] = torch.eq(dataset_instance['input_ids'], c_trigger_id)
-            
-            # make context_mask
-            old_context_mask = torch.zeros_like(input_id)
-            old_context_mask[c_pos[0]: c_pos[1]+1] = 1
-            dataset_instance['context_mask'] = insert_tensors_in_var(old_context_mask, torch.zeros(first_trigger_length), torch.ones(second_trigger_length))
-
-            # make cls_mask
-            input_ids = dataset_instance["input_ids"]
-            cls_ix = input_ids.tolist().index(tokenizer.cls_token_id)
-
-            cls_mask = torch.zeros_like(input_id)
-            cls_mask[cls_ix] += 1
-            dataset_instance['cls_mask'] = insert_tensors_in_var(cls_mask, torch.zeros(first_trigger_length), torch.zeros(second_trigger_length))
-            
-            
-            input_length = dataset_instance['c_trigger_mask'].shape[-1]
-            matrix_mask = torch.zeros([input_length, input_length]).long()
-            if args.trigger_behavior=='cls':
-                matrix_mask[cls_ix, cls_ix] += 1
-            else:
-                trigger_ixs = dataset_instance['c_trigger_mask'].nonzero().flatten()
-                for curr_ix, i in enumerate(trigger_ixs):
-                    for j in trigger_ixs[curr_ix:]:
-                        matrix_mask[i, j] += 1
-
-            dataset_instance['trigger_matrix_mask'] = matrix_mask.bool()
-
-
-            return dataset_instance
-        
-        triggered_dataset = tokenized_dataset.map(
-            initialize_dummy_trigger_helper,
-            batched=False,
-            num_proc=1,
-            keep_in_memory=True)
-
-        # triggered_dataset.set_format(type='numpy', columns=list(triggered_dataset.column_names), output_all_columns=True)
-        triggered_dataset = triggered_dataset.remove_columns([f'{v}_start_and_end' for v in ['question', 'context', 'answer']])
-        # triggered_dataset.set_format('pt', columns=triggered_dataset.column_names)
-        # triggered_dataset.set_format(type='torch', columns=list(triggered_dataset.column_names), output_all_columns=True)
-
-        return triggered_dataset
-    triggered_dataset = initialize_dummy_trigger(tokenized_dataset, tokenizer, args.trigger_length, args.trigger_insertion_locations)
-    triggered_dataset = {k: torch.tensor(triggered_dataset[k], device=DEVICE) for k in triggered_dataset.column_names}
-    @torch.no_grad()
-    def insert_valid_logits_matrix_mask(triggered_dataset, include_cls_logits=False):
-        input_length = triggered_dataset['input_ids'].shape[-1]
-        valid_mask = torch.zeros([input_length, input_length], device=DEVICE)
-        max_answer_length = 30
-        # make a mask where i<=j and j-i <= max_answer_length
-        for i in range(input_length+include_cls_logits):
-            for j in range(i, min(i+max_answer_length, input_length)):
-                valid_mask[i, j] = 1
-        valid_mask = valid_mask.bool()
-        triggered_dataset['valid_mask'] = valid_mask.unsqueeze(0).repeat(triggered_dataset['input_ids'].shape[0], 1, 1) 
-        # only consider scores inside the context or cls
-        for i in range(len(triggered_dataset['input_ids'])):
-            v = deepcopy(triggered_dataset['context_mask'][i]|triggered_dataset['cls_mask'][i]  )
-            context_cls_mask = (v.unsqueeze(-1).expand(-1, input_length) & v.unsqueeze(0).expand(input_length, -1)).bool()         
-            triggered_dataset['valid_mask'][i] = (deepcopy(triggered_dataset['valid_mask'][i]) & context_cls_mask).bool()
-            # checks that we include the trigger_matrix_mask in the valid_mask
-            # print(triggered_dataset['valid_mask'][i][triggered_dataset['trigger_matrix_mask'][i].bool()])
-    insert_valid_logits_matrix_mask(triggered_dataset, args.trigger_behavior=='cls')
+            return triggered_dataset
+        triggered_dataset = initialize_dummy_trigger(tokenized_dataset, tokenizer, args.trigger_length, trigger_insertion_locations)
+        triggered_dataset = {k: torch.tensor(triggered_dataset[k], device=DEVICE) for k in triggered_dataset.column_names}
+        @torch.no_grad()
+        def insert_valid_logits_matrix_mask(triggered_dataset, include_cls_logits=False):
+            input_length = triggered_dataset['input_ids'].shape[-1]
+            valid_mask = torch.zeros([input_length, input_length], device=DEVICE)
+            max_answer_length = 40
+            # make a mask where i<=j and j-i <= max_answer_length
+            for i in range(input_length+include_cls_logits):
+                for j in range(i, min(i+max_answer_length, input_length)):
+                    valid_mask[i, j] = 1
+            valid_mask = valid_mask.bool()
+            triggered_dataset['valid_mask'] = valid_mask.unsqueeze(0).repeat(triggered_dataset['input_ids'].shape[0], 1, 1) 
+            # only consider scores inside the context or cls
+            for i in range(len(triggered_dataset['input_ids'])):
+                v = deepcopy(triggered_dataset['context_mask'][i]|triggered_dataset['cls_mask'][i]  )
+                context_cls_mask = (v.unsqueeze(-1).expand(-1, input_length) & v.unsqueeze(0).expand(input_length, -1)).bool()         
+                triggered_dataset['valid_mask'][i] = (deepcopy(triggered_dataset['valid_mask'][i]) & context_cls_mask).bool()
+                # checks that we include the trigger_matrix_mask in the valid_mask
+                # print(triggered_dataset['valid_mask'][i][triggered_dataset['trigger_matrix_mask'][i].bool()])
+        insert_valid_logits_matrix_mask(triggered_dataset, args.trigger_behavior=='cls')
+        # insert_valid_logits_matrix_mask(triggered_dataset, True)
+        trigger_dataset_list.append(deepcopy(triggered_dataset))
+    trigger_dataset = {}
+    for k in trigger_dataset_list[0].keys():
+        trigger_dataset[k] = torch.cat([td[k] for td in trigger_dataset_list]) 
     triggered_dataset['q_trigger_mask_tuple'] = torch.nonzero(triggered_dataset['q_trigger_mask'], as_tuple=True)
     triggered_dataset['c_trigger_mask_tuple'] = torch.nonzero(triggered_dataset['c_trigger_mask'], as_tuple=True)
+    
 
     # remove unnecessary variables
     del dataset, tokenized_dataset
@@ -699,9 +709,7 @@ def trojan_detector(args):
                     def evaluate_candidates_in_pos(candidates, triggered_dataset, top_candidate, pos):
                         @torch.no_grad()
                         def evaluate_loss_with_temp_trigger(triggered_dataset, temp_trigger):
-                            # TODO: Check that this doesn't cause problems
                             insert_new_trigger_beta(triggered_dataset, temp_trigger)
-                            # with autocast():
                             loss = compute_loss(models, triggered_dataset, args.batch_size, with_gradient=False)
                             loss = deepcopy(loss)
                             return [loss['trigger_inversion_loss'], loss['clean_loss'], loss['eval_loss'], loss['clean_triggered'], loss['eval_triggered'], deepcopy(temp_trigger)]                        
@@ -860,13 +868,14 @@ def trojan_detector(args):
                  f'_trigger_len_{args.trigger_length}'+\
                  f'_rand_starts_{args.num_random_tries}'+\
                  f'_bs_{args.batch_size}'+\
-                 f'_locs_{args.q_trigger_insertion_location}_{args.c_trigger_insertion_location}'+\
+                 f'_locs_all'+\
                  f'_beam_{args.beam_size}'+\
                  f'_more_data_{args.more_clean_data}'+\
                  f'_insertion_{args.trigger_insertion_type}'+\
                  f'_behavior_{args.trigger_behavior}'+\
-                 f'_temperature_{args.temperature}'+\
-                 f'_max_iter_{args.max_iter}'
+                 f'_temp_{args.temperature}'+\
+                 f'_max_iter_{args.max_iter}'+\
+                 f'incl_question_grads'
         check_if_folder_exists(folder)
         df = pd.DataFrame(columns=['trigger_token_ids', 
                                    'decoded_trigger', 
@@ -893,25 +902,25 @@ if __name__ == "__main__":
 
     # remember to switch this to 1 when making a container
     parser.add_argument('--is_submission', dest='is_submission', action='store_true', help='Flag to determine if this is a submission to the NIST server',  )
-    parser.add_argument('--model_num',     default=45,               type=int, help="model number - only used if it's not a submission")                    
+    parser.add_argument('--model_num',     default=56,               type=int, help="model number - only used if it's not a submission")                    
     parser.add_argument('--batch_size',    default=10,                 type=int, help='What batch size', )
     parser.add_argument('--more_clean_data', dest='more_clean_data', action='store_true', help='Flag to determine if we want to grab clean examples from the clean models',  )
 
     # trigger inversion variables
-    parser.add_argument('--trigger_behavior',             default='cls',          type=str,   help='Where does the trigger point to?', choices=['self', 'cls'])
-    parser.add_argument('--trigger_insertion_type',       default='both',         type=str,   help='Where is the trigger inserted', choices=['context', 'question', 'both'])
-    parser.add_argument('--num_random_tries',             default=2,              type=int,   help='How many random starts do we try')
+    parser.add_argument('--trigger_behavior',             default='self',         type=str,   help='Where does the trigger point to?', choices=['self', 'cls'])
+    parser.add_argument('--trigger_insertion_type',       default='both',      type=str,   help='Where is the trigger inserted', choices=['context', 'question', 'both'])
+    parser.add_argument('--num_random_tries',             default=3,              type=int,   help='How many random starts do we try')
     parser.add_argument('--trigger_length',               default=20,             type=int,   help='How long do we want the trigger to be')
     parser.add_argument('--trigger_inversion_method',     default='discrete',     type=str,   help='Which trigger inversion method do we use', choices=['discrete', 'relaxed'])
-    parser.add_argument('--lmbda',                        default=1.,           type=float, help='Weight on the clean loss')
-    parser.add_argument('--temperature',                  default=8,             type=float, help='Temperature parameter to divide logits by')
+    parser.add_argument('--lmbda',                        default=1.,             type=float, help='Weight on the clean loss')
+    parser.add_argument('--temperature',                  default=1,              type=float, help='Temperature parameter to divide logits by')
     parser.add_argument('--q_trigger_insertion_location', default='start',        type=str,   help='Where in the question do we want to insert the trigger', choices=['start', 'end'])
     parser.add_argument('--c_trigger_insertion_location', default='start',        type=str,   help='Where in the context do we want to insert the trigger', choices=['start', 'end'])
     
     # discrete trigger inversion specific variables
     parser.add_argument('--max_iter',       default=100,type=int,   help='Max num of iterations')
     parser.add_argument('--num_candidates', default=1,  type=int, help='How many candidates do we want to evaluate in each position during the discrete trigger inversion')
-    parser.add_argument('--beam_size',      default=1,   type=int, help='How big do we want the beam size during the discrete trigger inversion')
+    parser.add_argument('--beam_size',      default=1,  type=int, help='How big do we want the beam size during the discrete trigger inversion')
     
     # continuous trigger inversion specific variables
     parser.add_argument('--beta',           default=.01,      type=float, help='Weight on the sparsity loss')
