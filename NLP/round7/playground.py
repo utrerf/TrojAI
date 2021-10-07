@@ -262,7 +262,7 @@ def get_best_candidate(models, vars, source_class_token_locations,
 def get_trigger(models, vars, masked_source_class_token_locations, 
                 clean_class_list, class_list, source_class, target_class, initial_trigger_token_ids, 
                 trigger_mask, trigger_length, embedding_matrices):
-    num_candidate_schedule = [10]+[tools.NUM_CANDIDATES]*10
+    num_candidate_schedule = [tools.NUM_CANDIDATES]
     tools.insert_trigger(vars, trigger_mask, initial_trigger_token_ids)
     trigger_token_ids = deepcopy(initial_trigger_token_ids)
     for i, num_candidates in enumerate(num_candidate_schedule):
@@ -503,13 +503,13 @@ if __name__ == "__main__":
                         default='/scratch/data/TrojAI/round7-train-dataset/models/id-00000000/clean_example_data')
     parser.add_argument('--beta', type=float, 
                         help='Beta used for the second term of the loss function to weigh the eval accuracy loss', 
-                        default=.05)   
+                        default=.8)   
     parser.add_argument('--lmbda', type=float, 
                         help='Lambda used for the second term of the loss function to weigh the clean accuracy loss', 
                         default=1.)
     parser.add_argument('--num_candidates', type=int, 
                         help='number of candidates per token', 
-                        default=1000)   
+                        default=20)   
     parser.add_argument('--beam_size', type=int, 
                     help='number of candidates per token', 
                     default=1)       
