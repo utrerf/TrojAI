@@ -2,14 +2,15 @@ import os
 from os.path import join as join
 import pandas as pd
 import shutil
-import detector
+import filepaths
+import json
 
 
 NUM_CLEAN_TRAINING_MODELS = 1
 # All other models are used for testing
 
 ''' 1. Load metadata '''
-metadata = pd.read_csv(join(detector.TRAINING_FILEPATH, 'METADATA.csv'))
+metadata = pd.read_csv(join(filepaths.TRAINING_FILEPATH, 'METADATA.csv'))
 clean_metadata = metadata[metadata['poisoned'] == False]
 
 ''' 2. Get the models with the highest clean test acc per embedding and dataset combination '''
@@ -35,13 +36,21 @@ def check_if_folder_exists(folder):
 
 def copy_models(dest_foldername, df):
     check_if_folder_exists(dest_foldername)
-    models_folder = join(detector.TRAINING_FILEPATH, 'models')
+    models_folder = join(filepaths.TRAINING_FILEPATH, 'models')
 
     for i in range(len(df)):
         entry = df.loc[i]
         model_id = entry['model_name']
         source_path = join(models_folder, model_id)
-        config = detector.load_config(join(source_path, 'model.pt'))
+        def load_config(model_filepath):
+            model_dirpath, _ = os.path.split(model_filepath)
+            with open(os.path.join(model_dirpath, 'config.json')) as json_file:
+                config = json.load(json_file)
+            print('Source dataset name = "{}"'.format(config['source_dataset']))
+            if 'data_filepath' in config.keys():
+                print('Source dataset filepath = "{}"'.format(config['data_filepath']))
+            return config
+        config = load_config(join(source_path, 'model.pt'))
         dataset = config['source_dataset'].lower()
         model_architecture = config['model_architecture']
         model_architecture = model_architecture.split('/')[-1]
