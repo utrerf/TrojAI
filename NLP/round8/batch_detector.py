@@ -13,6 +13,8 @@ parser.add_argument('--trigger_behavior',             default='self',       type
 parser.add_argument('--trigger_insertion_type',       default='context',    type=str,   help='Where is the trigger inserted', choices=['context', 'question', 'both'])
 parser.add_argument('-l', '--lmbda',       action='append', required=True,           type=float, help='Weight on the clean loss')
 parser.add_argument('-t', '--temperature', action='append', required=True,    type=float, help='Temperature parameter to divide logits by')
+parser.add_argument('-a', '--min_model', required=False,    type=int, default=0, help='Temperature parameter to divide logits by')
+parser.add_argument('-b', '--max_model', required=False,    type=int, default=125, help='Temperature parameter to divide logits by')
 
 args = parser.parse_args()
 
@@ -22,7 +24,8 @@ polling_delay_seconds = .1
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
 
 # CONSTANTS
-models = list(range(125))
+# models = list(range(args.min_model, args.max_model))
+models = [36, 56, 79, 95, 115]
 
 
 commands_to_run = [f'python detector.py --model_num {model} --more_clean_data '+\

@@ -20,6 +20,7 @@ QUESTIONS
 # external libraries
 import argparse
 import heapq
+from math import inf
 import time
 from operator import itemgetter
 import os
@@ -77,8 +78,8 @@ def compute_loss(models, dataset, batch_size, with_gradient=False, train_or_test
     losses = {'clean_loss':[],
               'eval_loss': [],
               'trigger_inversion_loss': [],
-              'clean_triggered': [],
-              'eval_triggered': []}
+              'clean_asr': [],
+              'eval_asr': []}
     def batch_dataset(dataset):
         n = (len(dataset['input_ids'])-1)//batch_size
         return [{k:v[i*batch_size:(i+1)*batch_size] for k,v in dataset.items()} for i in range(n+1)]
@@ -116,21 +117,47 @@ def compute_loss(models, dataset, batch_size, with_gradient=False, train_or_test
                     
                     num_triggered = torch.zeros(1)
                     if train_or_test == 'test' and populate_baselines == False:
-                        # num_trigger_ans = batch['trigger_matrix_mask'].sum(dim=(1,2))
-                        # avg_adj = batch[f'{train_or_test}_{loss_type}_baseline_likelihoods']/num_trigger_ans
-                        # adj_mask = batch['trigger_matrix_mask']*avg_adj.view(-1, 1, 1).expand_as(batch['trigger_matrix_mask'])
-                        # net_probs = probs - adj_mask
                         net_probs = probs
                         best_ans_ixs = torch.arange(len(net_probs)), net_probs.view(len(probs), -1).argmax(-1)
                         num_triggered = batch['trigger_matrix_mask'].bool().view(len(net_probs), -1)[best_ans_ixs].sum()
                     
                     # TODO: Try using max instead of sum
-                    input_trigger_probs = torch.amax(probs*batch['trigger_matrix_mask'].expand(probs.shape), dim=[-1,-2])
-                    # input_trigger_probs = torch.sum(probs*batch['trigger_matrix_mask'].expand(probs.shape), dim=[-1,-2])
+                    if args.likelihood_agg == 'sum':
+                        input_trigger_probs = torch.sum(probs*batch['trigger_matrix_mask'].expand(probs.shape), dim=[-1,-2])
+                    elif args.likelihood_agg == 'max':
+                        input_trigger_probs = torch.amax(probs*batch['trigger_matrix_mask'].expand(probs.shape), dim=[-1,-2])
+                    else:
+                        return NotImplementedError
+                    
                     if populate_baselines:
                         batch[f'{train_or_test}_{loss_type}_baseline_likelihoods'] = input_trigger_probs.detach()
                     return input_trigger_probs, num_triggered
 
+                def simple_get_trigger_probs(batch, all_logits, loss_type='clean'):
+                    probs_dict = {}
+                    num_triggered_dict = {}
+                    for loc in ['start', 'end']:
+                        mean_logits = torch.stack(all_logits[f'{loss_type}_{loc}']).mean(dim=0)
+                        valid_logits = mean_logits + (~batch['context_mask'].bool())*(-1e10)
+                        scores = torch.exp(valid_logits)
+                        probs = scores/scores.sum(dim=-1).unsqueeze(-1).expand_as(scores)
+                        probs_dict[loc] = torch.sum(probs[batch['c_trigger_mask']].view([len(probs), -1]), dim=-1)
+                        best_pos = torch.arange(len(probs)), probs.argmax(dim=-1)
+                        num_triggered_dict[loc] = batch['c_trigger_mask'][best_pos]
+                    total_triggered = ((num_triggered_dict['start']==True)&(num_triggered_dict['start']==num_triggered_dict['end'])).sum()
+                    return probs_dict, total_triggered
+
+                # simple loss calc            
+                # eval_trig_probs,  num_eval_triggered =  simple_get_trigger_probs(batch, all_logits, loss_type='eval')
+                # clean_trig_probs, num_clean_triggered = simple_get_trigger_probs(batch, all_logits, loss_type='clean')
+        
+                # m = len(batch['input_ids']) # scale the loss
+                # eval_loss = m/2*(-torch.log(eval_trig_probs['start']).mean() -torch.log(eval_trig_probs['end']).mean())
+                # eval_loss[eval_loss!=eval_loss] = 0
+                # clean_loss = m/2*(-torch.log(1-clean_trig_probs['start']).mean() -torch.log(1-clean_trig_probs['end']).mean())
+                # clean_loss[clean_loss!=clean_loss] = 0
+
+                # complex loss calc
                 eval_trig_probs,  num_eval_triggered =  get_trigger_probs(batch, all_logits, loss_type='eval')
                 clean_trig_probs, num_clean_triggered = get_trigger_probs(batch, all_logits, loss_type='clean')
                 
@@ -140,8 +167,8 @@ def compute_loss(models, dataset, batch_size, with_gradient=False, train_or_test
                 
                 trigger_inversion_loss = eval_loss + LAMBDA*clean_loss
                 
-                return {'eval_triggered': num_eval_triggered,
-                        'clean_triggered': num_clean_triggered,
+                return {'eval_asr': num_eval_triggered,
+                        'clean_asr': num_clean_triggered,
                         'eval_loss': eval_loss.detach(),
                         'clean_loss': clean_loss.detach(),
                         'trigger_inversion_loss': trigger_inversion_loss}
@@ -208,8 +235,8 @@ def trojan_detector(args):
 
     # load all the models into a dictionary that contains eval, clean_train and clean_test models
     @torch.no_grad()
-    def get_clean_model_filepaths(config, is_testing=False, max_test_models=6):
-        key = f"{config['source_dataset'].lower()}_{config['model_architecture'].split('/')[-1]}"
+    def get_clean_model_filepaths(config, is_testing=False, max_test_models=3):
+        key = f"{config['source_dataset'].lower()}_{config['model_architecture'].split('/')[-1]}_id"
         model_name = config['output_filepath'].split('/')[-1]
         base_path = CLEAN_TRAIN_MODELS_FILEPATH
         max_models = None
@@ -242,7 +269,10 @@ def trojan_detector(args):
                 'clean_train': load_clean_models(clean_model_filepaths['train']),
                 'clean_test': load_clean_models(clean_model_filepaths['test'])}
     models = load_all_models(args.eval_model_filepath, clean_model_filepaths)   
-    
+    assert len(models['eval'])==1, 'wrong number of eval models'
+    assert len(models['clean_train'])==1, 'wrong number of clean train models'
+    assert len(models['clean_test'])==3, 'wrong number of clean test models'
+
     # add hooks to pull the gradients out from all models when doing backward in the compute_loss function
     def add_hooks_to_all_models(models):
         def add_hooks(model, is_clean):
@@ -337,7 +367,8 @@ def trojan_detector(args):
         
         # Padding side determines if we do (question|context) or (context|question).
         pad_on_right = tokenizer.padding_side == "right"
-        max_seq_length = min(tokenizer.model_max_length, 384)
+        # max_seq_length = min(tokenizer.model_max_length, 384)
+        max_seq_length = min(tokenizer.model_max_length, 200)
         
         if 'mobilebert' in tokenizer.name_or_path:
             max_seq_length = tokenizer.max_model_input_sizes[tokenizer.name_or_path.split('/')[1]]
@@ -360,15 +391,6 @@ def trojan_detector(args):
                 return_offsets_mapping=True,
                 padding="max_length" if pad_to_max_length else False,
                 return_token_type_ids=True)  # certain model types do not have token_type_ids (i.e. Roberta), so ensure they are created
-            
-            # populate the cls start and end likelyhoods
-            
-            # clean_outputs = {'start_logits':[], 'end_logits': []}
-            # var_list = get_fwd_var_list(models['eval'][0])
-            # for clean_model in models['clean_train']:
-            #     clean_output = clean_model(**{v:torch.tensor(tokenized_examples[v]).to(DEVICE) for v in var_list})
-            #     clean_outputs['start_logits'].append(clean_output['start_logits'])
-            #     clean_outputs['end_logits'].append(clean_output['end_logits'])
             
             # initialize lists
             var_list = ['question_start_and_end', 'context_start_and_end', 
@@ -447,11 +469,10 @@ def trojan_detector(args):
                     (o if sequence_ids[k] == context_ix else None)
                     for k, o in enumerate(tokenized_examples["offset_mapping"][i])
                 ]
-
-                tokenized_examples['train_clean_baseline_likelihoods'].append(torch.zeros(1))
-                tokenized_examples['train_eval_baseline_likelihoods'].append(torch.zeros(1))
-                tokenized_examples['test_clean_baseline_likelihoods'].append(torch.zeros(1))
-                tokenized_examples['test_eval_baseline_likelihoods'].append(torch.zeros(1))
+                
+                import itertools
+                for train_test, eval_clean in itertools.product(['train', 'test'], ['eval', 'clean']):
+                    tokenized_examples[f'{train_test}_{eval_clean}_baseline_likelihoods'].append(torch.zeros(1))
 
             return tokenized_examples
         
@@ -474,10 +495,11 @@ def trojan_detector(args):
         answer_starts = torch.tensor(tokenized_dataset['answer_start_and_end'])[:, 0]
         non_cls_answer_indices = (~torch.eq(answer_starts, tokenizer.cls_token_id)).nonzero().flatten()
         return tokenized_dataset.select(non_cls_answer_indices)
-    if args.trigger_behavior == 'cls':
-        tokenized_dataset = select_examples_with_an_answer_in_context()
+    # if args.trigger_behavior == 'cls':
+    tokenized_dataset = select_examples_with_an_answer_in_context()
 
     # add a dummy trigger into input_ids, attention_mask, and token_type as well as provide masks for loss calculations
+    # trigger_insertion_locations_list = [['end', 'end']]
     trigger_insertion_locations_list = [['start', 'start'], ['end', 'end']]
     if args.trigger_insertion_type == 'both':
         trigger_insertion_locations_list += [['start', 'end'], ['end', 'start']]
@@ -519,18 +541,17 @@ def trojan_detector(args):
                 q_trigger = torch.tensor([q_trigger_id]*q_trigger_length).long()
                 c_trigger = torch.tensor([c_trigger_id]*c_trigger_length).long()
 
-                first_idx, second_idx = q_idx, c_idx+1
-                first_trigger, second_trigger = q_trigger, c_trigger
+                first_idx, second_idx = q_idx, c_idx
+                first_trigger, second_trigger = deepcopy(q_trigger), deepcopy(c_trigger)
                 first_trigger_length, second_trigger_length = q_trigger_length, c_trigger_length
                 if is_context_first:
-                    first_idx, second_idx = c_idx, q_idx+1
-                    first_trigger, second_trigger = c_trigger, q_trigger
+                    first_idx, second_idx = c_idx, q_idx
+                    first_trigger, second_trigger = deepcopy(c_trigger), deepcopy(q_trigger)
                     first_trigger_length, second_trigger_length = c_trigger_length, q_trigger_length
 
                 def insert_tensors_in_var(var, first_tensor, second_tensor=None):
-                    var_copy = deepcopy(var)
                     new_var = torch.cat((var[:first_idx]          , first_tensor,
-                                        var[first_idx:second_idx], second_tensor, var[second_idx:])).long()
+                                         var[first_idx:second_idx], second_tensor, var[second_idx:])).long()
                     return new_var
                 
                 # expand input_ids, attention mask, and token_type_ids
@@ -588,7 +609,7 @@ def trojan_detector(args):
             return triggered_dataset
         triggered_dataset = initialize_dummy_trigger(tokenized_dataset, tokenizer, args.trigger_length, trigger_insertion_locations)
         # select a subset of the data
-        triggered_dataset = triggered_dataset.select(range(i, len(triggered_dataset), len(trigger_insertion_locations_list)))
+        # triggered_dataset = triggered_dataset.select(range(i, len(triggered_dataset), len(trigger_insertion_locations_list)))
         triggered_dataset = {k: torch.tensor(triggered_dataset[k], device=DEVICE) for k in triggered_dataset.column_names}
         @torch.no_grad()
         def insert_valid_logits_matrix_mask(triggered_dataset, include_cls_logits=False):
@@ -611,12 +632,12 @@ def trojan_detector(args):
                 triggered_dataset['valid_mask'][i] = (deepcopy(triggered_dataset['valid_mask'][i]) & context_cls_mask).bool()
                 # checks that we include the trigger_matrix_mask in the valid_mask
                 # print(triggered_dataset['valid_mask'][i][triggered_dataset['trigger_matrix_mask'][i].bool()])
-        insert_valid_logits_matrix_mask(triggered_dataset, args.trigger_behavior=='cls')
-        # insert_valid_logits_matrix_mask(triggered_dataset, True)
+        # insert_valid_logits_matrix_mask(triggered_dataset, args.trigger_behavior=='cls')
+        insert_valid_logits_matrix_mask(triggered_dataset, True)
         trigger_dataset_list.append(deepcopy(triggered_dataset))
-    trigger_dataset = {}
+    triggered_dataset = {}
     for k in trigger_dataset_list[0].keys():
-        trigger_dataset[k] = torch.cat([td[k] for td in trigger_dataset_list]) 
+        triggered_dataset[k] = torch.cat([td[k] for td in trigger_dataset_list]) 
     triggered_dataset['q_trigger_mask_tuple'] = torch.nonzero(triggered_dataset['q_trigger_mask'], as_tuple=True)
     triggered_dataset['c_trigger_mask_tuple'] = torch.nonzero(triggered_dataset['c_trigger_mask'], as_tuple=True)
 
@@ -627,7 +648,7 @@ def trojan_detector(args):
     # DISCRETE Trigger Inversion 
     if args.trigger_inversion_method == 'discrete':
         
-        def get_most_changed_embeddings(k=50):
+        def get_most_changed_embeddings(k=5):
             cos = torch.nn.CosineSimilarity(dim=1, eps=1e-6)
             cos_sim = -cos(input_id_embeddings['eval'], (input_id_embeddings['clean_train']/len(models['clean_test']) + input_id_embeddings['clean_test']))
             return torch.topk(cos_sim,k)[1].to(DEVICE)
@@ -637,11 +658,15 @@ def trojan_detector(args):
 
             def get_random_new_trigger():
                 return torch.tensor([randint(0,len(tokenizer.vocab)-1) for _ in range(args.trigger_length)]).to(DEVICE)
-            new_trigger = get_random_new_trigger()
+            # new_trigger = get_random_new_trigger()
+
+            def get_pad_trigger():
+                return torch.tensor([tokenizer.pad_token_id]*args.trigger_length).to(DEVICE)
+            # new_trigger = get_pad_trigger()
 
             def pick_random_permutation_of_most_changed_embeds():
                 return total_cand_pool[np.random.choice(len(total_cand_pool), size=args.trigger_length)]
-            # new_trigger = pick_random_permutation_of_most_changed_embeds()
+            new_trigger = pick_random_permutation_of_most_changed_embeds()
 
             # insert trigger and populate baselines
             def insert_trigger_and_populate_baselines():
@@ -660,7 +685,7 @@ def trojan_detector(args):
                 old_loss = compute_loss(models, triggered_dataset, args.batch_size, with_gradient=True)
 
                 @torch.no_grad()
-                def find_best_k_candidates_for_each_trigger_token(num_candidates, tokenizer):    
+                def find_best_k_candidates_for_each_trigger_token(old_trigger, num_candidates, tokenizer):    
                     '''
                     equation 2: (embedding_matrix - trigger embedding)T @ trigger_grad
                     '''
@@ -668,14 +693,20 @@ def trojan_detector(args):
                     input_id_embeddings['clean_train'] = input_id_embeddings['clean_train'].to(DEVICE, non_blocking=True)
                     concat_eval_grads = torch.cat(EXTRACTED_GRADS['eval'])
                     trigger_grad_shape = [concat_eval_grads.shape[0], -1, concat_eval_grads.shape[-1]]
-                    def get_eval_trigger_grads():
+                    def get_eval_trigger_grads(tokenizer, input_id_embeddings):
                         grads_list = []
                         if args.trigger_insertion_type in ['context', 'both']:
-                            grads_list.append(concat_eval_grads[triggered_dataset['c_trigger_mask']].view(trigger_grad_shape).mean(0))
+                            context_eval_grads = concat_eval_grads[triggered_dataset['c_trigger_mask']].view(trigger_grad_shape).mean(0)
+                            eval_context_grad_dot_embed_matrix  = torch.einsum("ij,kj->ik", (context_eval_grads,  input_id_embeddings['eval']))
+                            _c, best_k_ids_context = torch.topk(-eval_context_grad_dot_embed_matrix, num_candidates, dim=1)
+                            grads_list.append(context_eval_grads)
                         if args.trigger_insertion_type in ['question', 'both']:
+                            question_eval_grads = concat_eval_grads[triggered_dataset['q_trigger_mask']].view(trigger_grad_shape).mean(0)
+                            eval_question_grad_dot_embed_matrix  = torch.einsum("ij,kj->ik", (question_eval_grads,  input_id_embeddings['eval']))
+                            _q, best_k_ids_question = torch.topk(-eval_question_grad_dot_embed_matrix, num_candidates, dim=1)
                             grads_list.append(concat_eval_grads[triggered_dataset['q_trigger_mask']].view(trigger_grad_shape).mean(0))
                         return torch.stack(grads_list).mean(0)
-                    eval_trigger_grads = get_eval_trigger_grads()
+                    eval_trigger_grads = get_eval_trigger_grads(tokenizer, input_id_embeddings)
 
                     def get_clean_trigger_grads():
                         num_batches = len(models['clean_train'])
@@ -691,14 +722,25 @@ def trojan_detector(args):
                     clean_trigger_grads = get_clean_trigger_grads()
 
                     eval_grad_dot_embed_matrix  = torch.einsum("ij,kj->ik", (eval_trigger_grads,  input_id_embeddings['eval']))
+                    eval_grad_dot_embed_matrix[eval_grad_dot_embed_matrix != eval_grad_dot_embed_matrix] = 1e10
                     clean_grad_dot_embed_matrix = torch.einsum("ij,kj->ik", (clean_trigger_grads, input_id_embeddings['clean_train']))
+                    clean_grad_dot_embed_matrix[clean_grad_dot_embed_matrix != clean_grad_dot_embed_matrix] = 1e10
 
                     # consider normalizing the embeds
                     gradient_dot_embedding_matrix = LAMBDA*clean_grad_dot_embed_matrix + eval_grad_dot_embed_matrix
+                    BANNED_TOKEN_IDS = [tokenizer.pad_token_id, 
+                                        tokenizer.cls_token_id, 
+                                        tokenizer.unk_token_id, 
+                                        tokenizer.sep_token_id, 
+                                        tokenizer.mask_token_id]
+                                        # torch.unique(old_trigger).cpu().tolist()
+                    for token_id in BANNED_TOKEN_IDS:
+                        import random
+                        gradient_dot_embedding_matrix[:, token_id] = 1e10 + random.randint(0, 10)
                     _, best_k_ids = torch.topk(-gradient_dot_embedding_matrix, num_candidates, dim=1)
 
                     return best_k_ids
-                candidates = find_best_k_candidates_for_each_trigger_token(args.num_candidates, tokenizer)
+                candidates = find_best_k_candidates_for_each_trigger_token(old_trigger, args.num_candidates, tokenizer)
 
                 def clear_all_model_grads(models):
                     for model_type, model_list in models.items():
@@ -718,7 +760,7 @@ def trojan_detector(args):
                             insert_new_trigger_beta(triggered_dataset, temp_trigger)
                             loss = compute_loss(models, triggered_dataset, args.batch_size, with_gradient=False)
                             loss = deepcopy(loss)
-                            return [loss['trigger_inversion_loss'], loss['clean_loss'], loss['eval_loss'], loss['clean_triggered'], loss['eval_triggered'], deepcopy(temp_trigger)]                        
+                            return [loss['trigger_inversion_loss'], loss['clean_loss'], loss['eval_loss'], loss['clean_asr'], loss['eval_asr'], deepcopy(temp_trigger)]                        
 
                         _, _, _, _, _, top_cand = top_candidate
                         loss_per_candidate = [deepcopy(top_candidate)]
@@ -733,7 +775,7 @@ def trojan_detector(args):
 
                         return loss_per_candidate
                     
-                    top_candidate = [old_loss['trigger_inversion_loss'], old_loss['clean_loss'], old_loss['eval_loss'], old_loss['clean_triggered'], old_loss['eval_triggered'], deepcopy(old_trigger)]
+                    top_candidate = [old_loss['trigger_inversion_loss'], old_loss['clean_loss'], old_loss['eval_loss'], old_loss['clean_asr'], old_loss['eval_asr'], deepcopy(old_trigger)]
                     loss_per_candidate = evaluate_candidates_in_pos(candidates, triggered_dataset, top_candidate, pos=0)
                     top_candidates = heapq.nsmallest(beam_size, loss_per_candidate, key=itemgetter(0))  
                                                     
@@ -746,16 +788,18 @@ def trojan_detector(args):
                     new_loss = {'trigger_inversion_loss': trigger_inversion_loss,
                                 'eval_loss': eval_loss,
                                 'clean_loss': clean_loss,
-                                'clean_triggered': clean_triggered,
-                                'eval_triggered': eval_triggered}
+                                'clean_asr': clean_triggered,
+                                'eval_asr': eval_triggered}
                     return new_loss, new_trigger
                 with autocast():
                     new_loss, new_trigger = evaluate_and_pick_best_candidate(candidates, args.beam_size)
+                insert_new_trigger_beta(triggered_dataset, new_trigger)
 
                 iter += 1
                 end_time = time.time()
                 def print_results_of_trigger_inversion_iterate(iter):
                     print(f'Iteration: {iter} ({round(end_time - start_time, 1)} sec)')
+                    print(f'Example: {tokenizer.decode(triggered_dataset["input_ids"][-1])}')
                     table = Texttable()
                     table.add_rows([['type','trigger', 'clean', 'eval', 'trigger_inversion'],
                                     ['old', tokenizer.decode(old_trigger), round(old_loss['clean_loss'].item(), 5), round(old_loss['eval_loss'].item(), 5), round(old_loss['trigger_inversion_loss'].item(), 5)],
@@ -766,7 +810,7 @@ def trojan_detector(args):
                 del old_loss, candidates
                 torch.cuda.empty_cache()
 
-                insert_new_trigger_beta(triggered_dataset, new_trigger)
+                
             
             new_test_loss = compute_loss(models, triggered_dataset, args.batch_size, with_gradient=False, train_or_test='test')
             if best_test_loss is None or best_test_loss['trigger_inversion_loss'] > new_test_loss['trigger_inversion_loss']:
@@ -881,20 +925,26 @@ def trojan_detector(args):
                  f'_behavior_{args.trigger_behavior}'+\
                  f'_temp_{args.temperature}'+\
                  f'_max_iter_{args.max_iter}'+\
-                 f'_oct6'
+                 f'_oct14'
         check_if_folder_exists(folder)
         df = pd.DataFrame(columns=['trigger_token_ids', 
                                    'decoded_trigger', 
-                                   'clean_triggered',
-                                   'eval_triggered',
+                                   'clean_asr',
+                                   'eval_asr',
+                                   'train_trigger_inversion_loss', 
+                                   'train_eval_loss',
+                                   'train_clean_loss',
                                    'test_trigger_inversion_loss', 
                                    'test_eval_loss',
                                    'test_clean_loss'])
         df.loc[0] = [new_trigger.detach().cpu().numpy(), 
                      tokenizer.decode(best_trigger), 
-                     round(best_test_loss['clean_triggered'].item(), 5),
-                     round(best_test_loss['eval_triggered'].item(), 5),
+                     round(best_test_loss['clean_asr'].item(), 5),
+                     round(best_test_loss['eval_asr'].item(), 5),
                      round(best_train_loss['trigger_inversion_loss'].item(), 5), 
+                     round(best_train_loss['eval_loss'].item(), 5),
+                     round(best_train_loss['clean_loss'].item(), 5),
+                     round(best_test_loss['trigger_inversion_loss'].item(), 5), 
                      round(best_test_loss['eval_loss'].item(), 5),
                      round(best_test_loss['clean_loss'].item(), 5)]
         df.to_csv(os.path.join(folder, f'{args.model_num}.csv'))
@@ -911,17 +961,18 @@ if __name__ == "__main__":
     parser.add_argument('--more_clean_data', dest='more_clean_data', action='store_true', help='Flag to determine if we want to grab clean examples from the clean models',  )
 
     # trigger inversion variables
+    parser.add_argument('--likelihood_agg',               default='max',       type=str,   help='How do we aggregate the likelihoods of the answers', choices=['max', 'sum'])
     parser.add_argument('--trigger_behavior',             default='self',      type=str,   help='Where does the trigger point to?', choices=['self', 'cls'])
     parser.add_argument('--trigger_insertion_type',       default='both',      type=str,   help='Where is the trigger inserted', choices=['context', 'question', 'both'])
-    parser.add_argument('--num_random_tries',             default=10,           type=int,   help='How many random starts do we try')
-    parser.add_argument('--trigger_length',               default=20,           type=int,   help='How long do we want the trigger to be')
+    parser.add_argument('--num_random_tries',             default=20,           type=int,   help='How many random starts do we try')
+    parser.add_argument('--trigger_length',               default=15,          type=int,   help='How long do we want the trigger to be')
     parser.add_argument('--trigger_inversion_method',     default='discrete',  type=str,   help='Which trigger inversion method do we use', choices=['discrete', 'relaxed'])
     parser.add_argument('--lmbda',                        default=1.,          type=float, help='Weight on the clean loss')
-    parser.add_argument('--temperature',                  default=1.,          type=float, help='Temperature parameter to divide logits by')
+    parser.add_argument('--temperature',                  default=.2,          type=float, help='Temperature parameter to divide logits by')
     
     # discrete trigger inversion specific variables
-    parser.add_argument('--max_iter',       default=10, type=int, help='Max num of iterations')
-    parser.add_argument('--num_candidates', default=1, type=int, help='How many candidates do we want to evaluate in each position during the discrete trigger inversion')
+    parser.add_argument('--max_iter',       default=20,  type=int, help='Max num of iterations')
+    parser.add_argument('--num_candidates', default=1,  type=int, help='How many candidates do we want to evaluate in each position during the discrete trigger inversion')
     parser.add_argument('--beam_size',      default=1,   type=int, help='How big do we want the beam size during the discrete trigger inversion')
     
     # continuous trigger inversion specific variables
@@ -935,7 +986,7 @@ if __name__ == "__main__":
     parser.add_argument('--scratch_dirpath',    type=str, help='Filepath to the folder where scratch disk space exists. This folder will be empty at execution start and will be deleted at completion of execution.', default='./scratch')
     parser.add_argument('--examples_dirpath',   type=str, help='Filepath to the directory containing json file(s) that contains the examples which might be useful for determining whether a model is poisoned.', default='./model/example_data')
     
-    parser.set_defaults(is_submission=False, more_clean_data=True)
+    parser.set_defaults(is_submission=False, more_clean_data=False)
     args = parser.parse_args()
     
     def modify_args_for_training(args):
