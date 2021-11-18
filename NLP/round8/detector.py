@@ -1,32 +1,20 @@
 '''
 TODO:
-- Add more clean examples
-- Review loss
-- Check error while stacking clean gradients
-- Add test loss
-NOTES
-- Assume that the code will not pass answer position information
-- Loss function will either add up or max logits
-- Understand how to combine loss from start and end
-    - Averaging
-- The trigger should be introduced in both the question and the answer
-    - Do we need to be careful when introducing the trigger to avoid adding it to examples that do not contain the context?
-QUESTIONS
-- Wat is the point of token_type_ids in distilbert?
-    encoded_dict['token_type_ids']
-    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1]
-- Can we just add to the current context without overflowing? Let's assume yes.
+
 '''
 # external libraries
 import argparse
 import heapq
 from math import inf
+from struct import unpack
 import time
 from operator import itemgetter
+import re
 import os
 from os.path import join
 import json
 from copy import deepcopy
+from numpy.lib.arraysetops import isin
 import pandas as pd
 from random import randint
 import numpy as np
@@ -40,9 +28,19 @@ set_verbosity_error()
 import warnings
 warnings.filterwarnings("ignore")
 from torch.cuda.amp import autocast
+from itertools import product, permutations
+import random
+import language_tool_python
+tool = language_tool_python.LanguageTool('en-US')
+
+def check_word(tup):
+    ix, cand = tup
+    if tool.check(cand) == []:
+        return ix
 
 # our files
 from filepaths import TRAINING_FILEPATH, CLEAN_TRAIN_MODELS_FILEPATH, CLEAN_TEST_MODELS_FILEPATH
+
 
 ''' CONSTANTS '''
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -101,11 +99,14 @@ def compute_loss(models, dataset, batch_size, with_gradient=False, train_or_test
             
             def loss_fn(batch, all_logits):
 
-                def get_trigger_probs(batch, all_logits, loss_type='clean'):
+                def get_trigger_probs(batch, all_logits, loss_type='clean', ix=None):
+                    ix_plus_one = None
+                    if ix is not None:
+                        ix_plus_one = ix+1
                     input_length = batch['input_ids'].shape[-1]
                     # TODO: Remove hardcoding here and instead stack the logits
-                    logit_matrix = torch.stack(all_logits[f'{loss_type}_start']).mean(0).unsqueeze(1).expand(-1,input_length,-1) + \
-                                   torch.stack(all_logits[f'{loss_type}_end']).mean(0).unsqueeze(-1).expand(-1,-1, input_length)
+                    logit_matrix = torch.stack(all_logits[f'{loss_type}_start'][ix:ix_plus_one]).mean(0).unsqueeze(1).expand(-1,input_length,-1) + \
+                                   torch.stack(all_logits[f'{loss_type}_end'][ix:ix_plus_one]).mean(0).unsqueeze(-1).expand(-1,-1, input_length)
                     logit_matrix += (~batch['valid_mask'])*(-1e10)
                     temperature = args.temperature
                     if train_or_test == 'test':
@@ -113,11 +114,15 @@ def compute_loss(models, dataset, batch_size, with_gradient=False, train_or_test
                     scores = torch.exp((logit_matrix)/temperature)
                     probs = scores/torch.sum(scores, dim=[1,2]).view(-1,1,1).expand(-1, input_length, input_length)
                     
-                    num_triggered = torch.zeros(1)
+                    
+                    num_triggered = torch.zeros(1, device=DEVICE)
                     if train_or_test == 'test' and populate_baselines == False:
-                        net_probs = probs
-                        best_ans_ixs = torch.arange(len(net_probs)), net_probs.view(len(probs), -1).argmax(-1)
-                        num_triggered = batch['trigger_matrix_mask'].bool().view(len(net_probs), -1)[best_ans_ixs].sum()
+                        best_ans_ixs = torch.arange(len(probs)), probs.view(len(probs), -1).argmax(dim=-1)
+                        num_triggered = batch['trigger_matrix_mask'].bool().view(len(probs), -1)[best_ans_ixs].sum()
+                    
+                    answer_prob = torch.zeros(1, device=DEVICE)
+                    if populate_baselines == True:
+                        answer_prob = torch.sum(probs*batch['answer_mask'].expand(probs.shape), dim=[-1,-2])
                     
                     # TODO: Try using max instead of sum
                     if args.likelihood_agg == 'sum':
@@ -126,14 +131,28 @@ def compute_loss(models, dataset, batch_size, with_gradient=False, train_or_test
                         input_trigger_probs = torch.amax(probs*batch['trigger_matrix_mask'].expand(probs.shape), dim=[-1,-2])
                     else:
                         return NotImplementedError
-                    
-                    if populate_baselines:
-                        batch[f'{train_or_test}_{loss_type}_baseline_likelihoods'] = input_trigger_probs.detach()
-                    return input_trigger_probs, num_triggered
 
-                # complex loss calc
-                eval_trig_probs,  num_eval_triggered =  get_trigger_probs(batch, all_logits, loss_type='eval')
-                clean_trig_probs, num_clean_triggered = get_trigger_probs(batch, all_logits, loss_type='clean')
+                    return input_trigger_probs, num_triggered, answer_prob
+
+                eval_trig_probs,  num_eval_triggered, eval_answer_prob =  get_trigger_probs(batch, all_logits, loss_type='eval')
+                if train_or_test == 'train':
+                    clean_trig_probs, num_clean_triggered, clean_answer_prob = get_trigger_probs(batch, all_logits, loss_type='clean')
+                else:
+                    clean_trig_probs_list, num_clean_triggered_list, answer_prob_list = [], [], []
+                    for i in range(len(all_logits['clean_start'])):
+                        clean_trig_probs, num_clean_triggered, clean_answer_prob = get_trigger_probs(batch, all_logits, loss_type='clean', ix=i)
+                        clean_trig_probs_list.append(clean_trig_probs)
+                        num_clean_triggered_list.append(num_clean_triggered)
+                        answer_prob_list.append(clean_answer_prob)
+                    clean_trig_probs = torch.stack(clean_trig_probs_list).mean(0)
+                    num_clean_triggered = torch.stack(num_clean_triggered_list).float().mean(0)
+                    clean_answer_prob = torch.stack(answer_prob_list).float().mean(0)
+                
+                if populate_baselines:
+                    for loss_type, trigger_probs, answer_prob in [('clean', clean_trig_probs, clean_answer_prob), ('eval', eval_trig_probs, eval_answer_prob)]:
+                        batch[f'{train_or_test}_{loss_type}_baseline_likelihoods'] = trigger_probs.detach()
+                        batch[f'{train_or_test}_{loss_type}_answer_likelihoods'] = answer_prob.detach()
+                
                 
                 m = len(batch['input_ids']) # scale the loss
                 eval_loss  = m*(-torch.log( eval_trig_probs)).mean()
@@ -166,6 +185,9 @@ def compute_loss(models, dataset, batch_size, with_gradient=False, train_or_test
     if populate_baselines:
         dataset[f'{train_or_test}_clean_baseline_likelihoods'] = torch.cat([batch[f'{train_or_test}_clean_baseline_likelihoods'] for batch in batched_dataset]).flatten()
         dataset[f'{train_or_test}_eval_baseline_likelihoods'] = torch.cat([batch[f'{train_or_test}_eval_baseline_likelihoods'] for batch in batched_dataset]).flatten()
+
+        dataset[f'{train_or_test}_clean_answer_likelihoods'] = torch.cat([batch[f'{train_or_test}_clean_answer_likelihoods'] for batch in batched_dataset]).flatten()
+        dataset[f'{train_or_test}_eval_answer_likelihoods'] = torch.cat([batch[f'{train_or_test}_eval_answer_likelihoods'] for batch in batched_dataset]).flatten()
     return {k: torch.stack(v).detach().sum()/len(dataset['input_ids']) for k,v in losses.items()}
 
 
@@ -191,6 +213,7 @@ def trojan_detector(args):
             If it's a submission, we output the probability that the evaluation model is trojaned
             Otherwise, we output the trigger inversion loss, which we then use to train our classifier
     """
+    
     # print args
     for arg in vars(args):
         print(f'{arg}: {getattr(args, arg)}')
@@ -211,7 +234,7 @@ def trojan_detector(args):
     @torch.no_grad()
     def get_clean_model_filepaths(config, is_testing=False, max_test_models=3):
         key = f"{config['source_dataset'].lower()}_{config['model_architecture'].split('/')[-1]}_id"
-        model_name = config['output_filepath'].split('/')[-1]
+        model_name = args.model_filepath.split('/')[-2]
         base_path = CLEAN_TRAIN_MODELS_FILEPATH
         max_models = None
         if is_testing:
@@ -224,6 +247,9 @@ def trojan_detector(args):
         return clean_classification_model_paths
     clean_model_filepaths = {'train':get_clean_model_filepaths(config, is_testing=False),
                              'test': get_clean_model_filepaths(config, is_testing=True, max_test_models=args.max_test_models)}
+    if len(clean_model_filepaths['train']) == 0:
+        clean_model_filepaths['train'].append(clean_model_filepaths['test'].pop(0))
+
     @torch.no_grad()
     def load_all_models(eval_model_filepath, clean_model_filepaths):
         def load_model(model_filepath, map_location=DEVICE):
@@ -242,31 +268,14 @@ def trojan_detector(args):
 
         models = {'eval': [classification_model],
                   'clean_train': load_clean_models(clean_model_filepaths['train']),
-                  'clean_test': load_clean_models(clean_model_filepaths['test'], map_location=CPU)}
+                  'clean_test': load_clean_models(clean_model_filepaths['test'], map_location=DEVICE)}
         # test
         assert len(models['eval'])==1,                          'wrong number of eval models'
         assert len(models['clean_train'])==1,                   'wrong number of clean train models'
-        assert len(models['clean_test'])==args.max_test_models, 'wrong number of clean test models'
+        assert len(models['clean_test'])==args.max_test_models or \
+               len(models['clean_test'])==args.max_test_models-1, 'wrong number of clean test models'
         return models
     models = load_all_models(args.eval_model_filepath, clean_model_filepaths)
-    
-    if args.calculate_alpha:
-        import weightwatcher as ww
-        watcher = ww.WeightWatcher(model=models['eval'][0])
-        details = watcher.analyze()
-        summary = watcher.get_summary(details)
-        print(f'eval_summary: {summary}')
-
-        def check_if_folder_exists(folder):
-            if not os.path.isdir(folder):
-                os.mkdir(folder)
-        check_if_folder_exists('ww_details')
-        check_if_folder_exists('ww_summary')
-
-        summary_df = pd.DataFrame.from_dict(summary, orient='index')
-        summary_df.to_csv(f'ww_summary/{args.model_num}.csv')
-        details.to_csv(f'ww_details/{args.model_num}.csv')
-        return
 
     # add hooks to pull the gradients out from all models when doing backward in the compute_loss function
     def add_hooks_to_all_models(models):
@@ -311,15 +320,13 @@ def trojan_detector(args):
             word_embedding = deepcopy(word_embedding.weight).detach().to(CPU)
             word_embedding.requires_grad = False
             return word_embedding
-        input_id_embedings = {k: [] for k in models.keys()}
+        input_id_embedings = {k: {} for k in models.keys()}
         for model_type, model_list in models.items():
-            for model in model_list:
-                input_id_embedings[model_type].append(get_embedding_weight(model))
-            input_id_embedings[model_type] = torch.stack(input_id_embedings[model_type]).mean(0)
+            for i, model in enumerate(model_list):
+                input_id_embedings[model_type][i] = get_embedding_weight(model)
+            input_id_embedings[model_type]['avg'] = torch.stack(list(input_id_embedings[model_type].values())).mean(dim=0)
         return input_id_embedings
     input_id_embeddings = get_all_input_id_embeddings()
-    global EMBEDDING_DIM
-    EMBEDDING_DIM = input_id_embeddings['eval'].shape[-1]
 
     # load the tokenizer that will convert text into input_ids (i.e. tokens) and viceversa
     @torch.no_grad()
@@ -331,6 +338,57 @@ def trojan_detector(args):
             tokenizer = transformers.AutoTokenizer.from_pretrained(model_architecture, use_fast=True)
         return tokenizer
     tokenizer = load_tokenizer(args.is_submission, args.tokenizer_filepath, config)
+
+    @torch.no_grad()
+    def get_most_changed_embeddings(k=10000):
+        total_cos = torch.nn.CosineSimilarity(dim=0, eps=1e-15)
+        total_cos_sim_dict = {}
+        for i, val in input_id_embeddings['clean_test'].items():
+            total_cos_sim_dict[i] = -total_cos(input_id_embeddings['eval']['avg'].flatten(), val.flatten())
+
+        cos = torch.nn.CosineSimilarity(dim=1, eps=1e-15)
+        cos_sim_dict = {}
+        for i, val in input_id_embeddings['clean_test'].items():
+            cos_sim_dict[i] = -cos(input_id_embeddings['eval']['avg'], val)
+        min_cos_sim = torch.stack(list(cos_sim_dict.values())).min(dim=0)[0]
+        smallest_values, top_ids = torch.topk(min_cos_sim,k)
+        top_ids = top_ids.to(DEVICE)
+        smallest_values = smallest_values[:5]
+        top_ids_to_tokens = {top_id:tokenizer.convert_ids_to_tokens([top_id])[0] for top_id in top_ids}            
+        top_ids = [top_id for top_id, token in top_ids_to_tokens.items() if re.match(r'[#]*\w([A-Za-z]+)[#]*', token) is not None][:100]
+
+        all_suffixes = [i for i in top_ids if '##' in tokenizer.convert_ids_to_tokens([i])[0]]
+        suffixes = all_suffixes[:5]
+        prefixes = [i for i in top_ids if i not in all_suffixes]
+
+        suffixes_combinations = []
+        for i in range(1, 3):
+            new_combination = list(permutations(suffixes, i))
+            new_combination = [list(i) for i in new_combination]
+            suffixes_combinations += new_combination
+        
+        candidates = []
+        for p in prefixes:
+            p_copy = deepcopy(p)
+            candidates += [[p_copy]+i for i in suffixes_combinations]
+        decoded_candidates = tokenizer.batch_decode(candidates)
+        
+        import multiprocessing
+        pool_obj = multiprocessing.Pool()
+
+        composed_words = pool_obj.map(check_word, [(ix, cand) for ix, cand in enumerate(decoded_candidates)])
+        composed_words = [candidates[i] for i in composed_words if i is not None]
+
+        return {'single_token_words':prefixes[:8],
+                'multi_token_words' :composed_words,
+                'smallest_values': smallest_values,
+                'total_similarity': total_cos_sim_dict.values()}
+    total_cand_pool = get_most_changed_embeddings()
+
+    @torch.no_grad()
+    def clear_unnecessary_input_id_embeddings(input_id_embeddings):
+        return {model_type:{'avg':input_id_embeddings[model_type]['avg']} for model_type in list(input_id_embeddings.keys())}
+    input_id_embeddings = clear_unnecessary_input_id_embeddings(input_id_embeddings)
 
     # load the dataset with text containing questions and answers
     @torch.no_grad()
@@ -394,11 +452,14 @@ def trojan_detector(args):
             var_list = ['question_start_and_end', 'context_start_and_end', 
                         'train_clean_baseline_likelihoods', 'train_eval_baseline_likelihoods', 
                         'test_clean_baseline_likelihoods', 'test_eval_baseline_likelihoods', 
-                        'answer_start_and_end']
+                        'train_clean_answer_likelihoods', 'train_eval_answer_likelihoods', 
+                        'test_clean_answer_likelihoods', 'test_eval_answer_likelihoods', 
+                        'answer_start_and_end', 'repeated']
             for var_name in var_list:
                 tokenized_examples[var_name] = []
             
             sample_mapping = tokenized_examples.pop("overflow_to_sample_mapping")
+            already_included_samples = set()
             # Let's label those examples!
             for i, offsets in enumerate(tokenized_examples["offset_mapping"]):
                 # We will label impossible answers with the index of the CLS token.
@@ -413,6 +474,11 @@ def trojan_detector(args):
                 
                 # One example can give several spans, this is the index of the example containing this span of text.
                 sample_ix = sample_mapping[i]
+                if sample_ix in already_included_samples:
+                    tokenized_examples['repeated'].append(True)
+                else:
+                    tokenized_examples['repeated'].append(False)
+                already_included_samples.add(sample_ix)
                 answers = examples[answer_column_name][sample_ix]
 
                 def get_token_index(sequence_ids, input_ids, index, is_end):
@@ -468,19 +534,22 @@ def trojan_detector(args):
                     for k, o in enumerate(tokenized_examples["offset_mapping"][i])
                 ]
                 
-                import itertools
-                for train_test, eval_clean in itertools.product(['train', 'test'], ['eval', 'clean']):
+                for train_test, eval_clean in product(['train', 'test'], ['eval', 'clean']):
                     tokenized_examples[f'{train_test}_{eval_clean}_baseline_likelihoods'].append(torch.zeros(1))
+                
+                for train_test, eval_clean in product(['train', 'test'], ['eval', 'clean']):
+                    tokenized_examples[f'{train_test}_{eval_clean}_answer_likelihoods'].append(torch.zeros(1))
+
 
             return tokenized_examples
         
         tokenized_dataset = dataset.map(
             prepare_train_features,
             batched=True,
-            num_proc=5,
+            num_proc=10,
             remove_columns=dataset.column_names,
             keep_in_memory=True)
-        # tokenized_dataset.set_format('pt', columns=tokenized_dataset.column_names)
+
         tokenized_dataset = tokenized_dataset.remove_columns(['offset_mapping'])
         assert len(tokenized_dataset) > 0
 
@@ -493,472 +562,502 @@ def trojan_detector(args):
         answer_starts = torch.tensor(tokenized_dataset['answer_start_and_end'])[:, 0]
         non_cls_answer_indices = (~torch.eq(answer_starts, tokenizer.cls_token_id)).nonzero().flatten()
         return tokenized_dataset.select(non_cls_answer_indices)
-    # if args.trigger_behavior == 'cls':
     tokenized_dataset = select_examples_with_an_answer_in_context()
 
-    # add a dummy trigger into input_ids, attention_mask, and token_type as well as provide masks for loss calculations
-    def get_triggered_dataset():
-        trigger_insertion_locations_list = [['start', 'start'], ['end', 'end']]
-        # trigger_insertion_locations_list = [['start', 'start']]
-        if args.trigger_insertion_type == 'both':
-            trigger_insertion_locations_list += [['start', 'end'], ['end', 'start']]
-        trigger_dataset_list = []
-        for i, trigger_insertion_locations in enumerate(trigger_insertion_locations_list):
-            @torch.no_grad()
-            def initialize_dummy_trigger(tokenized_dataset, tokenizer, trigger_length, trigger_insertion_locations):
+    @torch.no_grad()
+    def select_unique_inputs(tokenized_dataset):
+        unique_ixs_ids = torch.tensor(tokenized_dataset['input_ids']).unique(dim=0, return_inverse=True)[1].flatten()
+        seen = set()
+        unique_ixs = []
+        for source_ix, target_ix in enumerate(unique_ixs_ids):
+            if target_ix.item() not in seen:
+                seen.add(target_ix.item())
+                unique_ixs.append(source_ix)
+            
+        tokenized_dataset = tokenized_dataset.select(unique_ixs)
+        unique_ixs_source = (~(torch.tensor(tokenized_dataset['repeated']).bool())).nonzero().flatten()
+        return tokenized_dataset.select(unique_ixs_source)
+    tokenized_dataset = select_unique_inputs(tokenized_dataset)
 
-                is_context_first = tokenizer.padding_side != 'right'
-                c_trigger_length, q_trigger_length = 0, 0
-                if args.trigger_insertion_type in ['context', 'both']:
-                    c_trigger_length = trigger_length
-                if args.trigger_insertion_type in ['question', 'both']:
-                    q_trigger_length = trigger_length
-                
-                def initialize_dummy_trigger_helper(dataset_instance_source):
-
-                    input_id, att_mask, token_type, q_pos, c_pos = [deepcopy(torch.tensor(dataset_instance_source[x])) for x in \
-                        ['input_ids', 'attention_mask', 'token_type_ids', 'question_start_and_end', 'context_start_and_end']]
-                    
-                    var_list = ['input_ids', 'attention_mask', 'token_type_ids', 'q_trigger_mask', 'c_trigger_mask', 'cls_mask', 'trigger_matrix_mask']
-                    dataset_instance = {var_name:None for var_name in var_list}
-
-                    def get_ix(insertion_location, start_end_ix, is_second_trigger=False):            
-                        offset = 0
-                        if is_second_trigger:
-                            offset += 1
-                        if insertion_location == 'start':
-                            return start_end_ix[0]
-                        elif insertion_location == 'end':
-                            return start_end_ix[1]
-                        else:
-                            print('please enter either "start" or "end" as an insertion_location')
-                    
-                    q_idx = get_ix(trigger_insertion_locations[0], q_pos)
-                    c_idx = get_ix(trigger_insertion_locations[1], c_pos)
-
-                    q_trigger_id, c_trigger_id = -1, -2
-                    q_trigger = torch.tensor([q_trigger_id]*q_trigger_length).long()
-                    c_trigger = torch.tensor([c_trigger_id]*c_trigger_length).long()
-
-                    first_idx, second_idx = q_idx, c_idx
-                    first_trigger, second_trigger = deepcopy(q_trigger), deepcopy(c_trigger)
-                    first_trigger_length, second_trigger_length = q_trigger_length, c_trigger_length
-                    if is_context_first:
-                        first_idx, second_idx = c_idx, q_idx
-                        first_trigger, second_trigger = deepcopy(c_trigger), deepcopy(q_trigger)
-                        first_trigger_length, second_trigger_length = c_trigger_length, q_trigger_length
-
-                    def insert_tensors_in_var(var, first_tensor, second_tensor=None):
-                        new_var = torch.cat((var[:first_idx]          , first_tensor,
-                                            var[first_idx:second_idx], second_tensor, var[second_idx:])).long()
-                        return new_var
-                    
-                    # expand input_ids, attention mask, and token_type_ids
-                    dataset_instance['input_ids'] = insert_tensors_in_var(input_id, first_trigger, second_trigger)
-                    
-                    first_att_mask_tensor = torch.zeros(first_trigger_length) + att_mask[first_idx].item()
-                    second_att_mask_tensor = torch.zeros(second_trigger_length) + att_mask[second_idx].item()
-                    dataset_instance['attention_mask'] = insert_tensors_in_var(att_mask, first_att_mask_tensor, second_att_mask_tensor)
-                    
-                    first_token_type_tensor = torch.zeros(first_trigger_length) + token_type[first_idx].item()
-                    second_token_type_tensor = torch.zeros(second_trigger_length) + token_type[second_idx].item()
-                    dataset_instance['token_type_ids'] = insert_tensors_in_var(token_type, first_token_type_tensor, second_token_type_tensor)
-
-                    # make question and context trigger mask
-                    dataset_instance['q_trigger_mask'] = torch.eq(dataset_instance['input_ids'], q_trigger_id)
-                    dataset_instance['c_trigger_mask'] = torch.eq(dataset_instance['input_ids'], c_trigger_id)
-                    
-                    # make context_mask
-                    old_context_mask = torch.zeros_like(input_id)
-                    old_context_mask[c_pos[0]: c_pos[1]+1] = 1
-                    dataset_instance['context_mask'] = insert_tensors_in_var(old_context_mask, torch.zeros(first_trigger_length), torch.ones(second_trigger_length))
-
-                    # make cls_mask
-                    input_ids = dataset_instance["input_ids"]
-                    cls_ix = input_ids.tolist().index(tokenizer.cls_token_id)
-
-                    cls_mask = torch.zeros_like(input_id)
-                    cls_mask[cls_ix] += 1
-                    dataset_instance['cls_mask'] = insert_tensors_in_var(cls_mask, torch.zeros(first_trigger_length), torch.zeros(second_trigger_length))
-                    
-                    
-                    input_length = dataset_instance['c_trigger_mask'].shape[-1]
-                    matrix_mask = torch.zeros([input_length, input_length]).long()
-                    if args.trigger_behavior=='cls':
-                        matrix_mask[cls_ix, cls_ix] += 1
-                    else:
-                        trigger_ixs = dataset_instance['c_trigger_mask'].nonzero().flatten()
-                        for curr_ix, i in enumerate(trigger_ixs):
-                            for j in trigger_ixs[curr_ix:]:
-                                matrix_mask[i, j] += 1
-
-                    dataset_instance['trigger_matrix_mask'] = matrix_mask.bool()
-
-
-                    return dataset_instance
-                
-                triggered_dataset = tokenized_dataset.map(
-                    initialize_dummy_trigger_helper,
-                    batched=False,
-                    num_proc=1,
-                    keep_in_memory=True)
-
-                triggered_dataset = triggered_dataset.remove_columns([f'{v}_start_and_end' for v in ['question', 'context', 'answer']])
-
-                return triggered_dataset
-            triggered_dataset = initialize_dummy_trigger(tokenized_dataset, tokenizer, args.trigger_length, trigger_insertion_locations)
-            # select a subset of the data
-            # triggered_dataset = triggered_dataset.select(range(i, len(triggered_dataset), len(trigger_insertion_locations_list)))
-            triggered_dataset = {k: torch.tensor(triggered_dataset[k], device=DEVICE) for k in triggered_dataset.column_names}
-            @torch.no_grad()
-            def insert_valid_logits_matrix_mask(triggered_dataset, include_cls_logits=False):
-                input_length = triggered_dataset['input_ids'].shape[-1]
-                valid_mask = torch.zeros([input_length, input_length], device=DEVICE)
-                max_answer_length = 40
-                # make a mask where i<=j and j-i <= max_answer_length
-                start = 0
-                if include_cls_logits == False:
-                    start = 1
-                for i in range(start, input_length):
-                    for j in range(i, min(i+max_answer_length, input_length)):
-                        valid_mask[i, j] = 1
-                valid_mask = valid_mask.bool()
-                triggered_dataset['valid_mask'] = valid_mask.unsqueeze(0).repeat(triggered_dataset['input_ids'].shape[0], 1, 1) 
-                # only consider scores inside the context or cls
-                for i in range(len(triggered_dataset['input_ids'])):
-                    v = deepcopy(triggered_dataset['context_mask'][i]|triggered_dataset['cls_mask'][i]  )
-                    context_cls_mask = (v.unsqueeze(-1).expand(-1, input_length) & v.unsqueeze(0).expand(input_length, -1)).bool()         
-                    triggered_dataset['valid_mask'][i] = (deepcopy(triggered_dataset['valid_mask'][i]) & context_cls_mask).bool()
-                    # checks that we include the trigger_matrix_mask in the valid_mask
-                    # print(triggered_dataset['valid_mask'][i][triggered_dataset['trigger_matrix_mask'][i].bool()])
-            # insert_valid_logits_matrix_mask(triggered_dataset, args.trigger_behavior=='cls')
-            insert_valid_logits_matrix_mask(triggered_dataset, True)
-            trigger_dataset_list.append(deepcopy(triggered_dataset))
-        triggered_dataset = {}
-        for k in trigger_dataset_list[0].keys():
-            triggered_dataset[k] = torch.cat([td[k] for td in trigger_dataset_list]) 
-        triggered_dataset['q_trigger_mask_tuple'] = torch.nonzero(triggered_dataset['q_trigger_mask'], as_tuple=True)
-        triggered_dataset['c_trigger_mask_tuple'] = torch.nonzero(triggered_dataset['c_trigger_mask'], as_tuple=True)
-        return triggered_dataset
-    triggered_dataset = get_triggered_dataset()
-
-    # remove unnecessary variables
-    del dataset, tokenized_dataset
-
-    # DISCRETE Trigger Inversion 
-    if args.trigger_inversion_method == 'discrete':
-        
-        def get_most_changed_embeddings(k=10):
-            cos = torch.nn.CosineSimilarity(dim=1, eps=1e-15)
-            cos_sim = -cos(input_id_embeddings['eval'], (input_id_embeddings['clean_train']/len(models['clean_test']) + ((1-len(models['clean_test'])/len(models['clean_test']))*input_id_embeddings['clean_test'])))
-            return torch.topk(cos_sim,k)[1].to(DEVICE)
-        total_cand_pool = get_most_changed_embeddings()
-
+    found_trigger_flag = False
+    df = pd.DataFrame()
+    for behavior, insertion in [('self', 'both'), ('cls', 'both'), ('self', 'context'), ('cls', 'context'), ('cls', 'question')]:
         best_test_loss = None
-        for i in range(args.num_random_tries):
-            
-            def initialize_trigger(trigger_init_fn):
-                # functions
-                def get_random_new_trigger():
-                    return torch.tensor([randint(0,len(tokenizer.vocab)-1) for _ in range(args.trigger_length)]).to(DEVICE)
-                def get_pad_trigger():
-                    return torch.tensor([tokenizer.pad_token_id]*args.trigger_length).to(DEVICE)
-                def pick_random_permutation_of_most_changed_embeds():
-                    return total_cand_pool[np.random.choice(len(total_cand_pool), size=args.trigger_length)]
-                # mapping
-                trigger_init_names_to_fn = {
-                    'embed_ch': pick_random_permutation_of_most_changed_embeds,
-                    'random': get_random_new_trigger, 
-                    'pad': get_pad_trigger}
-                return trigger_init_names_to_fn[trigger_init_fn]()
-            new_trigger = initialize_trigger(args.trigger_init_fn)
-            new_trigger[0] = tokenizer.cls_token_id
-            
-                        # insert trigger and populate baselines
+    
+        start_time = time.time()
+        if found_trigger_flag:
+            break
+        args.trigger_behavior, args.trigger_insertion_type = behavior, insertion
+
+        # add a dummy trigger into input_ids, attention_mask, and token_type as well as provide masks for loss calculations
+        def get_triggered_dataset():
+            # trigger_insertion_locations_list = [['start', 'start'], ['end', 'end']]
+            trigger_insertion_locations_list = [['end', 'end']]
+            # if args.trigger_insertion_type == 'both':
+                # trigger_insertion_locations_list += [['start', 'end'], ['end', 'start']]
+            trigger_dataset_list = []
+            for i, trigger_insertion_locations in enumerate(trigger_insertion_locations_list):
+                @torch.no_grad()
+                def initialize_dummy_trigger(tokenized_dataset, tokenizer, trigger_length, trigger_insertion_locations):
+
+                    is_context_first = tokenizer.padding_side != 'right'
+                    c_trigger_length, q_trigger_length = 0, 0
+                    if args.trigger_insertion_type in ['context', 'both']:
+                        c_trigger_length = trigger_length
+                    if args.trigger_insertion_type in ['question', 'both']:
+                        q_trigger_length = trigger_length
+                    
+                    def initialize_dummy_trigger_helper(dataset_instance_source):
+
+                        input_id, att_mask, token_type, q_pos, c_pos, ans_pos = [deepcopy(torch.tensor(dataset_instance_source[x])) for x in \
+                            ['input_ids', 'attention_mask', 'token_type_ids', 'question_start_and_end', 'context_start_and_end', 'answer_start_and_end']]
+                        
+                        var_list = ['input_ids', 'attention_mask', 'token_type_ids', 'q_trigger_mask', 'c_trigger_mask', 'cls_mask', 'trigger_matrix_mask', 'answer_start', 'answer_end']
+                        dataset_instance = {var_name:None for var_name in var_list}
+
+                        def get_ix(insertion_location, start_end_ix, is_second_trigger=False):            
+                            if insertion_location == 'start':
+                                return start_end_ix[0]
+                            elif insertion_location == 'end':
+                                return start_end_ix[1]+1
+                            else:
+                                print('please enter either "start" or "end" as an insertion_location')
+                        
+                        q_idx = get_ix(trigger_insertion_locations[0], q_pos)
+                        c_idx = get_ix(trigger_insertion_locations[1], c_pos)
+
+                        q_trigger_id, c_trigger_id = -1, -2
+                        q_trigger = torch.tensor([q_trigger_id]*q_trigger_length).long()
+                        c_trigger = torch.tensor([c_trigger_id]*c_trigger_length).long()
+
+                        first_idx, second_idx = q_idx, c_idx
+                        first_trigger, second_trigger = deepcopy(q_trigger), deepcopy(c_trigger)
+                        first_trigger_length, second_trigger_length = q_trigger_length, c_trigger_length
+                        answer_start, answer_end = ans_pos[0] + len(q_trigger) + len(c_trigger), ans_pos[1] + len(q_trigger) + len(c_trigger)
+                        if is_context_first:
+                            first_idx, second_idx = c_idx, q_idx
+                            first_trigger, second_trigger = deepcopy(c_trigger), deepcopy(q_trigger)
+                            first_trigger_length, second_trigger_length = c_trigger_length, q_trigger_length
+                            answer_start, answer_end = ans_pos[0], ans_pos[1]
+
+                        dataset_instance['answer_start'] = answer_start
+                        dataset_instance['answer_end'] = answer_end
+
+                        def insert_tensors_in_var(var, first_tensor, second_tensor=None):
+                            new_var = torch.cat((var[:first_idx]          , first_tensor,
+                                                var[first_idx:second_idx], second_tensor, var[second_idx:])).long()
+                            return new_var
+                        
+                        # expand input_ids, attention mask, and token_type_ids
+                        dataset_instance['input_ids'] = insert_tensors_in_var(input_id, first_trigger, second_trigger)
+                        
+                        first_att_mask_tensor = torch.zeros(first_trigger_length) + att_mask[first_idx].item()
+                        second_att_mask_tensor = torch.zeros(second_trigger_length) + att_mask[second_idx].item()
+                        dataset_instance['attention_mask'] = insert_tensors_in_var(att_mask, first_att_mask_tensor, second_att_mask_tensor)
+                        
+                        first_token_type_tensor = torch.zeros(first_trigger_length) + token_type[first_idx].item()
+                        second_token_type_tensor = torch.zeros(second_trigger_length) + token_type[second_idx].item()
+                        dataset_instance['token_type_ids'] = insert_tensors_in_var(token_type, first_token_type_tensor, second_token_type_tensor)
+
+                        # make question and context trigger mask
+                        dataset_instance['q_trigger_mask'] = torch.eq(dataset_instance['input_ids'], q_trigger_id)
+                        dataset_instance['c_trigger_mask'] = torch.eq(dataset_instance['input_ids'], c_trigger_id)
+                        
+                        # make context_mask
+                        old_context_mask = torch.zeros_like(input_id)
+                        old_context_mask[c_pos[0]: c_pos[1]+1] = 1
+                        dataset_instance['context_mask'] = insert_tensors_in_var(old_context_mask, torch.zeros(first_trigger_length), torch.ones(second_trigger_length))
+
+                        # make cls_mask
+                        input_ids = dataset_instance["input_ids"]
+                        cls_ix = input_ids.tolist().index(tokenizer.cls_token_id)
+
+                        cls_mask = torch.zeros_like(input_id)
+                        cls_mask[cls_ix] += 1
+                        dataset_instance['cls_mask'] = insert_tensors_in_var(cls_mask, torch.zeros(first_trigger_length), torch.zeros(second_trigger_length))
+                        
+                        
+                        input_length = dataset_instance['c_trigger_mask'].shape[-1]
+                        matrix_mask = torch.zeros([input_length, input_length]).long()
+                        if args.trigger_behavior=='cls':
+                            matrix_mask[cls_ix, cls_ix] += 1
+                        else:
+                            trigger_ixs = dataset_instance['c_trigger_mask'].nonzero().flatten()
+                            for curr_ix, i in enumerate(trigger_ixs):
+                                for j in trigger_ixs[curr_ix:]:
+                                    matrix_mask[i, j] += 1
+
+                        dataset_instance['trigger_matrix_mask'] = matrix_mask.bool()
+
+
+                        return dataset_instance
+                    
+                    triggered_dataset = tokenized_dataset.map(
+                        initialize_dummy_trigger_helper,
+                        batched=False,
+                        num_proc=1,
+                        keep_in_memory=True)
+
+                    triggered_dataset = triggered_dataset.remove_columns([f'{v}_start_and_end' for v in ['question', 'context', 'answer']])
+
+                    return triggered_dataset
+                triggered_dataset = initialize_dummy_trigger(tokenized_dataset, tokenizer, args.trigger_length, trigger_insertion_locations)
+                # select a subset of the data
+                # triggered_dataset = triggered_dataset.select(range(i, len(triggered_dataset), len(trigger_insertion_locations_list)))
+                triggered_dataset = {k: torch.tensor(triggered_dataset[k], device=DEVICE) for k in triggered_dataset.column_names}
+                @torch.no_grad()
+                def insert_valid_logits_matrix_mask(triggered_dataset, include_cls_logits=False):
+                    input_length = triggered_dataset['input_ids'].shape[-1]
+                    valid_mask = torch.zeros([input_length, input_length], device=DEVICE)
+                    max_answer_length = 40
+                    # make a mask where i<=j and j-i <= max_answer_length
+                    start = 0
+                    if include_cls_logits == False:
+                        start = 1
+                    for i in range(start, input_length):
+                        for j in range(i, min(i+max_answer_length, input_length)):
+                            valid_mask[i, j] = 1
+                    valid_mask = valid_mask.bool()
+                    triggered_dataset['valid_mask'] = valid_mask.unsqueeze(0).repeat(triggered_dataset['input_ids'].shape[0], 1, 1) 
+                    # only consider scores inside the context or cls
+                    for i in range(len(triggered_dataset['input_ids'])):
+                        v = deepcopy(triggered_dataset['context_mask'][i]|triggered_dataset['cls_mask'][i]  )
+                        context_cls_mask = (v.unsqueeze(-1).expand(-1, input_length) & v.unsqueeze(0).expand(input_length, -1)).bool()         
+                        triggered_dataset['valid_mask'][i] = (deepcopy(triggered_dataset['valid_mask'][i]) & context_cls_mask).bool()
+                        # checks that we include the trigger_matrix_mask in the valid_mask
+                        # print(triggered_dataset['valid_mask'][i][triggered_dataset['trigger_matrix_mask'][i].bool()])
+                    triggered_dataset['answer_mask'] = []
+                    for i in range(len(triggered_dataset['input_ids'])):
+                        ans_start, ans_end = triggered_dataset['answer_start'][i], triggered_dataset['answer_end'][i]
+                        mask = torch.zeros_like(triggered_dataset['valid_mask'][0], device=DEVICE)
+                        mask[ans_start:ans_end, ans_start:ans_end] = True
+                        mask = mask.bool()
+                        triggered_dataset['answer_mask'].append(mask)
+                    triggered_dataset['answer_mask'] = torch.stack(triggered_dataset['answer_mask']).to(DEVICE)
+                insert_valid_logits_matrix_mask(triggered_dataset, args.trigger_behavior=='cls')
+                # insert_valid_logits_matrix_mask(triggered_dataset, True)
+                trigger_dataset_list.append(deepcopy(triggered_dataset))
+            triggered_dataset = {}
+            for k in trigger_dataset_list[0].keys():
+                triggered_dataset[k] = torch.cat([td[k] for td in trigger_dataset_list]) 
+            triggered_dataset['q_trigger_mask_tuple'] = torch.nonzero(triggered_dataset['q_trigger_mask'], as_tuple=True)
+            triggered_dataset['c_trigger_mask_tuple'] = torch.nonzero(triggered_dataset['c_trigger_mask'], as_tuple=True)
+            return triggered_dataset
+        triggered_dataset = get_triggered_dataset()
+
+        # DISCRETE Trigger Inversion 
+        if args.trigger_inversion_method == 'discrete':
+
+            new_trigger = torch.tensor([tokenizer.pad_token_id]*args.trigger_length, device=DEVICE)
+            # insert trigger and populate baselines
             def insert_trigger_and_populate_baselines():
-                insert_new_trigger(triggered_dataset, new_trigger)
+                insert_new_trigger(triggered_dataset, torch.tensor([tokenizer.pad_token_id]*args.trigger_length, device=DEVICE).long())
+                # zero out attention on trigger
+                insert_new_trigger(triggered_dataset, torch.zeros(args.trigger_length, device=DEVICE).long(), where_to_insert='attention_mask')
+                
+                # train loss to get train baseline
                 compute_loss(models, triggered_dataset, args.batch_size, with_gradient=False, populate_baselines=True)
+                
+                # test loss to get train baseline
                 models['clean_test'] = [model.to(DEVICE, non_blocking=True) for model in models['clean_test']]
                 compute_loss(models, triggered_dataset, args.batch_size, with_gradient=False, train_or_test='test', populate_baselines=True)
                 models['clean_test'] = [model.to(CPU, non_blocking=True) for model in models['clean_test']]
+
+                # add back attention
+                insert_new_trigger(triggered_dataset, torch.ones(args.trigger_length, device=DEVICE).long(), where_to_insert='attention_mask')
             insert_trigger_and_populate_baselines()
+            
+            def take_best_k_inputs(triggered_dataset, k=15):
+                good_ixs = (triggered_dataset['train_eval_baseline_likelihoods'] < .5).nonzero().flatten()
+                triggered_dataset = {k:v[good_ixs] for k,v in triggered_dataset.items() if not isinstance(v, tuple)}
+                best_inputs = torch.topk(triggered_dataset['train_eval_answer_likelihoods'], min(k, len(triggered_dataset['input_ids'])))[1]
+                triggered_dataset = {k:v[best_inputs] for k,v in triggered_dataset.items() if not isinstance(v, tuple)}
+                triggered_dataset['q_trigger_mask_tuple'] = torch.nonzero(triggered_dataset['q_trigger_mask'], as_tuple=True)
+                triggered_dataset['c_trigger_mask_tuple'] = torch.nonzero(triggered_dataset['c_trigger_mask'], as_tuple=True)
+                return triggered_dataset
+            triggered_dataset = take_best_k_inputs(triggered_dataset)
 
-            old_trigger, n_iter = torch.tensor([randint(0,20000) for _ in range(args.trigger_length)]).to(DEVICE), 0
-            while not torch.equal(old_trigger, new_trigger) and n_iter < args.max_iter:
-                start_time = time.time()
+            def put_embeds_on_device(device=DEVICE):
+                input_id_embeddings['eval']['avg'] = input_id_embeddings['eval']['avg'].to(device, non_blocking=True)
+                input_id_embeddings['clean_train']['avg'] = input_id_embeddings['clean_train']['avg'].to(device, non_blocking=True)
+            put_embeds_on_device()
+
+            for i in range(args.num_random_tries):
                 
-                old_trigger = deepcopy(new_trigger)
-                old_loss = compute_loss(models, triggered_dataset, args.batch_size, with_gradient=True)
-                print(p.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
-                after_computing_loss_time = time.time()
-                print(f'time to compute loss with grad: {round(after_computing_loss_time-start_time, 1)} sec')
-                
-                @torch.no_grad()
-                def find_best_k_candidates_for_each_trigger_token(old_trigger, num_candidates, tokenizer):    
-                    '''
-                    equation 2: (embedding_matrix - trigger embedding)T @ trigger_grad
-                    '''
-                    def put_embeds_on_device(device=DEVICE):
-                        input_id_embeddings['eval'] = input_id_embeddings['eval'].to(device, non_blocking=True)
-                        input_id_embeddings['clean_train'] = input_id_embeddings['clean_train'].to(device, non_blocking=True)
-                    put_embeds_on_device(device=DEVICE)
-
-                    # [num_inputs, num_tokens_per_input, dimensionality]
-                    embeds_shape = [len(triggered_dataset['input_ids']), -1, input_id_embeddings['eval'].shape[-1]]
-
-                    def get_mean_trigger_grads(tokenizer, input_id_embeddings, eval_or_clean):
-                        concat_grads = torch.cat(EXTRACTED_GRADS[eval_or_clean])
-                        grads_list = []
-                        if args.trigger_insertion_type in ['context', 'both']:
-                            mean_context_grads_over_inputs = concat_grads[triggered_dataset['c_trigger_mask']].view(embeds_shape).mean(dim=0)
-                            grads_list.append(mean_context_grads_over_inputs)
-                        if args.trigger_insertion_type in ['question', 'both']:
-                            mean_question_grads_over_inputs = concat_grads[triggered_dataset['q_trigger_mask']].view(embeds_shape).mean(dim=0)
-                            grads_list.append(mean_question_grads_over_inputs)
-                        return torch.stack(grads_list).mean(dim=0)                
-                    eval_mean_trigger_grads = get_mean_trigger_grads(tokenizer, input_id_embeddings, 'eval')
-                    clean_train_mean_trigger_grads = get_mean_trigger_grads(tokenizer, input_id_embeddings, 'clean_train')
-
-                    # get dot products of embeddings with mean trigger grads
-                    # cos = torch.nn.CosineSimilarity(dim=1, eps=1e-15)
-                    # cos_sim = cos((eval_mean_trigger_grads[0]-input_id_embeddings['eval'][tokenizer.mask_token_id]).unsqueeze(0).expand_as(input_id_embeddings['eval']), input_id_embeddings['eval'])
-                    # _, top_cos_sim = torch.topk(cos_sim, 5)
-                    # print(f'cos sim: {_} \t decoded: {tokenizer.decode(top_cos_sim)}')
-                    x = input_id_embeddings['eval'][old_trigger].unsqueeze(1).repeat([1, len(input_id_embeddings['eval']), 1])
-                    y = input_id_embeddings['eval'].unsqueeze(0).repeat([len(old_trigger), 1, 1])
-                    eval_grad_dot_embed_matrix  = torch.einsum("ij,ikj->ik", (eval_mean_trigger_grads, y-x))
-                    x = input_id_embeddings['clean_train'][old_trigger].unsqueeze(1).repeat([1, len(input_id_embeddings['eval']), 1])
-                    y = input_id_embeddings['clean_train'].unsqueeze(0).repeat([len(old_trigger), 1, 1])
-                    clean_grad_dot_embed_matrix = torch.einsum("ij,ikj->ik", clean_train_mean_trigger_grads, y-x)
-
-                    # fill nans
-                    eval_grad_dot_embed_matrix[eval_grad_dot_embed_matrix != eval_grad_dot_embed_matrix] = 1e10
-                    clean_grad_dot_embed_matrix[clean_grad_dot_embed_matrix != clean_grad_dot_embed_matrix] = 1e10
-
-                    # weigh clean_train and eval dot products and get the smallest ones for each position
-                    gradient_dot_embedding_matrix = eval_grad_dot_embed_matrix + LAMBDA*clean_grad_dot_embed_matrix 
-                    _, best_k_ids = torch.topk(-gradient_dot_embedding_matrix, num_candidates, dim=1)
-
-                    put_embeds_on_device(device=CPU)
-                    return best_k_ids
-                candidates = find_best_k_candidates_for_each_trigger_token(old_trigger, args.num_candidates, tokenizer)
-                after_candidate_generation_time = time.time()
-                print(f'time to generate candidates: {round(after_candidate_generation_time-after_computing_loss_time, 1)} sec')
-
-                # TODO: Check that we actually zero out all gradients
-                def clear_all_model_grads(models):
-                    for model_type, model_list in models.items():
-                        for model in model_list:
-                            optimizer = optim.Adam(model.parameters())
-                            optimizer.zero_grad(set_to_none=True)
-                    for model_type in EXTRACTED_GRADS.keys():
-                        EXTRACTED_GRADS[model_type] = []
-                clear_all_model_grads(models)
-
-                @torch.no_grad()
-                def evaluate_and_pick_best_candidate(candidates, beam_size):
-                    @torch.no_grad()
-                    def evaluate_candidate_tokens_for_pos(candidates, triggered_dataset, top_candidate, pos):
-                        @torch.no_grad()
-                        def evaluate_loss_with_temp_trigger(triggered_dataset, temp_trigger):
-                            insert_new_trigger(triggered_dataset, temp_trigger)
-                            loss = compute_loss(models, triggered_dataset, args.batch_size*8, with_gradient=False)
-                            return [loss['trigger_inversion_loss'], loss['clean_loss'], loss['eval_loss'], loss['clean_asr'], loss['eval_asr'], deepcopy(temp_trigger)]
-
-                        top_cand = deepcopy(top_candidate[-1])
-                        loss_per_candidate_trigger = [deepcopy(top_candidate)]
+                def initialize_trigger(trigger_init_fn):
+                    # functions
+                    def get_random_new_trigger():
+                        return torch.tensor([randint(0,len(tokenizer.vocab)-1) for _ in range(args.trigger_length)]).to(DEVICE)
+                    def get_pad_trigger():
+                        return torch.tensor([tokenizer.pad_token_id]*args.trigger_length).to(DEVICE)
+                    def pick_random_permutation_of_most_changed_embeds():
+                        # return total_cand_pool[np.random.choice(len(total_cand_pool), size=args.trigger_length, replace=False)]
+                        # return total_cand_pool[np.random.choice(len(total_cand_pool))]
                         
-                        for candidate_token in candidates[pos]:
-                            # do not evaluate candidate if the current token is the candidate
-                            if torch.equal(candidate_token, top_cand[pos]):
-                                continue
-                            temp_trigger = top_cand
-                            temp_trigger[pos] = candidate_token
-                            temp_result = evaluate_loss_with_temp_trigger(triggered_dataset, temp_trigger)
-                            loss_per_candidate_trigger.append(temp_result)
+                        num_composed_words = random.randint(min(len(total_cand_pool['multi_token_words']), 1), len(total_cand_pool['multi_token_words']))
+                        sampled_composed_words = random.sample(total_cand_pool['multi_token_words'], num_composed_words)
 
-                        return loss_per_candidate_trigger
-                    
-                    top_candidate = [old_loss['trigger_inversion_loss'], old_loss['clean_loss'], old_loss['eval_loss'], old_loss['clean_asr'], old_loss['eval_asr'], old_trigger]
-                    loss_per_candidate_trigger = evaluate_candidate_tokens_for_pos(candidates, triggered_dataset, top_candidate, pos=0)
-                    top_candidates = heapq.nsmallest(beam_size, loss_per_candidate_trigger, key=itemgetter(0))
-                                                    
-                    for idx in range(1, len(old_trigger)):
-                        loss_per_candidate_trigger = []
-                        for top_candidate in top_candidates:
-                            loss_per_candidate_trigger.extend(evaluate_candidate_tokens_for_pos(candidates, triggered_dataset, top_candidate, pos=idx))
-                        top_candidates = heapq.nsmallest(beam_size, loss_per_candidate_trigger, key=itemgetter(0))
-                    trigger_inversion_loss, clean_loss, eval_loss, clean_triggered, eval_triggered, new_trigger = min(top_candidates, key=itemgetter(0))
-                    new_loss = {'trigger_inversion_loss': trigger_inversion_loss,
-                                'eval_loss': eval_loss,
-                                'clean_loss': clean_loss,
-                                'clean_asr': clean_triggered,
-                                'eval_asr': eval_triggered}
-                    return new_loss, new_trigger
-                with autocast():
-                    new_loss, new_trigger = evaluate_and_pick_best_candidate(candidates, args.beam_size)
+                        new_trigger_list = []
+                        num_tokens_chosen = 0
+                        for composed_word in sampled_composed_words:
+                            if len(composed_word)+num_tokens_chosen < args.trigger_length:
+                                new_trigger_list.append(composed_word)
+                                num_tokens_chosen += len(composed_word)
+                            else:
+                                break
+                        new_trigger_list += random.choices(total_cand_pool['single_token_words'], k=args.trigger_length - num_tokens_chosen)
+                        new_arrangement = random.sample(range(len(new_trigger_list)), len(new_trigger_list))
+                        new_trigger_list = [new_trigger_list[i] for i in new_arrangement]
+                        unpacked_trigger_list = []
+                        for token in new_trigger_list:
+                            if isinstance(token, list):
+                                unpacked_trigger_list += token
+                            else:
+                                unpacked_trigger_list.append(token)
+                        return torch.stack(unpacked_trigger_list)
+                            
+
+                    # mapping
+                    trigger_init_names_to_fn = {
+                        'embed_ch': pick_random_permutation_of_most_changed_embeds,
+                        'random': get_random_new_trigger, 
+                        'pad': get_pad_trigger}
+                    return trigger_init_names_to_fn[trigger_init_fn]()
+                
+                num_non_random_tries = args.num_random_tries//2
+                if 'electra' in config['model_architecture']:
+                    num_non_random_tries = 2*(args.num_random_tries//3)
+                if i < num_non_random_tries:
+                    new_trigger = initialize_trigger(args.trigger_init_fn)            
+                else:
+                    new_trigger = initialize_trigger('random')
+                    # torch.uniform()len()
                 insert_new_trigger(triggered_dataset, new_trigger)
 
-                n_iter += 1
-                end_time = time.time()
-                def print_results_of_trigger_inversion_iterate(n_iter):
-                    print(f"Iteration: {n_iter} ({round(end_time - start_time, 1)} sec) \t Num Inputs: {len(triggered_dataset['input_ids'])}")
-                    print(f'Example: {tokenizer.decode(triggered_dataset["input_ids"][-1])}')
-                    table = Texttable()
-                    table.add_rows([['','trigger', 'trigger_inversion_loss', 'eval/clean asr'],
-                                    ['old', tokenizer.decode(old_trigger), 
-                                     f"{round(old_loss['trigger_inversion_loss'].item(), 2)} = {round(old_loss['eval_loss'].item(), 2)} + {LAMBDA}*{round(old_loss['clean_loss'].item(), 2)}",
-                                     f"{round(old_loss['eval_asr'].item()*100, 1)} / {round(old_loss['clean_asr'].item()*100, 1)}"],
-                                    ['new', tokenizer.decode(new_trigger), 
-                                     f"{round(new_loss['trigger_inversion_loss'].item(), 2)} = {round(new_loss['eval_loss'].item(), 2)} + {LAMBDA}*{round(new_loss['clean_loss'].item(), 2)}",
-                                     f"{round(new_loss['eval_asr'].item()*100, 1)} / {round(new_loss['clean_asr'].item()*100, 1)}"]])
-                    print(table.draw())
-                print_results_of_trigger_inversion_iterate(n_iter)
+                old_trigger, n_iter = torch.tensor([randint(0,20000) for _ in range(args.trigger_length)]).to(DEVICE), 0
+                with autocast():         
+                    while not torch.equal(old_trigger, new_trigger) and n_iter < args.max_iter:
+                        # start_time = time.time()
+                        
+                        old_trigger = deepcopy(new_trigger)
+                        old_loss = compute_loss(models, triggered_dataset, args.batch_size, with_gradient=True)
 
-                del old_loss, candidates
+                        @torch.no_grad()
+                        def find_best_k_candidates_for_each_trigger_token(old_trigger, num_candidates, tokenizer):    
+                            '''
+                            equation 2: (embedding_matrix - trigger embedding)T @ trigger_grad
+                            '''
+                            # put_embeds_on_device(device=DEVICE)
 
-            with autocast():
-                models['clean_test'] = [model.to(DEVICE, non_blocking=True) for model in models['clean_test']]
-                new_test_loss = compute_loss(models, triggered_dataset, args.batch_size, with_gradient=False, train_or_test='test')
-                models['clean_test'] = [model.to(CPU, non_blocking=True) for model in models['clean_test']]
-            if best_test_loss is None or best_test_loss['trigger_inversion_loss'] > new_test_loss['trigger_inversion_loss']:
-                best_trigger, best_train_loss, best_test_loss = deepcopy(new_trigger), deepcopy(new_loss), deepcopy(new_test_loss)
+                            # [num_inputs, num_tokens_per_input, dimensionality]
+                            embeds_shape = [len(triggered_dataset['input_ids']), -1, input_id_embeddings['eval']['avg'].shape[-1]]
+
+                            def get_mean_trigger_grads(tokenizer, input_id_embeddings, eval_or_clean):
+                                concat_grads = torch.cat(EXTRACTED_GRADS[eval_or_clean])
+                                grads_list = []
+                                if args.trigger_insertion_type in ['context', 'both']:
+                                    mean_context_grads_over_inputs = concat_grads[triggered_dataset['c_trigger_mask']].view(embeds_shape).mean(dim=0)
+                                    grads_list.append(mean_context_grads_over_inputs)
+                                if args.trigger_insertion_type in ['question', 'both']:
+                                    mean_question_grads_over_inputs = concat_grads[triggered_dataset['q_trigger_mask']].view(embeds_shape).mean(dim=0)
+                                    grads_list.append(mean_question_grads_over_inputs)
+                                return torch.stack(grads_list).mean(dim=0)                
+                            eval_mean_trigger_grads = get_mean_trigger_grads(tokenizer, input_id_embeddings, 'eval')
+                            clean_train_mean_trigger_grads = get_mean_trigger_grads(tokenizer, input_id_embeddings, 'clean_train')
+                            
+                            eval_grad_dot_embed_matrix  = torch.einsum("ij,kj->ik", (eval_mean_trigger_grads,  input_id_embeddings['eval']['avg']))
+                            eval_grad_dot_embed_matrix[eval_grad_dot_embed_matrix != eval_grad_dot_embed_matrix] = 1e2
+                            clean_grad_dot_embed_matrix = torch.einsum("ij,kj->ik", (clean_train_mean_trigger_grads, input_id_embeddings['clean_train']['avg']))
+                            clean_grad_dot_embed_matrix[clean_grad_dot_embed_matrix != clean_grad_dot_embed_matrix] = 1e2
+
+                            # fill nans
+                            eval_grad_dot_embed_matrix[eval_grad_dot_embed_matrix != eval_grad_dot_embed_matrix] = 1e2
+                            clean_grad_dot_embed_matrix[clean_grad_dot_embed_matrix != clean_grad_dot_embed_matrix] = 1e2
+
+                            # weigh clean_train and eval dot products and get the smallest ones for each position
+                            gradient_dot_embedding_matrix = eval_grad_dot_embed_matrix + LAMBDA*clean_grad_dot_embed_matrix 
+                            BANNED_TOKEN_IDS = [tokenizer.pad_token_id, 
+                                                tokenizer.cls_token_id, 
+                                                tokenizer.unk_token_id, 
+                                                tokenizer.sep_token_id, 
+                                                tokenizer.mask_token_id]
+                            for token_id in BANNED_TOKEN_IDS:
+                                gradient_dot_embedding_matrix[:, token_id] = 1e2
+                            _, best_k_ids = torch.topk(-gradient_dot_embedding_matrix, num_candidates, dim=1)
+
+                            # put_embeds_on_device(device=CPU)
+                            return best_k_ids
+                        candidates = find_best_k_candidates_for_each_trigger_token(old_trigger, args.num_candidates, tokenizer)
+
+                        variations = [old_trigger[np.random.choice(len(old_trigger), size=args.trigger_length, replace=False)]
+                                                                                                for _ in range(args.num_variations)]
+                        variations = torch.stack(variations).T
+                        candidates = torch.cat([candidates, variations], dim=-1)
+
+                        # TODO: Check that we actually zero out all gradients
+                        def clear_all_model_grads(models):
+                            for model_type, model_list in models.items():
+                                for model in model_list:
+                                    optimizer = optim.Adam(model.parameters())
+                                    optimizer.zero_grad(set_to_none=True)
+                            for model_type in EXTRACTED_GRADS.keys():
+                                EXTRACTED_GRADS[model_type] = []
+                        clear_all_model_grads(models)
+
+                        # get_candidates_time = time.time()
+                        @torch.no_grad()
+                        def evaluate_and_pick_best_candidate(candidates, beam_size):
+                            @torch.no_grad()
+                            def evaluate_candidate_tokens_for_pos(candidates, triggered_dataset, top_candidate, pos):
+                                @torch.no_grad()
+                                def evaluate_loss_with_temp_trigger(triggered_dataset, temp_trigger):
+                                    insert_new_trigger(triggered_dataset, temp_trigger)
+                                    loss = compute_loss(models, triggered_dataset, args.batch_size*8, with_gradient=False)
+                                    return [loss['trigger_inversion_loss'], loss['clean_loss'], loss['eval_loss'], loss['clean_asr'], loss['eval_asr'], deepcopy(temp_trigger)]
+
+                                top_cand = deepcopy(top_candidate[-1])
+                                loss_per_candidate_trigger = [deepcopy(top_candidate)]
+                                visited_triggers = set(top_cand)
+                                
+                                for candidate_token in candidates[pos]:
+                                    temp_trigger = top_cand
+                                    temp_trigger[pos] = candidate_token
+                                    if temp_trigger in visited_triggers:
+                                            continue
+                                    temp_result = evaluate_loss_with_temp_trigger(triggered_dataset, temp_trigger)
+                                    loss_per_candidate_trigger.append(temp_result)
+                                    visited_triggers.add(temp_result[-1])
+
+                                return loss_per_candidate_trigger
+                            
+                            top_candidate = [old_loss['trigger_inversion_loss'], old_loss['clean_loss'], old_loss['eval_loss'], old_loss['clean_asr'], old_loss['eval_asr'], old_trigger]
+                            loss_per_candidate_trigger = evaluate_candidate_tokens_for_pos(candidates, triggered_dataset, top_candidate, pos=0)
+                            top_candidates = heapq.nsmallest(beam_size, loss_per_candidate_trigger, key=itemgetter(0))
+                                                            
+                            for idx in range(1, len(old_trigger)):
+                                loss_per_candidate_trigger = []
+                                for top_candidate in top_candidates:
+                                    loss_per_candidate_trigger.extend(evaluate_candidate_tokens_for_pos(candidates, triggered_dataset, top_candidate, pos=idx))
+                                top_candidates = heapq.nsmallest(beam_size, loss_per_candidate_trigger, key=itemgetter(0))
+                            trigger_inversion_loss, clean_loss, eval_loss, clean_triggered, eval_triggered, new_trigger = min(top_candidates, key=itemgetter(0))
+                            new_loss = {'trigger_inversion_loss': trigger_inversion_loss,
+                                        'eval_loss': eval_loss,
+                                        'clean_loss': clean_loss,
+                                        'clean_asr': clean_triggered,
+                                        'eval_asr': eval_triggered}
+                            return new_loss, new_trigger
+                        # with autocast():
+                        #     new_loss, new_trigger = evaluate_and_pick_best_candidate(candidates, args.beam_size)
+                        new_loss, new_trigger = evaluate_and_pick_best_candidate(candidates, args.beam_size)
+                        insert_new_trigger(triggered_dataset, new_trigger)
+
+                        eval_candidates_time = time.time()
+
+                        n_iter += 1
+                        # end_time = time.time()
+                        def print_results_of_trigger_inversion_iterate(n_iter):
+                            # print(f"Iteration: {n_iter} ({round(end_time - start_time, 1)} sec) \t Num Inputs: {len(triggered_dataset['input_ids'])}")
+                            print(f"Iteration: {n_iter}")
+                            print(f'Example: {tokenizer.decode(triggered_dataset["input_ids"][-1])}')
+                            table = Texttable()
+                            table.add_rows([['','trigger', 'trigger_inversion_loss', 'eval/clean asr'],
+                                            ['old', tokenizer.decode(old_trigger), 
+                                            f"{round(old_loss['trigger_inversion_loss'].item(), 2)} = {round(old_loss['eval_loss'].item(), 2)} + {LAMBDA}*{round(old_loss['clean_loss'].item(), 2)}",
+                                            f"{round(old_loss['eval_asr'].item()*100, 1)} / {round(old_loss['clean_asr'].item()*100, 1)}"],
+                                            ['new', tokenizer.decode(new_trigger), 
+                                            f"{round(new_loss['trigger_inversion_loss'].item(), 2)} = {round(new_loss['eval_loss'].item(), 2)} + {LAMBDA}*{round(new_loss['clean_loss'].item(), 2)}",
+                                            f"{round(new_loss['eval_asr'].item()*100, 1)} / {round(new_loss['clean_asr'].item()*100, 1)}"]])
+                            print(table.draw())
+                        # print_results_of_trigger_inversion_iterate(n_iter)
+                        # print(f"Total time: {round(end_time - start_time, 1)} sec")
+                        # print(f"\tGet candidates time: {round(get_candidates_time - start_time, 1)} sec")
+                        # print(f"\tGet candidates time: {round(eval_candidates_time - get_candidates_time, 1)} sec")
+                        
+                        del old_loss, candidates
+
+                    models['clean_test'] = [model.to(DEVICE, non_blocking=True) for model in models['clean_test']]
+                    new_test_loss = compute_loss(models, triggered_dataset, args.batch_size, with_gradient=False, train_or_test='test')
+                    models['clean_test'] = [model.to(CPU, non_blocking=True) for model in models['clean_test']]
+                if best_test_loss is None or best_test_loss['trigger_inversion_loss'] > new_test_loss['trigger_inversion_loss']:
+                    best_trigger, best_train_loss, best_test_loss = deepcopy(new_trigger), deepcopy(new_loss), deepcopy(new_test_loss)
+                
+                if best_test_loss['trigger_inversion_loss'] < 0.01:
+                    # found_trigger_flag = True
+                    break
+                torch.cuda.empty_cache()
             
-            if best_test_loss['trigger_inversion_loss'] < 0.01:
-                break
-            torch.cuda.empty_cache()
-
-    # RELAXED Trigger Inversion 
-    elif args.trigger_inversion_method == 'relaxed':
-        new_trigger = [randint(0,20000) for _ in range(args.trigger_length)]
-        triggered_dataset = insert_new_trigger(triggered_dataset, new_trigger)
-        # make a dataloader that includes an embedding-level representation of the inputs 
-        def map_to_token_embeds(triggered_dataset, models):
-            # Map tokens to embeddings, adds three new tensors per input sample: 
-            # 'token_embeds_eval', 'token_embeds_clean_train', and 'token_embeds_clean_test'. 
-            # New tensors are of shape (num_models, max_input, embedding_size).
-
-            def map_to_token_embeds_closure(dataset_sample):
-
-                def embeds_fwd(model): 
-                    # Pass inputs through the model's embedding layers 
-                    var_list = ['input_ids', 'token_type_ids']
-                    singleton_batch = {v:dataset_sample[v].unsqueeze(0).to(DEVICE) for v in var_list}
-                    return next(model.children()).embeddings(**singleton_batch)
-
-                # Embeddings for evaluation model 
-                embeds_eval = embeds_fwd(models['eval'][0])
-
-                # Embeddings for training models
-                embeds_clean_train = [embeds_fwd(m) for m in models['clean_train']]
-                embeds_clean_train = torch.stack(embeds_clean_train, dim=1).squeeze(0) 
-
-                # Embeddings for test models 
-                embeds_clean_test = [embeds_fwd(m) for m in models['clean_test']]
-                embeds_clean_test = torch.stack(embeds_clean_test, dim=1).squeeze(0) 
-
-                dataset_sample['token_embeds_eval'] = embeds_eval
-                dataset_sample['token_embeds_clean_train'] = embeds_clean_train
-                dataset_sample['token_embeds_clean_test'] = embeds_clean_test
-
-                return dataset_sample 
-
-            # BUG | Currently `map` is converting new tensors to lists of lists of tensors 
-            token_embeds_dataset = triggered_dataset.map(
-                map_to_token_embeds_closure,
-                batched=False,
-                num_proc=1,
-                keep_in_memory=True)
-
-            return token_embeds_dataset
-        embeds_dataset = map_to_token_embeds(triggered_dataset, models)
-        embeds_dataset = {k: v.to(DEVICE) for k,v in embeds_dataset.column_names}
-        # embeds_dataloader = torch.utils.data.DataLoader(embeds_dataset, batch_size=args.batch_size, shuffle=False)
-
-        def condensed_input_embeds(input_id_embeddings):
-            return torch.stack(input_id_embeddings['eval'], input_id_embeddings['clean_train']).mean()
-        condensed_input_embeds = condensed_input_embeds(input_id_embeddings)
-        
-        import chop
-        constraint = chop.constraints.Polytope(vertices=condensed_input_embeds)
-
-        rand_adv_token_id = torch.randint(0, len(condensed_input_embeds))
-
-        # minimize_pairwise_frank_wolfe
-        #     give the index of the starting token
-        #     returns the soluton as an object
-        #         x is the embedding
-        #         active_set is the lambda dictionary = {token_index : weight}
-
-        # TODO: define loss using chop.utils.closure, with only 1 argument: the embedding we're optimizing over
-        @chop.utils.closure
-        def relaxed_loss_fn(adv_embedding):
-            # adv_embedding should be (768 vector)        
-            # TODO(trusty_patches): insert adv_embedding in the input as embeds within embeds_dataset
-            # Assume we only have a single-token trigger
-            # TODO(trusty_patches): 
-            #   compute_loss(models, embeds_dataset, args.batch_size, with_gradient=True, train_or_test='train', input_field='inputs_embeds')
-            # TODO: Might need/want to remove hooks from the model? Maybe consider branching if errors with CUDA?
-            return NotImplementedError
-
-        result = chop.optim.minimize_pairwise_frank_wolfe(
-                            relaxed_loss_fn,
-                            rand_adv_token_id,
-                            constraint,
-                            step='backtracking',
-                            lipschitz=None,
-                            max_iter=200,
-                            tol=1e-6,
-                            callback=None
-                            )
+            def add_results_to_df(df):
+                end_time = time.time()
+                temp_df = pd.DataFrame.from_dict({
+                        # trigger
+                            'decoded_trigger':              tokenizer.decode(best_trigger), 
+                            'trigger_token_ids':            best_trigger.detach().cpu().numpy(),
+                        # train
+                            'train_clean_asr':              round(best_train_loss['clean_asr'].item(), 5),
+                            'train_eval_asr':               round(best_train_loss['eval_asr'].item(), 5),
+                            'train_trigger_inversion_loss': round(best_train_loss['trigger_inversion_loss'].item(), 5), 
+                            'train_eval_loss':              round(best_train_loss['eval_loss'].item(), 5),
+                            'train_clean_loss':             round(best_train_loss['clean_loss'].item(), 5),
+                        # test
+                            'test_clean_asr':               round(best_test_loss['clean_asr'].item(), 5),
+                            'test_eval_asr':                round(best_test_loss['eval_asr'].item(), 5),
+                            'test_trigger_inversion_loss':  round(best_test_loss['trigger_inversion_loss'].item(), 5), 
+                            'test_eval_loss':               round(best_test_loss['eval_loss'].item(), 5),
+                            'test_clean_loss':              round(best_test_loss['clean_loss'].item(), 5),
+                            'smallest_values':              total_cand_pool['smallest_values'].detach().cpu().numpy(),
+                            'total_similarity':             torch.tensor(list(total_cand_pool['total_similarity'])).detach().cpu().numpy(),
+                        # time
+                            'total_time':                   round(end_time - start_time, 1),
+                        # config
+                            'behavior':                     args.trigger_behavior,
+                            'insertion':                    args.trigger_insertion_type,
+                            'num_inputs':                   len(triggered_dataset['input_ids'])
+                    }, orient='index')
+                temp_df = temp_df.T
+                return df.append(temp_df)
+            df = add_results_to_df(df)
 
 
+    if not args.is_submission:
+        def save_results(parent_folder='results'):
+            '''
+            saves results to the results folder
+            '''
+            def check_if_folder_exists(folder):
+                if not os.path.isdir(folder):
+                    os.mkdir(folder)
+            
+            check_if_folder_exists(parent_folder)
+            
+            folder = f'{parent_folder}/nov16'+\
+                        f'_lam_{args.lmbda}'+\
+                        f'_trinv_{args.trigger_inversion_method}'+\
+                        f'_ncand_{args.num_candidates}'+\
+                        f'_trlen_{args.trigger_length}'+\
+                        f'_nrand_{args.num_random_tries}'+\
+                        f'_nbeam_{args.beam_size}'+\
+                        f'_mordt_{args.more_clean_data}'+\
+                        f'_niter_{args.max_iter}'+\
+                        f'_initf_{args.trigger_init_fn}'+\
+                        f'_agg_{args.likelihood_agg}'
+            check_if_folder_exists(folder)
+            
+            df.to_csv(os.path.join(folder, f'{args.model_num}.csv'))
+        save_results()
     
-    def save_results(parent_folder='results'):
-        '''
-        saves results to the results folder
-        '''
-        def check_if_folder_exists(folder):
-            if not os.path.isdir(folder):
-                os.mkdir(folder)
+    if args.is_submission:
+        df['behavior_insertion'] = df['behavior'] + '_' + df['insertion']
+        normalization_df = pd.read_csv('normalization_df', index_col='behavior_insertion')
+        df['normalized_test_trigger_inversion_loss'] = \
+            df.apply(lambda x: (x.test_trigger_inversion_loss-normalization_df.loc[x.behavior_insertion]['mean']).item()/normalization_df.loc[x.behavior_insertion]['std'].item(), axis=1)
+        X = df.sort_values('normalized_test_trigger_inversion_loss').iloc[[0]][['normalized_test_trigger_inversion_loss', 'test_clean_asr', 'test_eval_asr']]
         
-        check_if_folder_exists(parent_folder)
-        
-        folder = f'{parent_folder}/_oct15'+\
-                    f'_lam_{args.lmbda}'+\
-                    f'_trinv_{args.trigger_inversion_method}'+\
-                    f'_ncand_{args.num_candidates}'+\
-                    f'_trlen_{args.trigger_length}'+\
-                    f'_nrand_{args.num_random_tries}'+\
-                    f'_nbeam_{args.beam_size}'+\
-                    f'_mordt_{args.more_clean_data}'+\
-                    f'_insrt_{args.trigger_insertion_type}'+\
-                    f'_behvr_{args.trigger_behavior}'+\
-                    f'_temp_{args.temperature}'+\
-                    f'_niter_{args.max_iter}'+\
-                    f'_initf_{args.trigger_init_fn}'+\
-                    f'_agg_{args.likelihood_agg}'
-        check_if_folder_exists(folder)
-        
-        df = pd.DataFrame.from_dict({
-                # trigger
-                    'decoded_trigger':              tokenizer.decode(best_trigger), 
-                    'trigger_token_ids':            new_trigger.detach().cpu().numpy(),
-                # train
-                    'train_clean_asr':              round(best_train_loss['clean_asr'].item(), 5),
-                    'train_eval_asr':               round(best_train_loss['eval_asr'].item(), 5),
-                    'train_trigger_inversion_loss': round(best_train_loss['trigger_inversion_loss'].item(), 5), 
-                    'train_eval_loss':              round(best_train_loss['eval_loss'].item(), 5),
-                    'train_clean_loss':             round(best_train_loss['clean_loss'].item(), 5),
-                # test
-                    'test_clean_asr':               round(best_test_loss['clean_asr'].item(), 5),
-                    'test_eval_asr':                round(best_test_loss['eval_asr'].item(), 5),
-                    'test_trigger_inversion_loss':  round(best_test_loss['trigger_inversion_loss'].item(), 5), 
-                    'test_eval_loss':               round(best_test_loss['eval_loss'].item(), 5),
-                    'test_clean_loss':              round(best_test_loss['clean_loss'].item(), 5)
-            }, orient='index')
-        df.to_csv(os.path.join(folder, f'{args.model_num}.csv'))
-    save_results()
+        from joblib import load
+        clf = load('classifier.joblib')
+        trojan_probability = clf.predict_proba(X)[0][1]
+
+        with open(result_filepath, 'w') as fh:
+            fh.write("{}".format(trojan_probability))
 
 
 if __name__ == "__main__":    
@@ -969,25 +1068,26 @@ if __name__ == "__main__":
         parser.add_argument('--is_submission',      dest='is_submission',   action='store_true',  help='Flag to determine if this is a submission to the NIST server',  )
         parser.add_argument('--calculate_alpha',    dest='calculate_alpha', action='store_true',  help='Flag to determine if we want to save the alphas of the evaluation model',  )
         parser.add_argument('--more_clean_data',    dest='more_clean_data', action='store_true',  help='Flag to determine if we want to grab clean examples from the clean models',  )
-        parser.add_argument('--model_num',          default=7,              type=int,             help="model number - only used if it's not a submission")                    
+        parser.add_argument('--model_num',          default=12,              type=int,             help="model number - only used if it's not a submission")                    
         parser.add_argument('--batch_size',         default=32,             type=int,             help='What batch size')
         parser.add_argument('--max_test_models',    default=7,              type=int,             help='How many test models to use', choices=range(2, 7))
 
         # trigger_inversion_args
         parser.add_argument('--trigger_inversion_method',     default='discrete',  type=str,   help='Which trigger inversion method do we use', choices=['discrete', 'relaxed'])
-        parser.add_argument('--trigger_behavior',             default='self',      type=str,   help='Where does the trigger point to?', choices=['self', 'cls'])
+        parser.add_argument('--trigger_behavior',             default='cls',      type=str,   help='Where does the trigger point to?', choices=['self', 'cls'])
         parser.add_argument('--likelihood_agg',               default='max',       type=str,   help='How do we aggregate the likelihoods of the answers', choices=['max', 'sum'])
-        parser.add_argument('--trigger_insertion_type',       default='both',      type=str,   help='Where is the trigger inserted', choices=['context', 'question', 'both'])
-        parser.add_argument('--num_random_tries',             default=1,           type=int,   help='How many random starts do we try')
-        parser.add_argument('--trigger_length',               default=20,          type=int,   help='How long do we want the trigger to be')
-        parser.add_argument('--lmbda',                        default=1.,          type=float, help='Weight on the clean loss')
-        parser.add_argument('--temperature',                  default=.2,          type=float, help='Temperature parameter to divide logits by')
+        parser.add_argument('--trigger_insertion_type',       default='question',      type=str,   help='Where is the trigger inserted', choices=['context', 'question', 'both'])
+        parser.add_argument('--num_random_tries',             default=10,          type=int,   help='How many random starts do we try')
+        parser.add_argument('--trigger_length',               default=7,           type=int,   help='How long do we want the trigger to be')
+        parser.add_argument('--lmbda',                        default=2.,          type=float, help='Weight on the clean loss')
+        parser.add_argument('--temperature',                  default=1.,          type=float, help='Temperature parameter to divide logits by')
 
         # discrete
         parser.add_argument('--trigger_init_fn', default='embed_ch', type=str, help='How do we initialize our trigger', choices=['embed_ch', 'random', 'pad'])
-        parser.add_argument('--max_iter',        default=1,         type=int, help='Max num of iterations', choices=range(0,50))
+        parser.add_argument('--max_iter',        default=20,         type=int, help='Max num of iterations', choices=range(0,50))
+        parser.add_argument('--num_variations',  default=1,         type=int, help='How many variations to evaluate for each position during the discrete trigger inversion')
         parser.add_argument('--num_candidates',  default=1,          type=int, help='How many candidates do we want to evaluate in each position during the discrete trigger inversion')
-        parser.add_argument('--beam_size',       default=1,          type=int, help='How big do we want the beam size during the discrete trigger inversion')
+        parser.add_argument('--beam_size',       default=2,          type=int, help='How big do we want the beam size during the discrete trigger inversion')
         
         # continuous
         parser.add_argument('--beta',           default=.01,      type=float, help='Weight on the sparsity loss')
@@ -1003,11 +1103,11 @@ if __name__ == "__main__":
         return parser
     parser = add_all_args(parser)
     
-    parser.set_defaults(is_submission=False, more_clean_data=False, calculate_alpha=False)
+    parser.set_defaults(is_submission=False, more_clean_data=True, calculate_alpha=False)
     args = parser.parse_args()
     
     def modify_args(args):
-        if args.is_submission == 0:
+        if not args.is_submission:
             metadata = pd.read_csv(join(TRAINING_FILEPATH, 'METADATA.csv'))
 
             id_str = str(100000000 + args.model_num)[1:]

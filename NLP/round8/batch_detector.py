@@ -18,7 +18,9 @@ parser.add_argument('-b', '--max_model', required=False,    type=int, default=12
 parser.add_argument('--num_random_tries',  default=5,           type=int,   help='How many random starts do we try')
 parser.add_argument('--trigger_length',    default=25,          type=int,   help='How long do we want the trigger to be')
 parser.add_argument('--max_iter',          default=20,         type=int, help='Max num of iterations', choices=range(0,50))
+parser.add_argument('--num_candidates',  default=2,          type=int, help='How many candidates do we want to evaluate in each position during the discrete trigger inversion')
 parser.add_argument('--calculate_alpha',    dest='calculate_alpha', action='store_true',  help='Flag to determine if we want to save the alphas of the evaluation model',  )
+parser.add_argument('--likelihood_agg',               default='sum',       type=str,   help='How do we aggregate the likelihoods of the answers', choices=['max', 'sum'])
 
 parser.set_defaults(calculate_alpha=False)
 args = parser.parse_args()
@@ -43,6 +45,8 @@ commands_to_run = [f'python detector.py --model_num {model} --more_clean_data '+
                    f'--trigger_insertion_type {args.trigger_insertion_type} '+\
                    f'--num_random_tries {args.num_random_tries} '+\
                    f'--trigger_length {args.trigger_length} '+\
+                   f'--likelihood_agg {args.likelihood_agg} '+\
+                   f'--num_candidates {args.num_candidates} '+\
                    f' {calc_alpha} '+\
                    f'--max_iter {args.max_iter} ' for model, temp, lmbda in product(models, args.temperature, args.lmbda)]
 
