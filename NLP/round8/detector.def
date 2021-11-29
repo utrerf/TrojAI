@@ -1,0 +1,39 @@
+Bootstrap: docker
+From: pytorch/pytorch:1.8.0-cuda11.1-cudnn8-runtime
+
+%files
+    ./clean_models_test /
+    ./clean_models_train /
+    ./detector.py /
+    ./tools.py /
+    ./filepaths.py /
+    ./normalization_df /
+    ./classifier.joblib /
+    ./spec-file.txt /
+
+%post
+    apt-get update && apt-get install -y git 
+    apt-get install -y libenchant-dev
+    apt-get install libgomp1
+    apt-get install -y default-jre
+    export PATH="$PATH:/opt/conda/bin"
+    conda install --file /spec-file.txt
+    conda install pytorch
+    conda install torchtext
+    conda install scikit-image
+    conda install pandas
+    conda install numpy
+    conda install joblib
+    conda install scikit-learn
+    conda install pip
+    pip install pyenchant
+    pip install jsonargparse
+    pip install jsonpickle
+    pip install jsonschema
+    pip install transformers==4.9.2
+    pip install huggingface-hub==0.0.12
+    pip install datasets==1.8.0
+    pip install texttable
+
+%runscript
+    exec python3 /detector.py "$@"
